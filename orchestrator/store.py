@@ -1,4 +1,6 @@
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,11 +64,18 @@ class JobStore:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        with closing(self.connect()) as conn:
+            with conn:
+                yield conn
+
     def initialize(self) -> None:
-        with self.connect() as conn:
+        with self.connection() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -104,7 +113,8 @@ class JobStore:
         if normalized is None:
             return SubmitResult(kind="invalid", movie_number=movie_number)
 
-        with self.connect() as conn:
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = self._get_by_normalized(conn, normalized)
             if existing and not force:
                 return SubmitResult(kind="existing", movie_number=movie_number, job=existing)
@@ -164,14 +174,13 @@ class JobStore:
         return BatchSubmitResult(created=created, existing=existing, invalid=invalid)
 
     def get_job(self, job_id: str, conn: sqlite3.Connection | None = None) -> JobRecord | None:
-        own_conn = conn is None
-        active_conn = conn or self.connect()
-        try:
+        if conn is not None:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_job(row) if row else None
+
+        with self.connection() as active_conn:
             row = active_conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row) if row else None
-        finally:
-            if own_conn:
-                active_conn.close()
 
     def _get_by_normalized(self, conn: sqlite3.Connection, normalized: str) -> JobRecord | None:
         row = conn.execute(
@@ -193,7 +202,12 @@ class JobStore:
         }:
             return SubmitResult(kind="conflict", movie_number=movie_number, job=existing)
         now = utc_now_iso()
-        conn.execute(
+        active_statuses = (
+            JobStatus.TRANSCRIPTION_CLAIMED.value,
+            JobStatus.TRANSCRIBING.value,
+            JobStatus.TRANSLATING.value,
+        )
+        cursor = conn.execute(
             """
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
@@ -202,9 +216,13 @@ class JobStore:
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
+              AND status NOT IN (?, ?, ?)
             """,
-            (JobStatus.QUEUED.value, now, existing.id),
+            (JobStatus.QUEUED.value, now, existing.id, *active_statuses),
         )
+        if cursor.rowcount == 0:
+            job = self.get_job(existing.id, conn=conn)
+            return SubmitResult(kind="conflict", movie_number=movie_number, job=job)
         job = self.get_job(existing.id, conn=conn)
         return SubmitResult(kind="created", movie_number=movie_number, job=job)
 
