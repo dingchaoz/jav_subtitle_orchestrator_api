@@ -108,10 +108,9 @@ class WindowsWorker:
 
     def _run_with_periodic_heartbeat(self, job_id: str, stage: str, operation, *args) -> None:
         stop = Event()
-        errors: list[BaseException] = []
         thread = Thread(
             target=self._heartbeat_until_stopped,
-            args=(job_id, stage, stop, errors),
+            args=(job_id, stage, stop),
             daemon=True,
         )
         thread.start()
@@ -120,23 +119,18 @@ class WindowsWorker:
         finally:
             stop.set()
             thread.join()
-        if errors:
-            raise errors[0]
 
     def _heartbeat_until_stopped(
         self,
         job_id: str,
         stage: str,
         stop: Event,
-        errors: list[BaseException],
     ) -> None:
         while not stop.wait(self.heartbeat_interval_seconds):
             try:
                 self.client.heartbeat(job_id, stage)
-            except BaseException as exc:
-                errors.append(exc)
-                stop.set()
-                return
+            except Exception:
+                continue
 
 
 def run_forever(worker: WindowsWorker, poll_interval_seconds: int) -> None:

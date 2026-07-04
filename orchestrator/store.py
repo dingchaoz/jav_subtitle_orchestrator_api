@@ -511,6 +511,7 @@ class JobStore:
         if existing.status in {
             JobStatus.TRANSCRIPTION_CLAIMED,
             JobStatus.TRANSCRIBING,
+            JobStatus.TRANSCRIPTION_DONE,
             JobStatus.TRANSLATING,
         }:
             return SubmitResult(kind="conflict", movie_number=movie_number, job=existing)
@@ -518,6 +519,7 @@ class JobStore:
         active_statuses = (
             JobStatus.TRANSCRIPTION_CLAIMED.value,
             JobStatus.TRANSCRIBING.value,
+            JobStatus.TRANSCRIPTION_DONE.value,
             JobStatus.TRANSLATING.value,
         )
         cursor = conn.execute(
@@ -529,7 +531,7 @@ class JobStore:
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
-              AND status NOT IN (?, ?, ?)
+              AND status NOT IN (?, ?, ?, ?)
             """,
             (JobStatus.QUEUED.value, now, existing.id, *active_statuses),
         )

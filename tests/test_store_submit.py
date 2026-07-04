@@ -141,6 +141,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
     [
         JobStatus.TRANSCRIPTION_CLAIMED,
         JobStatus.TRANSCRIBING,
+        JobStatus.TRANSCRIPTION_DONE,
         JobStatus.TRANSLATING,
     ],
 )
