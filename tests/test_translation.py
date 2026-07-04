@@ -58,6 +58,39 @@ def test_translation_adapter_handles_real_hyphenated_script_output(tmp_path):
     assert output_srt.read_text(encoding="utf-8").startswith("1\n00:00:00,000")
 
 
+def test_translation_adapter_uses_temp_output_dir_inside_final_parent(tmp_path):
+    final_dir = tmp_path / "final"
+    script = tmp_path / "fake_translate.py"
+    script.write_text(
+        "import argparse\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--input')\n"
+        "parser.add_argument('--langs')\n"
+        "parser.add_argument('--output-dir')\n"
+        "args = parser.parse_args()\n"
+        f"expected_parent = Path({str(final_dir)!r})\n"
+        "output_dir = Path(args.output_dir)\n"
+        "if output_dir.parent != expected_parent:\n"
+        "    raise SystemExit(f'wrong output parent: {output_dir.parent}')\n"
+        "input_path = Path(args.input)\n"
+        "translated = '1\\n00:00:00,000 --> 00:00:01,500\\nHello\\n\\n'\n"
+        "Path(args.output_dir, f'{input_path.stem}-{args.langs}.srt').write_text(\n"
+        "    translated,\n"
+        "    encoding='utf-8',\n"
+        ")\n",
+        encoding="utf-8",
+    )
+    input_srt = tmp_path / "ktb-096.Japanese.srt"
+    input_srt.write_text(JAPANESE_SRT, encoding="utf-8")
+    output_srt = final_dir / "ktb-096.English.srt"
+    translator = SubtitleTranslator(str(script))
+
+    translator.translate_to_english(input_srt, output_srt)
+
+    assert output_srt.read_text(encoding="utf-8").startswith("1\n00:00:00,000")
+
+
 def test_translation_adapter_raises_runtime_error_with_script_context(tmp_path):
     script = tmp_path / "fake_translate.py"
     script.write_text(

@@ -10,7 +10,10 @@ class SubtitleTranslator:
 
     def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
         output_srt.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix="subtitle-translation-") as temp_output_dir:
+        with TemporaryDirectory(
+            prefix=".subtitle-translation-",
+            dir=output_srt.parent,
+        ) as temp_output_dir:
             temp_output_path = Path(temp_output_dir)
             command = [
                 sys.executable,
