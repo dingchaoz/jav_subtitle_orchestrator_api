@@ -249,6 +249,29 @@ class JobStore:
             audio_path_windows=paths.audio_path_windows,
         )
 
+    def record_download_failure(
+        self,
+        job_id: str,
+        status: JobStatus,
+        attempt_count: int,
+        error: str,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, attempt_count = ?, updated_at = ?, error = ?
+                WHERE id = ?
+                """,
+                (status.value, attempt_count, now, error, job_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(job_id)
+            job = self.get_job(job_id, conn=conn)
+            assert job is not None
+            return job
+
     def claim_next_worker_job(self, worker_id: str, lease_seconds: int) -> JobRecord | None:
         now = utc_now_iso()
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
