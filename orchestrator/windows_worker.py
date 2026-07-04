@@ -7,6 +7,13 @@ import requests
 from orchestrator.job_logs import append_job_log
 
 
+def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
+    try:
+        append_job_log(job_dir, filename, message)
+    except Exception:
+        return
+
+
 class MacApiClient:
     def __init__(self, base_url: str, worker_id: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -82,9 +89,9 @@ class WindowsWorker:
             japanese_srt = Path(job["japanese_srt_path_windows"])
             english_srt = Path(job["english_srt_path_windows"])
 
-            append_job_log(job_dir, "windows-worker.log", f"claimed {job_id}")
+            _append_job_log_safely(job_dir, "windows-worker.log", f"claimed {job_id}")
             self.client.heartbeat(job_id, stage)
-            append_job_log(job_dir, "whisper.log", f"transcribing {audio_path}")
+            _append_job_log_safely(job_dir, "whisper.log", f"transcribing {audio_path}")
             self._run_with_periodic_heartbeat(
                 job_id,
                 stage,
@@ -98,7 +105,11 @@ class WindowsWorker:
 
             stage = "translating"
             self.client.heartbeat(job_id, stage)
-            append_job_log(job_dir, "translate.log", f"translating {japanese_srt}")
+            _append_job_log_safely(
+                job_dir,
+                "translate.log",
+                f"translating {japanese_srt}",
+            )
             self._run_with_periodic_heartbeat(
                 job_id,
                 stage,
@@ -108,11 +119,11 @@ class WindowsWorker:
             )
 
             self.client.complete(job_id, str(japanese_srt), str(english_srt))
-            append_job_log(job_dir, "windows-worker.log", f"completed {job_id}")
+            _append_job_log_safely(job_dir, "windows-worker.log", f"completed {job_id}")
             return True
         except Exception as exc:
             if job_dir is not None:
-                append_job_log(
+                _append_job_log_safely(
                     job_dir,
                     "windows-worker.log",
                     f"failed {job_id} {stage}: {exc}",

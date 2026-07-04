@@ -8,6 +8,13 @@ from orchestrator.paths import build_job_paths
 from orchestrator.store import JobRecord, JobStore
 
 
+def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
+    try:
+        append_job_log(job_dir, filename, message)
+    except Exception:
+        return
+
+
 class MacDownloadWorker:
     def __init__(self, store: JobStore, adapter, max_download_attempts: int) -> None:
         self.store = store
@@ -33,7 +40,7 @@ class MacDownloadWorker:
         Path(paths.job_dir_mac).mkdir(parents=True, exist_ok=True)
         write_job_snapshot(job)
 
-        append_job_log(
+        _append_job_log_safely(
             paths.job_dir_mac,
             "mac-download.log",
             f"downloading_metadata {job.normalized_movie_number}",
@@ -46,7 +53,7 @@ class MacDownloadWorker:
         )
         write_job_snapshot(updated)
 
-        append_job_log(
+        _append_job_log_safely(
             paths.job_dir_mac,
             "mac-download.log",
             f"downloading_audio {job.normalized_movie_number}",
@@ -60,7 +67,7 @@ class MacDownloadWorker:
             audio_path_windows=paths.audio_path_windows,
         )
         write_job_snapshot(updated)
-        append_job_log(
+        _append_job_log_safely(
             paths.job_dir_mac,
             "mac-download.log",
             f"audio_ready {job.normalized_movie_number}",

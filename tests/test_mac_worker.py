@@ -60,6 +60,30 @@ def test_mac_worker_writes_download_log(sqlite_path, mac_jobs_root):
     )
 
 
+def test_mac_worker_audio_ready_log_failure_does_not_requeue_job(
+    sqlite_path,
+    mac_jobs_root,
+    monkeypatch,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    worker = MacDownloadWorker(store, FakeMissAVAdapter(), max_download_attempts=3)
+
+    def fail_on_audio_ready(job_dir, filename, message):
+        if message == "audio_ready ktb-096":
+            raise OSError("log disk full")
+
+    monkeypatch.setattr("orchestrator.mac_worker.append_job_log", fail_on_audio_ready)
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status == JobStatus.AUDIO_READY
+    assert refreshed.attempt_count == 0
+    assert refreshed.error is None
+
+
 def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

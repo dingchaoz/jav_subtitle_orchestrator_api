@@ -4,12 +4,17 @@ from threading import Event
 from orchestrator.windows_worker import WindowsWorker
 
 
+class FailedCalls(list):
+    def __call__(self, job_id, stage, error):
+        self.append((job_id, stage, error))
+
+
 class FakeClient:
     def __init__(self, job):
         self.job = job
         self.heartbeats = []
         self.completed = []
-        self.failed = []
+        self.failed = FailedCalls()
 
     def next_job(self):
         return self.job
@@ -19,10 +24,6 @@ class FakeClient:
 
     def complete(self, job_id, japanese_srt_path_windows, english_srt_path_windows):
         self.completed.append((job_id, japanese_srt_path_windows, english_srt_path_windows))
-
-    def failed(self, job_id, stage, error):
-        self.failed.append((job_id, stage, error))
-
 
 class FakeTranscriber:
     def transcribe_to_srt(self, audio_path: Path, output_path: Path) -> None:
@@ -105,6 +106,14 @@ class TransientFailureBlockingTranscriber(FakeTranscriber):
         super().transcribe_to_srt(audio_path, output_path)
 
 
+class FailingTranscriber:
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def transcribe_to_srt(self, audio_path: Path, output_path: Path) -> None:
+        raise RuntimeError(self.error)
+
+
 def make_job(tmp_path):
     job_dir = tmp_path / "ktb-096"
     job_dir.mkdir()
@@ -157,13 +166,78 @@ def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
     assert worker.process_one() is True
 
     job_dir = Path(job["audio_path_windows"]).parent
-    assert "claimed job_1\n" in (job_dir / "logs" / "windows-worker.log").read_text(
-        encoding="utf-8"
+    audio_path = Path(job["audio_path_windows"])
+    japanese_srt = Path(job["japanese_srt_path_windows"])
+
+    assert (job_dir / "logs" / "windows-worker.log").read_text(encoding="utf-8") == (
+        "claimed job_1\n"
+        "completed job_1\n"
     )
-    assert "transcribing" in (job_dir / "logs" / "whisper.log").read_text(encoding="utf-8")
-    assert "translating" in (job_dir / "logs" / "translate.log").read_text(
-        encoding="utf-8"
+    assert (job_dir / "logs" / "whisper.log").read_text(encoding="utf-8") == (
+        f"transcribing {audio_path}\n"
     )
+    assert (job_dir / "logs" / "translate.log").read_text(encoding="utf-8") == (
+        f"translating {japanese_srt}\n"
+    )
+
+
+def test_windows_worker_completed_log_failure_does_not_fail_completed_job(
+    tmp_path,
+    monkeypatch,
+):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
+
+    def fail_on_completed(job_dir, filename, message):
+        if message == "completed job_1":
+            raise OSError("log disk full")
+
+    monkeypatch.setattr("orchestrator.windows_worker.append_job_log", fail_on_completed)
+
+    assert worker.process_one() is True
+    assert client.completed == [
+        (
+            "job_1",
+            job["japanese_srt_path_windows"],
+            job["english_srt_path_windows"],
+        )
+    ]
+    assert client.failed == []
+
+
+def test_windows_worker_writes_failure_log_on_transcription_error(tmp_path):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FailingTranscriber("whisper crashed"), FakeTranslator())
+
+    assert worker.process_one() is True
+
+    job_dir = Path(job["audio_path_windows"]).parent
+    assert (job_dir / "logs" / "windows-worker.log").read_text(encoding="utf-8") == (
+        "claimed job_1\n"
+        "failed job_1 transcribing: whisper crashed\n"
+    )
+    assert client.failed == [("job_1", "transcribing", "whisper crashed")]
+
+
+def test_windows_worker_failure_log_failure_still_reports_original_failure(
+    tmp_path,
+    monkeypatch,
+):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FailingTranscriber("whisper crashed"), FakeTranslator())
+
+    def fail_on_failed_log(job_dir, filename, message):
+        if message.startswith("failed "):
+            raise OSError("log disk full")
+
+    monkeypatch.setattr("orchestrator.windows_worker.append_job_log", fail_on_failed_log)
+
+    assert worker.process_one() is True
+    assert client.completed == []
+    assert client.failed == [("job_1", "transcribing", "whisper crashed")]
 
 
 def test_windows_worker_returns_false_when_no_job():
