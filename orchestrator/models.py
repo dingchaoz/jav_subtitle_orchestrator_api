@@ -1,4 +1,10 @@
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,3 +65,30 @@ class WorkerFailedRequest(BaseModel):
     worker_id: str
     stage: JobStatus
     error: str = Field(min_length=1)
+
+
+class JobResponse(BaseModel):
+    id: str
+    movie_number: str
+    status: JobStatus
+    job_dir_mac: str
+    job_dir_windows: str
+    error: str | None = None
+
+
+class BatchJobResponse(BaseModel):
+    created: list[JobResponse]
+    existing: list[JobResponse]
+    invalid: list[str]
+
+
+class WorkerJobResponse(BaseModel):
+    id: str
+    movie_number: str
+    audio_path_windows: str
+    japanese_srt_path_windows: str
+    english_srt_path_windows: str
+
+
+class WorkerNextJobResponse(BaseModel):
+    job: WorkerJobResponse | None
