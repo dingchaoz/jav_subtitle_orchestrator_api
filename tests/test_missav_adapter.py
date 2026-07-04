@@ -11,6 +11,9 @@ def _fake_pipeline_root(tmp_path: Path) -> Path:
     root = tmp_path / "MissAV-Pipeline"
     new_release = root / "new-release"
     new_release.mkdir(parents=True)
+    pipeline_python = root / ".venv" / "bin" / "python"
+    pipeline_python.parent.mkdir(parents=True)
+    pipeline_python.write_text("# fake python\n", encoding="utf-8")
     (new_release / "unified_download.py").write_text("# fake\n", encoding="utf-8")
     (new_release / "batch_audio_downloader.py").write_text("# fake\n", encoding="utf-8")
     return root
@@ -22,6 +25,7 @@ def test_download_metadata_writes_matching_movie_record(monkeypatch, tmp_path):
     output_path = tmp_path / "jobs" / "ktb-096" / "metadata.json"
 
     def fake_run(command, **kwargs):
+        assert command[0] == str(pipeline_root / ".venv" / "bin" / "python")
         assert command[1] == str(pipeline_root / "new-release" / "unified_download.py")
         assert kwargs["cwd"] == pipeline_root
         catalog_path.write_text(
@@ -49,12 +53,38 @@ def test_download_metadata_writes_matching_movie_record(monkeypatch, tmp_path):
     }
 
 
+def test_adapter_uses_explicit_python_executable(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    output_path = tmp_path / "jobs" / "ktb-096" / "metadata.json"
+    explicit_python = tmp_path / "python-for-missav"
+    explicit_python.write_text("# explicit python\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        assert command[0] == str(explicit_python)
+        catalog_path.write_text(
+            json.dumps({"movies": [{"number": "ktb-096", "title": "Requested movie"}]}) + "\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    MissAVAdapter(pipeline_root, python_executable=explicit_python).download_metadata(
+        "ktb-096",
+        output_path,
+    )
+
+    assert json.loads(output_path.read_text(encoding="utf-8"))["number"] == "ktb-096"
+
+
 def test_download_metadata_raises_when_requested_movie_missing(monkeypatch, tmp_path):
     pipeline_root = _fake_pipeline_root(tmp_path)
     catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
     output_path = tmp_path / "jobs" / "ktb-096" / "metadata.json"
 
     def fake_run(command, **kwargs):
+        assert command[0] == str(pipeline_root / ".venv" / "bin" / "python")
         catalog_path.write_text(
             json.dumps({"movies": [{"number": "abc-001", "title": "Wrong movie"}]}) + "\n",
             encoding="utf-8",
@@ -91,11 +121,17 @@ def test_download_audio_queues_requested_movie_and_moves_produced_audio(
     )
 
     def fake_run(command, **kwargs):
+        assert command[0] == str(pipeline_root / ".venv" / "bin" / "python")
         assert command[1] == str(pipeline_root / "new-release" / "batch_audio_downloader.py")
-        assert kwargs["cwd"] == pipeline_root
+        assert kwargs["cwd"] != pipeline_root
         json_file = Path(command[command.index("--json-file") + 1])
         queue_file = Path(command[command.index("--queue-file") + 1])
         output_dir = Path(command[command.index("--output-dir") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        assert json_file.is_absolute()
+        assert queue_file.is_absolute()
+        assert log_file.is_absolute()
+        assert output_dir.is_absolute()
         assert output_dir == output_path.parent
         assert command[command.index("--max-downloads") + 1] == "1"
         assert "--only-pending" in command

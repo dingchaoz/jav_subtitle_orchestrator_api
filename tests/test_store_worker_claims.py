@@ -4,6 +4,34 @@ from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
 
 
+def test_claim_next_download_job_is_atomic_and_ordered(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    slow = store.submit_job("ktb-096", priority=100, force=False).job
+    fast = store.submit_job("ktb-095", priority=10, force=False).job
+
+    claimed = store.claim_next_download_job()
+    second_claim = store.claim_next_download_job()
+
+    assert claimed.id == fast.id
+    assert claimed.status == JobStatus.DOWNLOADING_METADATA
+    assert second_claim.id == slow.id
+    assert second_claim.status == JobStatus.DOWNLOADING_METADATA
+
+
+def test_claim_next_download_job_removes_claimed_job_from_queue(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+
+    claimed = store.claim_next_download_job()
+    second_claim = store.claim_next_download_job()
+
+    assert claimed.id == job.id
+    assert store.list_jobs(JobStatus.QUEUED) == []
+    assert second_claim is None
+
+
 def test_claim_next_audio_ready_job_is_atomic_and_ordered(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

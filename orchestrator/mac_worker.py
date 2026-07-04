@@ -14,10 +14,9 @@ class MacDownloadWorker:
         self.max_download_attempts = max_download_attempts
 
     def process_one(self) -> bool:
-        queued = self.store.list_jobs(JobStatus.QUEUED)
-        if not queued:
+        job = self.store.claim_next_download_job()
+        if job is None:
             return False
-        job = queued[0]
         try:
             self._process_job(job)
         except Exception as exc:
@@ -31,12 +30,7 @@ class MacDownloadWorker:
             self.store.jobs_root_windows,
         )
         Path(paths.job_dir_mac).mkdir(parents=True, exist_ok=True)
-
-        updated = self.store.update_download_status(
-            job.id,
-            JobStatus.DOWNLOADING_METADATA,
-        )
-        write_job_snapshot(updated)
+        write_job_snapshot(job)
 
         self.adapter.download_metadata(job.normalized_movie_number, paths.metadata_path_mac)
         updated = self.store.update_download_status(

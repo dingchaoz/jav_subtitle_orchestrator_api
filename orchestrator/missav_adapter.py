@@ -20,13 +20,18 @@ QUEUE_MOVIE_FIELDS = ("number", "title", "link", "cover", "preview", "duration",
 
 
 class MissAVAdapter:
-    def __init__(self, missav_pipeline_root: Path) -> None:
+    def __init__(
+        self,
+        missav_pipeline_root: Path,
+        python_executable: Path | str | None = None,
+    ) -> None:
         self.missav_pipeline_root = missav_pipeline_root
+        self.python_executable = self._default_python_executable(python_executable)
 
     def download_metadata(self, movie_number: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
-            sys.executable,
+            str(self.python_executable),
             str(self.missav_pipeline_root / "new-release" / "unified_download.py"),
         ]
         completed = subprocess.run(
@@ -64,7 +69,7 @@ class MissAVAdapter:
             )
 
             command = [
-                sys.executable,
+                str(self.python_executable),
                 str(self.missav_pipeline_root / "new-release" / "batch_audio_downloader.py"),
                 "--json-file",
                 str(catalog_path),
@@ -81,7 +86,7 @@ class MissAVAdapter:
             ]
             completed = subprocess.run(
                 command,
-                cwd=self.missav_pipeline_root,
+                cwd=temp_dir,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -158,3 +163,11 @@ class MissAVAdapter:
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+
+    def _default_python_executable(self, python_executable: Path | str | None) -> Path:
+        if python_executable is not None:
+            return Path(python_executable)
+        pipeline_python = self.missav_pipeline_root / ".venv" / "bin" / "python"
+        if pipeline_python.exists():
+            return pipeline_python
+        return Path(sys.executable)

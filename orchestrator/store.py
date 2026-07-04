@@ -272,6 +272,36 @@ class JobStore:
             assert job is not None
             return job
 
+    def claim_next_download_job(self) -> JobRecord | None:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ?
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                (JobStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?, error = NULL
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    JobStatus.DOWNLOADING_METADATA.value,
+                    now,
+                    row["id"],
+                    JobStatus.QUEUED.value,
+                ),
+            )
+            return self.get_job(row["id"], conn=conn)
+
     def claim_next_worker_job(self, worker_id: str, lease_seconds: int) -> JobRecord | None:
         now = utc_now_iso()
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
