@@ -2,7 +2,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -181,6 +181,264 @@ class JobStore:
         with self.connection() as active_conn:
             row = active_conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             return self._row_to_job(row) if row else None
+
+    def list_jobs(self, status: JobStatus | None = None) -> list[JobRecord]:
+        with self.connection() as conn:
+            if status is None:
+                rows = conn.execute(
+                    "SELECT * FROM jobs ORDER BY priority ASC, created_at ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM jobs WHERE status = ? ORDER BY priority ASC, created_at ASC",
+                    (status.value,),
+                ).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
+    def update_download_status(
+        self,
+        job_id: str,
+        status: JobStatus,
+        *,
+        metadata_path_mac: str | None = None,
+        audio_path_mac: str | None = None,
+        audio_path_windows: str | None = None,
+        error: str | None = None,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?, metadata_path_mac = COALESCE(?, metadata_path_mac),
+                    audio_path_mac = COALESCE(?, audio_path_mac),
+                    audio_path_windows = COALESCE(?, audio_path_windows),
+                    error = ?
+                WHERE id = ?
+                """,
+                (
+                    status.value,
+                    now,
+                    metadata_path_mac,
+                    audio_path_mac,
+                    audio_path_windows,
+                    error,
+                    job_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(job_id)
+            job = self.get_job(job_id, conn=conn)
+            assert job is not None
+            return job
+
+    def mark_audio_ready(self, job_id: str) -> JobRecord:
+        job = self.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        paths = build_job_paths(
+            job.normalized_movie_number,
+            self.jobs_root_mac,
+            self.jobs_root_windows,
+        )
+        return self.update_download_status(
+            job_id,
+            JobStatus.AUDIO_READY,
+            metadata_path_mac=str(paths.metadata_path_mac),
+            audio_path_mac=str(paths.audio_path_mac),
+            audio_path_windows=paths.audio_path_windows,
+        )
+
+    def claim_next_worker_job(self, worker_id: str, lease_seconds: int) -> JobRecord | None:
+        now = utc_now_iso()
+        lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ?
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                (JobStatus.AUDIO_READY.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (JobStatus.TRANSCRIPTION_CLAIMED.value, worker_id, lease, now, row["id"]),
+            )
+            return self.get_job(row["id"], conn=conn)
+
+    def heartbeat(
+        self,
+        job_id: str,
+        worker_id: str,
+        stage: JobStatus,
+        lease_seconds: int,
+    ) -> JobRecord:
+        lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (stage.value, lease, now, job_id, worker_id),
+            )
+            if cursor.rowcount == 0:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            job = self.get_job(job_id, conn=conn)
+            assert job is not None
+            return job
+
+    def complete_worker_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        japanese_srt_path_windows: str,
+        english_srt_path_windows: str,
+        final_file_exists,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if not final_file_exists(str(paths.english_srt_path_mac)):
+                raise FileNotFoundError(paths.english_srt_path_mac)
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL,
+                    japanese_srt_path_mac = ?, japanese_srt_path_windows = ?,
+                    english_srt_path_mac = ?, english_srt_path_windows = ?
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    now,
+                    str(paths.japanese_srt_path_mac),
+                    japanese_srt_path_windows,
+                    str(paths.english_srt_path_mac),
+                    english_srt_path_windows,
+                    job_id,
+                    worker_id,
+                ),
+            )
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def fail_worker_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        stage: JobStatus,
+        error: str,
+        max_worker_attempts: int,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            next_attempts = job.worker_attempt_count + 1
+            next_status = (
+                JobStatus.FAILED
+                if next_attempts >= max_worker_attempts
+                else JobStatus.AUDIO_READY
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (
+                    next_status.value,
+                    next_attempts,
+                    now,
+                    f"{stage.value}: {error}",
+                    job_id,
+                    worker_id,
+                ),
+            )
+            failed = self.get_job(job_id, conn=conn)
+            assert failed is not None
+            return failed
+
+    def recover_expired_worker_leases(self, max_worker_attempts: int) -> int:
+        now = utc_now_iso()
+        recovered = 0
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN (?, ?, ?) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+                """,
+                (
+                    JobStatus.TRANSCRIPTION_CLAIMED.value,
+                    JobStatus.TRANSCRIBING.value,
+                    JobStatus.TRANSLATING.value,
+                    now,
+                ),
+            ).fetchall()
+            for row in rows:
+                attempts = row["worker_attempt_count"] + 1
+                next_status = (
+                    JobStatus.FAILED if attempts >= max_worker_attempts else JobStatus.AUDIO_READY
+                )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                        lease_expires_at = NULL, updated_at = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_status.value,
+                        attempts,
+                        now,
+                        "worker lease expired",
+                        row["id"],
+                    ),
+                )
+                recovered += 1
+        return recovered
+
+    def force_lease_expiry_for_test(self, job_id: str, lease_expires_at: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET lease_expires_at = ? WHERE id = ?",
+                (lease_expires_at, job_id),
+            )
 
     def _get_by_normalized(self, conn: sqlite3.Connection, normalized: str) -> JobRecord | None:
         row = conn.execute(
