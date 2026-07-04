@@ -4,8 +4,13 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAC_ENV_FILE = PROJECT_ROOT / ".env"
+WINDOWS_ENV_FILE = PROJECT_ROOT / ".env.windows"
+
+
 class MacSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=MAC_ENV_FILE, extra="ignore")
 
     host: str = Field(default="0.0.0.0", alias="ORCHESTRATOR_HOST")
     port: int = Field(default=8000, alias="ORCHESTRATOR_PORT")
@@ -26,7 +31,7 @@ class MacSettings(BaseSettings):
 
 
 class WindowsSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=WINDOWS_ENV_FILE, extra="ignore")
 
     mac_api_base_url: str = Field(alias="MAC_API_BASE_URL")
     worker_id: str = Field(default="windows-gpu-1", alias="WORKER_ID")
