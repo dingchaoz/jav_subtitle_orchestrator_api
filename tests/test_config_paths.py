@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from orchestrator.config import MacSettings, WindowsSettings
+from orchestrator.paths import build_job_paths, normalize_movie_number
 
 
 MAC_ENV_ALIASES = (
@@ -93,3 +94,28 @@ def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):
 
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000
+
+
+def test_normalize_movie_number_lowercases_and_keeps_dash():
+    assert normalize_movie_number(" KTB-096 ") == "ktb-096"
+
+
+def test_normalize_movie_number_accepts_id_without_dash():
+    assert normalize_movie_number("KTB096") == "ktb-096"
+
+
+def test_normalize_movie_number_rejects_invalid_ids():
+    assert normalize_movie_number("bad id") is None
+    assert normalize_movie_number("") is None
+
+
+def test_build_job_paths_maps_mac_root_to_windows_root(tmp_path):
+    paths = build_job_paths("ktb-096", tmp_path, "M:\\")
+
+    assert paths.job_dir_mac == tmp_path / "ktb-096"
+    assert paths.job_dir_windows == "M:\\ktb-096"
+    assert paths.metadata_path_mac == tmp_path / "ktb-096" / "metadata.json"
+    assert paths.audio_path_mac == tmp_path / "ktb-096" / "audio.wav"
+    assert paths.audio_path_windows == "M:\\ktb-096\\audio.wav"
+    assert paths.japanese_srt_path_windows == "M:\\ktb-096\\ktb-096.Japanese.srt"
+    assert paths.english_srt_path_windows == "M:\\ktb-096\\ktb-096.English.srt"
