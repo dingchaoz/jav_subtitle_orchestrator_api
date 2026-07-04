@@ -1,5 +1,6 @@
 import time
 from pathlib import Path
+from threading import Event, Thread
 
 import requests
 
@@ -53,10 +54,17 @@ class MacApiClient:
 
 
 class WindowsWorker:
-    def __init__(self, client, transcriber, translator) -> None:
+    def __init__(
+        self,
+        client,
+        transcriber,
+        translator,
+        heartbeat_interval_seconds: float = 60,
+    ) -> None:
         self.client = client
         self.transcriber = transcriber
         self.translator = translator
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
 
     def process_one(self) -> bool:
         job = self.client.next_job()
@@ -71,20 +79,64 @@ class WindowsWorker:
             english_srt = Path(job["english_srt_path_windows"])
 
             self.client.heartbeat(job_id, stage)
-            self.transcriber.transcribe_to_srt(audio_path, japanese_srt)
+            self._run_with_periodic_heartbeat(
+                job_id,
+                stage,
+                self.transcriber.transcribe_to_srt,
+                audio_path,
+                japanese_srt,
+            )
 
             stage = "transcription_done"
             self.client.heartbeat(job_id, stage)
 
             stage = "translating"
             self.client.heartbeat(job_id, stage)
-            self.translator.translate_to_english(japanese_srt, english_srt)
+            self._run_with_periodic_heartbeat(
+                job_id,
+                stage,
+                self.translator.translate_to_english,
+                japanese_srt,
+                english_srt,
+            )
 
             self.client.complete(job_id, str(japanese_srt), str(english_srt))
             return True
         except Exception as exc:
             self.client.failed(job_id, stage, str(exc))
             return True
+
+    def _run_with_periodic_heartbeat(self, job_id: str, stage: str, operation, *args) -> None:
+        stop = Event()
+        errors: list[BaseException] = []
+        thread = Thread(
+            target=self._heartbeat_until_stopped,
+            args=(job_id, stage, stop, errors),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            operation(*args)
+        finally:
+            stop.set()
+            thread.join()
+        if errors:
+            raise errors[0]
+
+    def _heartbeat_until_stopped(
+        self,
+        job_id: str,
+        stage: str,
+        stop: Event,
+        errors: list[BaseException],
+    ) -> None:
+        while not stop.wait(self.heartbeat_interval_seconds):
+            try:
+                self.client.heartbeat(job_id, stage)
+            except BaseException as exc:
+                errors.append(exc)
+                stop.set()
+                return
 
 
 def run_forever(worker: WindowsWorker, poll_interval_seconds: int) -> None:

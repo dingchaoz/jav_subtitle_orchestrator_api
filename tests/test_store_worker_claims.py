@@ -106,3 +106,30 @@ def test_expired_worker_lease_returns_job_to_audio_ready(sqlite_path, mac_jobs_r
     assert refreshed.status == JobStatus.AUDIO_READY
     assert refreshed.worker_attempt_count == 1
     assert refreshed.claimed_by is None
+
+
+def test_expired_transcription_done_worker_lease_returns_job_to_audio_ready(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1)
+    heartbeat = store.heartbeat(
+        claimed.id,
+        "windows-gpu-1",
+        JobStatus.TRANSCRIPTION_DONE,
+        lease_seconds=1,
+    )
+    expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    store.force_lease_expiry_for_test(heartbeat.id, expired)
+
+    recovered = store.recover_expired_worker_leases(max_worker_attempts=3)
+
+    assert recovered == 1
+    refreshed = store.get_job(heartbeat.id)
+    assert refreshed.status == JobStatus.AUDIO_READY
+    assert refreshed.worker_attempt_count == 1
+    assert refreshed.claimed_by is None

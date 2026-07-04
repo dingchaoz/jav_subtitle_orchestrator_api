@@ -454,11 +454,13 @@ class JobStore:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status IN (?, ?, ?) AND lease_expires_at IS NOT NULL AND lease_expires_at < ?
+                WHERE status IN (?, ?, ?, ?) AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
                 """,
                 (
                     JobStatus.TRANSCRIPTION_CLAIMED.value,
                     JobStatus.TRANSCRIBING.value,
+                    JobStatus.TRANSCRIPTION_DONE.value,
                     JobStatus.TRANSLATING.value,
                     now,
                 ),

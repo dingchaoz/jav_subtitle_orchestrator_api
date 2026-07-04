@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import Event
 
 from orchestrator.windows_worker import WindowsWorker
 
@@ -41,6 +42,52 @@ class FakeTranslator:
         )
 
 
+class BlockingFakeClient(FakeClient):
+    def __init__(self, job, stage: str):
+        super().__init__(job)
+        self.stage = stage
+        self.operation_started = Event()
+        self.periodic_heartbeat_seen = Event()
+
+    def heartbeat(self, job_id, stage):
+        super().heartbeat(job_id, stage)
+        if stage == self.stage and self.operation_started.is_set():
+            self.periodic_heartbeat_seen.set()
+
+
+class BlockingTranscriber(FakeTranscriber):
+    def __init__(self, client: BlockingFakeClient):
+        self.client = client
+
+    def transcribe_to_srt(self, audio_path: Path, output_path: Path) -> None:
+        self.client.operation_started.set()
+        assert self.client.periodic_heartbeat_seen.wait(timeout=1)
+        super().transcribe_to_srt(audio_path, output_path)
+
+
+class BlockingTranslator(FakeTranslator):
+    def __init__(self, client: BlockingFakeClient):
+        self.client = client
+
+    def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
+        self.client.operation_started.set()
+        assert self.client.periodic_heartbeat_seen.wait(timeout=1)
+        super().translate_to_english(input_srt, output_srt)
+
+
+def make_job(tmp_path):
+    job_dir = tmp_path / "ktb-096"
+    job_dir.mkdir()
+    audio = job_dir / "audio.wav"
+    audio.write_bytes(b"RIFFfakeWAVE")
+    return {
+        "id": "job_1",
+        "audio_path_windows": str(audio),
+        "japanese_srt_path_windows": str(job_dir / "ktb-096.Japanese.srt"),
+        "english_srt_path_windows": str(job_dir / "ktb-096.English.srt"),
+    }
+
+
 def test_windows_worker_processes_one_job(tmp_path):
     job_dir = tmp_path / "ktb-096"
     job_dir.mkdir()
@@ -77,3 +124,37 @@ def test_windows_worker_returns_false_when_no_job():
     worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
 
     assert worker.process_one() is False
+
+
+def test_windows_worker_heartbeats_during_long_transcription(tmp_path):
+    job = make_job(tmp_path)
+    client = BlockingFakeClient(job, "transcribing")
+    worker = WindowsWorker(
+        client,
+        BlockingTranscriber(client),
+        FakeTranslator(),
+        heartbeat_interval_seconds=0.001,
+    )
+
+    processed = worker.process_one()
+
+    assert processed is True
+    assert client.periodic_heartbeat_seen.is_set()
+    assert client.heartbeats.count(("job_1", "transcribing")) >= 2
+
+
+def test_windows_worker_heartbeats_during_long_translation(tmp_path):
+    job = make_job(tmp_path)
+    client = BlockingFakeClient(job, "translating")
+    worker = WindowsWorker(
+        client,
+        FakeTranscriber(),
+        BlockingTranslator(client),
+        heartbeat_interval_seconds=0.001,
+    )
+
+    processed = worker.process_one()
+
+    assert processed is True
+    assert client.periodic_heartbeat_seen.is_set()
+    assert client.heartbeats.count(("job_1", "translating")) >= 2
