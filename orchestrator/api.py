@@ -46,6 +46,16 @@ def worker_job_response(job: JobRecord) -> WorkerJobResponse:
     )
 
 
+def worker_mutation_http_error(
+    exc: KeyError | PermissionError | FileNotFoundError,
+) -> HTTPException:
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail="job not found")
+    if isinstance(exc, PermissionError):
+        return HTTPException(status_code=409, detail="job is not claimed by worker")
+    return HTTPException(status_code=409, detail=f"final file not found: {exc}")
+
+
 def create_app(
     store: JobStore,
     *,
@@ -97,29 +107,40 @@ def create_app(
 
     @app.post("/worker/jobs/{job_id}/heartbeat", response_model=JobResponse)
     def heartbeat(job_id: str, request: WorkerHeartbeatRequest) -> JobResponse:
-        job = store.heartbeat(job_id, request.worker_id, request.stage, worker_lease_seconds)
+        if store.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            job = store.heartbeat(job_id, request.worker_id, request.stage, worker_lease_seconds)
+        except (KeyError, PermissionError, FileNotFoundError) as exc:
+            raise worker_mutation_http_error(exc) from exc
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/complete", response_model=JobResponse)
     def complete(job_id: str, request: WorkerCompleteRequest) -> JobResponse:
-        job = store.complete_worker_job(
-            job_id,
-            request.worker_id,
-            request.japanese_srt_path_windows,
-            request.english_srt_path_windows,
-            final_file_exists,
-        )
+        try:
+            job = store.complete_worker_job(
+                job_id,
+                request.worker_id,
+                request.japanese_srt_path_windows,
+                request.english_srt_path_windows,
+                final_file_exists,
+            )
+        except (KeyError, PermissionError, FileNotFoundError) as exc:
+            raise worker_mutation_http_error(exc) from exc
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/failed", response_model=JobResponse)
     def failed(job_id: str, request: WorkerFailedRequest) -> JobResponse:
-        job = store.fail_worker_job(
-            job_id,
-            request.worker_id,
-            request.stage,
-            request.error,
-            max_worker_attempts,
-        )
+        try:
+            job = store.fail_worker_job(
+                job_id,
+                request.worker_id,
+                request.stage,
+                request.error,
+                max_worker_attempts,
+            )
+        except (KeyError, PermissionError, FileNotFoundError) as exc:
+            raise worker_mutation_http_error(exc) from exc
         return job_response(job)
 
     return app

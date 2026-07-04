@@ -54,3 +54,76 @@ def test_worker_heartbeat_and_failure(sqlite_path, mac_jobs_root):
     assert failed.status_code == 200
     assert failed.json()["status"] == "audio_ready"
     assert failed.json()["error"] == "transcribing: CUDA out of memory"
+
+
+def test_worker_heartbeat_missing_job_returns_404(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    client = TestClient(create_app(store), raise_server_exceptions=False)
+
+    response = client.post(
+        "/worker/jobs/missing-job/heartbeat",
+        json={"worker_id": "windows-gpu-1", "stage": "transcribing"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "job not found"
+
+
+def test_worker_failed_wrong_worker_returns_409(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    client = TestClient(create_app(store), raise_server_exceptions=False)
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/failed",
+        json={"worker_id": "windows-gpu-2", "stage": "transcribing", "error": "wrong worker"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job is not claimed by worker"
+
+
+def test_worker_complete_missing_final_file_returns_409(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    client = TestClient(create_app(store), raise_server_exceptions=False)
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/complete",
+        json={
+            "worker_id": "windows-gpu-1",
+            "japanese_srt_path_windows": "M:\\ktb-096\\ktb-096.Japanese.srt",
+            "english_srt_path_windows": "M:\\ktb-096\\ktb-096.English.srt",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "final file not found" in response.json()["detail"]
+
+
+def test_worker_complete_success_with_existing_final_file(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    client = TestClient(create_app(store, final_file_exists=lambda path: True))
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/complete",
+        json={
+            "worker_id": "windows-gpu-1",
+            "japanese_srt_path_windows": "M:\\ktb-096\\ktb-096.Japanese.srt",
+            "english_srt_path_windows": "M:\\ktb-096\\ktb-096.English.srt",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "english_srt_ready"
