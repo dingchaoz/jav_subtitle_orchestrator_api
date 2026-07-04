@@ -44,6 +44,22 @@ def test_mac_worker_processes_one_queued_job_to_audio_ready(sqlite_path, mac_job
     assert (mac_jobs_root / "ktb-096" / "job.json").exists()
 
 
+def test_mac_worker_writes_download_log(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    store.submit_job("ktb-096", priority=100, force=False)
+    worker = MacDownloadWorker(store, FakeMissAVAdapter(), max_download_attempts=3)
+
+    assert worker.process_one() is True
+
+    log_path = mac_jobs_root / "ktb-096" / "logs" / "mac-download.log"
+    assert log_path.read_text(encoding="utf-8") == (
+        "downloading_metadata ktb-096\n"
+        "downloading_audio ktb-096\n"
+        "audio_ready ktb-096\n"
+    )
+
+
 def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

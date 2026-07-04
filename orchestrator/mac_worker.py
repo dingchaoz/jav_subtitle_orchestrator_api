@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 
+from orchestrator.job_logs import append_job_log
 from orchestrator.job_snapshot import write_job_snapshot
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
@@ -32,6 +33,11 @@ class MacDownloadWorker:
         Path(paths.job_dir_mac).mkdir(parents=True, exist_ok=True)
         write_job_snapshot(job)
 
+        append_job_log(
+            paths.job_dir_mac,
+            "mac-download.log",
+            f"downloading_metadata {job.normalized_movie_number}",
+        )
         self.adapter.download_metadata(job.normalized_movie_number, paths.metadata_path_mac)
         updated = self.store.update_download_status(
             job.id,
@@ -40,6 +46,11 @@ class MacDownloadWorker:
         )
         write_job_snapshot(updated)
 
+        append_job_log(
+            paths.job_dir_mac,
+            "mac-download.log",
+            f"downloading_audio {job.normalized_movie_number}",
+        )
         self.adapter.download_audio(job.normalized_movie_number, paths.audio_path_mac)
         updated = self.store.update_download_status(
             job.id,
@@ -49,6 +60,11 @@ class MacDownloadWorker:
             audio_path_windows=paths.audio_path_windows,
         )
         write_job_snapshot(updated)
+        append_job_log(
+            paths.job_dir_mac,
+            "mac-download.log",
+            f"audio_ready {job.normalized_movie_number}",
+        )
 
     def _record_failure(self, job: JobRecord, error: str) -> None:
         next_attempts = job.attempt_count + 1

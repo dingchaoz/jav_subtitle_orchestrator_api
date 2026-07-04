@@ -149,6 +149,23 @@ def test_windows_worker_processes_one_job(tmp_path):
     ]
 
 
+def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
+
+    assert worker.process_one() is True
+
+    job_dir = Path(job["audio_path_windows"]).parent
+    assert "claimed job_1\n" in (job_dir / "logs" / "windows-worker.log").read_text(
+        encoding="utf-8"
+    )
+    assert "transcribing" in (job_dir / "logs" / "whisper.log").read_text(encoding="utf-8")
+    assert "translating" in (job_dir / "logs" / "translate.log").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_windows_worker_returns_false_when_no_job():
     client = FakeClient(None)
     worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
