@@ -39,3 +39,4 @@ Setup details:
 - [Mac setup](docs/setup/mac.md)
 - [Windows setup](docs/setup/windows.md)
 - [SMB setup](docs/setup/smb.md)
+- [Codex translation batch helper](docs/setup/codex-translation.md)
