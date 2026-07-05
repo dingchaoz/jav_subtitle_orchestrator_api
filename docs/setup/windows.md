@@ -5,7 +5,7 @@
 2. Create `.env.windows` from `.env.windows.example`:
 
 ```text
-MAC_API_BASE_URL=http://192.168.1.247:8000
+MAC_API_BASE_URL=http://192.168.1.205:8010
 WORKER_ID=windows-gpu-1
 WINDOWS_JOBS_ROOT=M:\
 WHISPER_MODEL=large-v3-turbo

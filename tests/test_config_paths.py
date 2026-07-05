@@ -85,7 +85,7 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     settings = MacSettings(_env_file=None)
 
     assert settings.host == "0.0.0.0"
-    assert settings.port == 8000
+    assert settings.port == 8010
     assert settings.db_path == db_path
     assert settings.missav_pipeline_root == Path("/Users/ytt/Documents/startup/MissAV-Pipeline")
     assert settings.jobs_root_mac == Path("/Users/ytt/MissAVJobs")
@@ -98,7 +98,7 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
 
 def test_windows_settings_defaults_match_design_spec(monkeypatch):
     clear_env_aliases(monkeypatch, WINDOWS_ENV_ALIASES)
-    monkeypatch.setenv("MAC_API_BASE_URL", "http://192.168.1.25:8000")
+    monkeypatch.setenv("MAC_API_BASE_URL", "http://192.168.1.205:8010")
     monkeypatch.setenv("WORKER_ID", "windows-gpu-1")
     monkeypatch.setenv("WINDOWS_JOBS_ROOT", "M:\\")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
@@ -109,7 +109,7 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
 
     settings = WindowsSettings(_env_file=None)
 
-    assert settings.mac_api_base_url == "http://192.168.1.25:8000"
+    assert settings.mac_api_base_url == "http://192.168.1.205:8010"
     assert settings.worker_id == "windows-gpu-1"
     assert settings.windows_jobs_root == "M:\\"
     assert settings.whisper_model == "large-v3-turbo"
@@ -131,7 +131,7 @@ def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):
     settings = MacSettings()
 
     assert settings.host == "0.0.0.0"
-    assert settings.port == 8000
+    assert settings.port == 8010
 
 
 def test_normalize_movie_number_lowercases_and_keeps_dash():

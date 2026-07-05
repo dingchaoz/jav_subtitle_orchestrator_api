@@ -13,7 +13,7 @@ class MacSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=MAC_ENV_FILE, extra="ignore")
 
     host: str = Field(default="0.0.0.0", alias="ORCHESTRATOR_HOST")
-    port: int = Field(default=8000, alias="ORCHESTRATOR_PORT")
+    port: int = Field(default=8010, alias="ORCHESTRATOR_PORT")
     db_path: Path = Field(
         default=Path("/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/data/jobs.sqlite3"),
         alias="ORCHESTRATOR_DB_PATH",

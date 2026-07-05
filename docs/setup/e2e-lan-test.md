@@ -4,8 +4,8 @@ Use this runbook after all unit and integration tests pass. It verifies one movi
 
 ## Preconditions
 
-- Mac API is bound to `0.0.0.0:8000`.
-- Windows `.env.windows` sets `MAC_API_BASE_URL` to the Mac LAN address, for example `http://192.168.1.247:8000`.
+- Mac API is bound to `0.0.0.0:8010`.
+- Windows `.env.windows` sets `MAC_API_BASE_URL` to the Mac LAN address, for example `http://192.168.1.205:8010`.
 - Mac downloader worker is running.
 - Windows worker is running.
 - Windows can read and write `M:\`.
@@ -20,7 +20,7 @@ Use this runbook after all unit and integration tests pass. It verifies one movi
 Submit `ktb-096` from the Mac:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/jobs \
+curl -X POST http://127.0.0.1:8010/jobs \
   -H "Content-Type: application/json" \
   -d '{"movie_number":"ktb-096","priority":100,"force":false}'
 ```
@@ -43,7 +43,7 @@ Expected queued response:
 From Windows, confirm the worker can reach the Mac API through the same LAN address configured in `.env.windows`:
 
 ```powershell
-Invoke-RestMethod http://192.168.1.247:8000/jobs
+Invoke-RestMethod http://192.168.1.205:8010/jobs
 ```
 
 Expected result: the request succeeds and returns the current JSON job list. If this fails, fix LAN routing, firewall rules, or `MAC_API_BASE_URL` before relying on the Windows worker.
@@ -96,7 +96,7 @@ M:\ktb-096\ktb-096.English.srt
 From the Mac, check job status:
 
 ```bash
-curl http://127.0.0.1:8000/jobs
+curl http://127.0.0.1:8010/jobs
 ```
 
 Expected `ktb-096` status:

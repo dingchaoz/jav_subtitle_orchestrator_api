@@ -10,7 +10,7 @@ mkdir -p /Users/ytt/MissAVJobs
 
 ```text
 ORCHESTRATOR_HOST=0.0.0.0
-ORCHESTRATOR_PORT=8000
+ORCHESTRATOR_PORT=8010
 ORCHESTRATOR_DB_PATH=/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/data/jobs.sqlite3
 MISSAV_PIPELINE_ROOT=/Users/ytt/Documents/startup/MissAV-Pipeline
 JOBS_ROOT_MAC=/Users/ytt/MissAVJobs
@@ -42,7 +42,7 @@ python -m orchestrator mac-worker
 5. Submit a batch:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/jobs/batch \
+curl -X POST http://127.0.0.1:8010/jobs/batch \
   -H "Content-Type: application/json" \
   -d '{"movie_numbers":["ktb-096","ktb-095","ktb-093"],"priority":100,"force":false}'
 ```
