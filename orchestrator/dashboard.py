@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime
+from pathlib import Path
 
 from orchestrator.models import (
     DashboardJobSummary,
     DashboardStateResponse,
     JobDetailResponse,
+    JobLogSummary,
+    JobLogTailResponse,
+    JobLogsResponse,
     JobStatus,
 )
 from orchestrator.store import JobRecord, JobStore
@@ -122,3 +126,55 @@ def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> Dashboa
 
 def job_has_active_error(job: JobRecord) -> bool:
     return job.status == JobStatus.FAILED or bool(job.error)
+
+
+ALLOWED_LOG_NAMES = (
+    "mac-download.log",
+    "windows-worker.log",
+    "whisper.log",
+    "translate.log",
+)
+
+
+def _job_logs_dir(job: JobRecord) -> Path:
+    return Path(job.job_dir_mac) / "logs"
+
+
+def _resolve_allowed_log_path(job: JobRecord, log_name: str) -> Path:
+    if log_name not in ALLOWED_LOG_NAMES:
+        raise FileNotFoundError(log_name)
+    logs_dir = _job_logs_dir(job).resolve()
+    path = (logs_dir / log_name).resolve()
+    if path.parent != logs_dir:
+        raise FileNotFoundError(log_name)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(log_name)
+    return path
+
+
+def list_job_logs(job: JobRecord) -> JobLogsResponse:
+    logs: list[JobLogSummary] = []
+    logs_dir = _job_logs_dir(job)
+    for log_name in ALLOWED_LOG_NAMES:
+        path = logs_dir / log_name
+        if path.exists() and path.is_file():
+            logs.append(
+                JobLogSummary(
+                    name=log_name,
+                    size_bytes=path.stat().st_size,
+                    available=True,
+                )
+            )
+    return JobLogsResponse(job_id=job.id, logs=logs)
+
+
+def read_job_log_tail(job: JobRecord, log_name: str, tail: int = 200) -> JobLogTailResponse:
+    bounded_tail = min(max(tail, 1), 1000)
+    path = _resolve_allowed_log_path(job, log_name)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return JobLogTailResponse(
+        job_id=job.id,
+        log_name=log_name,
+        tail=bounded_tail,
+        lines=lines[-bounded_tail:],
+    )

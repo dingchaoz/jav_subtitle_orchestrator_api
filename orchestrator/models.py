@@ -128,3 +128,21 @@ class JobDetailResponse(BaseModel):
     japanese_srt_path_windows: str | None = None
     english_srt_path_mac: str | None = None
     english_srt_path_windows: str | None = None
+
+
+class JobLogSummary(BaseModel):
+    name: str
+    size_bytes: int
+    available: bool
+
+
+class JobLogsResponse(BaseModel):
+    job_id: str
+    logs: list[JobLogSummary]
+
+
+class JobLogTailResponse(BaseModel):
+    job_id: str
+    log_name: str
+    tail: int
+    lines: list[str]
