@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Query
 
@@ -16,6 +17,11 @@ from orchestrator.models import (
     WorkerNextJobResponse,
 )
 from orchestrator.store import JobRecord, JobStore
+
+
+class EnglishAiPublisher(Protocol):
+    def publish_english_ai(self, movie_code: str, srt_path: Path) -> object:
+        ...
 
 
 def job_response(job: JobRecord) -> JobResponse:
@@ -62,6 +68,7 @@ def create_app(
     worker_lease_seconds: int = 1800,
     max_worker_attempts: int = 3,
     final_file_exists: Callable[[str], bool] | None = None,
+    publisher: EnglishAiPublisher | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
@@ -128,6 +135,11 @@ def create_app(
             )
         except (KeyError, PermissionError, FileNotFoundError) as exc:
             raise worker_mutation_http_error(exc) from exc
+        if publisher is not None and job.english_srt_path_mac:
+            publisher.publish_english_ai(
+                job.normalized_movie_number,
+                Path(job.english_srt_path_mac),
+            )
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/failed", response_model=JobResponse)

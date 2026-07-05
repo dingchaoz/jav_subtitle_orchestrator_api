@@ -28,6 +28,13 @@ class MacSettings(BaseSettings):
     worker_lease_seconds: int = Field(default=1800, alias="WORKER_LEASE_SECONDS")
     max_download_attempts: int = Field(default=3, alias="MAX_DOWNLOAD_ATTEMPTS")
     max_worker_attempts: int = Field(default=3, alias="MAX_WORKER_ATTEMPTS")
+    publish_to_supabase: bool = Field(default=False, alias="PUBLISH_TO_SUPABASE")
+    supabase_url: str | None = Field(default=None, alias="SUPABASE_URL")
+    supabase_service_role_key: str | None = Field(
+        default=None,
+        alias="SUPABASE_SERVICE_ROLE_KEY",
+    )
+    supabase_storage_bucket: str = Field(default="subtitles", alias="SUPABASE_STORAGE_BUCKET")
 
 
 class WindowsSettings(BaseSettings):
