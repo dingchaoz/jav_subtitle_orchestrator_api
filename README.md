@@ -14,3 +14,28 @@ Version 1 target:
 - Windows NVIDIA laptop polls the Mac API, reads audio over SMB, runs Japanese transcription, runs English SRT translation, and writes final SRT files back to the shared folder.
 - SQLite stores queue state for one or many movie IDs.
 
+## Version 1 Run Commands
+
+Mac API:
+
+```bash
+python -m orchestrator api
+```
+
+Mac downloader worker:
+
+```bash
+python -m orchestrator mac-worker
+```
+
+Windows worker:
+
+```powershell
+python -m orchestrator windows-worker
+```
+
+Setup details:
+
+- [Mac setup](docs/setup/mac.md)
+- [Windows setup](docs/setup/windows.md)
+- [SMB setup](docs/setup/smb.md)

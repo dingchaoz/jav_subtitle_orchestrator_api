@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from orchestrator.config import MacSettings, WindowsSettings
@@ -34,6 +36,20 @@ WINDOWS_ENV_ALIASES = (
 def clear_env_aliases(monkeypatch, aliases):
     for alias in aliases:
         monkeypatch.delenv(alias, raising=False)
+
+
+def test_module_cli_prints_help():
+    result = subprocess.run(
+        [sys.executable, "-m", "orchestrator", "--help"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "api" in result.stdout
+    assert "mac-worker" in result.stdout
+    assert "windows-worker" in result.stdout
 
 
 def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
