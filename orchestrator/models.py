@@ -86,3 +86,45 @@ class WorkerJobResponse(BaseModel):
 
 class WorkerNextJobResponse(BaseModel):
     job: WorkerJobResponse | None
+
+
+class DashboardJobSummary(BaseModel):
+    id: str
+    movie_number: str
+    status: JobStatus
+    priority: int
+    updated_at: str
+    claimed_by: str | None = None
+    error: str | None = None
+
+
+class DashboardStateResponse(BaseModel):
+    api: dict[str, str | bool]
+    activity: dict[str, dict[str, str | None]]
+    counts: dict[str, int]
+    latest_jobs: list[DashboardJobSummary]
+    active_errors: list[DashboardJobSummary]
+
+
+class JobDetailResponse(BaseModel):
+    id: str
+    movie_number: str
+    normalized_movie_number: str
+    status: JobStatus
+    priority: int
+    attempt_count: int
+    worker_attempt_count: int
+    claimed_by: str | None = None
+    lease_expires_at: str | None = None
+    created_at: str
+    updated_at: str
+    error: str | None = None
+    job_dir_mac: str
+    job_dir_windows: str
+    metadata_path_mac: str | None = None
+    audio_path_mac: str | None = None
+    audio_path_windows: str | None = None
+    japanese_srt_path_mac: str | None = None
+    japanese_srt_path_windows: str | None = None
+    english_srt_path_mac: str | None = None
+    english_srt_path_windows: str | None = None
