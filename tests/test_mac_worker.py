@@ -84,6 +84,25 @@ def test_mac_worker_audio_ready_log_failure_does_not_requeue_job(
     assert refreshed.error is None
 
 
+def test_mac_worker_recovers_interrupted_download_before_claiming_next_job(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    claimed = store.claim_next_download_job()
+    assert claimed.status == JobStatus.DOWNLOADING_METADATA
+    worker = MacDownloadWorker(store, FakeMissAVAdapter(), max_download_attempts=3)
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status == JobStatus.AUDIO_READY
+    assert refreshed.attempt_count == 1
+    assert Path(refreshed.audio_path_mac).exists()
+
+
 def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

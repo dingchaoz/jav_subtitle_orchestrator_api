@@ -22,6 +22,7 @@ class MacDownloadWorker:
         self.max_download_attempts = max_download_attempts
 
     def process_one(self) -> bool:
+        self.store.recover_interrupted_downloads(self.max_download_attempts)
         job = self.store.claim_next_download_job()
         if job is None:
             return False

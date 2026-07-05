@@ -302,6 +302,43 @@ class JobStore:
             )
             return self.get_job(row["id"], conn=conn)
 
+    def recover_interrupted_downloads(self, max_download_attempts: int) -> int:
+        now = utc_now_iso()
+        recovered = 0
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status IN (?, ?)
+                """,
+                (
+                    JobStatus.DOWNLOADING_METADATA.value,
+                    JobStatus.DOWNLOADING_AUDIO.value,
+                ),
+            ).fetchall()
+            for row in rows:
+                attempts = row["attempt_count"] + 1
+                next_status = (
+                    JobStatus.FAILED if attempts >= max_download_attempts else JobStatus.QUEUED
+                )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, attempt_count = ?, updated_at = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_status.value,
+                        attempts,
+                        now,
+                        "download interrupted",
+                        row["id"],
+                    ),
+                )
+                recovered += 1
+        return recovered
+
     def claim_next_worker_job(self, worker_id: str, lease_seconds: int) -> JobRecord | None:
         now = utc_now_iso()
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(

@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,6 +63,15 @@ def test_windows_runtime_env_exports_openai_api_key(monkeypatch):
     _export_windows_runtime_env(SimpleNamespace(openai_api_key="loaded-key"))
 
     assert os.environ["OPENAI_API_KEY"] == "loaded-key"
+
+
+def test_windows_extra_installs_translation_script_dependencies():
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    windows_deps = pyproject["project"]["optional-dependencies"]["windows"]
+
+    assert "faster-whisper>=1.0.3" in windows_deps
+    assert "openai>=1.0.0" in windows_deps
+    assert "tqdm>=4.66.0" in windows_deps
 
 
 def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):

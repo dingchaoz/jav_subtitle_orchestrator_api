@@ -100,6 +100,7 @@ def create_app(
 
     @app.get("/worker/next-job", response_model=WorkerNextJobResponse)
     def next_job(worker_id: str) -> WorkerNextJobResponse:
+        store.recover_expired_worker_leases(max_worker_attempts)
         job = store.claim_next_worker_job(worker_id, worker_lease_seconds)
         if job is None:
             return WorkerNextJobResponse(job=None)

@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from orchestrator.api import create_app
+from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
 
 
@@ -30,6 +31,24 @@ def test_worker_next_job_claims_audio_ready_job(sqlite_path, mac_jobs_root):
     assert body["audio_path_windows"] == "M:\\ktb-096\\audio.wav"
     assert body["japanese_srt_path_windows"] == "M:\\ktb-096\\ktb-096.Japanese.srt"
     assert body["english_srt_path_windows"] == "M:\\ktb-096\\ktb-096.English.srt"
+
+
+def test_worker_next_job_recovers_expired_lease_before_claiming(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=-1)
+    client = TestClient(create_app(store, worker_lease_seconds=1800, max_worker_attempts=3))
+
+    response = client.get("/worker/next-job?worker_id=windows-gpu-2")
+
+    assert response.status_code == 200
+    assert response.json()["job"]["id"] == claimed.id
+    refreshed = store.get_job(claimed.id)
+    assert refreshed.status == JobStatus.TRANSCRIPTION_CLAIMED
+    assert refreshed.claimed_by == "windows-gpu-2"
+    assert refreshed.worker_attempt_count == 1
 
 
 def test_worker_heartbeat_and_failure(sqlite_path, mac_jobs_root):
