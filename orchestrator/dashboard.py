@@ -63,11 +63,15 @@ def build_job_detail(job: JobRecord) -> JobDetailResponse:
     )
 
 
+def dashboard_recency_key(job: JobRecord) -> tuple[str, str, str]:
+    return (job.updated_at, job.created_at, job.id)
+
+
 def _latest_active_job(jobs: list[JobRecord], statuses: set[JobStatus]) -> JobRecord | None:
     candidates = [job for job in jobs if job.status in statuses]
     if not candidates:
         return None
-    return sorted(candidates, key=lambda job: job.updated_at, reverse=True)[0]
+    return sorted(candidates, key=dashboard_recency_key, reverse=True)[0]
 
 
 def _activity_payload(job: JobRecord | None) -> dict[str, str | None]:
@@ -91,10 +95,10 @@ def _activity_payload(job: JobRecord | None) -> dict[str, str | None]:
 def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> DashboardStateResponse:
     jobs = store.list_jobs()
     counts = Counter(job.status.value for job in jobs)
-    latest = sorted(jobs, key=lambda job: job.updated_at, reverse=True)[:latest_limit]
+    latest = sorted(jobs, key=dashboard_recency_key, reverse=True)[:latest_limit]
     errors = [
         job
-        for job in sorted(jobs, key=lambda item: item.updated_at, reverse=True)
+        for job in sorted(jobs, key=dashboard_recency_key, reverse=True)
         if job_has_active_error(job)
     ]
     mac_job = _latest_active_job(jobs, MAC_ACTIVE_STATUSES)
