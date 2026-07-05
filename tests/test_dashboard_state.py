@@ -82,8 +82,16 @@ def test_build_job_detail_returns_full_operational_fields(sqlite_path, mac_jobs_
     assert detail.attempt_count == 0
     assert detail.worker_attempt_count == 0
     assert detail.claimed_by is None
+    assert detail.lease_expires_at is None
+    assert detail.created_at == ready.created_at
+    assert detail.updated_at == ready.updated_at
+    assert detail.error is None
     assert detail.job_dir_mac == str(mac_jobs_root / "ktb-112")
     assert detail.job_dir_windows == "M:\\ktb-112"
     assert detail.metadata_path_mac == str(mac_jobs_root / "ktb-112" / "metadata.json")
     assert detail.audio_path_mac == str(mac_jobs_root / "ktb-112" / "audio.wav")
     assert detail.audio_path_windows == "M:\\ktb-112\\audio.wav"
+    assert detail.japanese_srt_path_mac is None
+    assert detail.japanese_srt_path_windows is None
+    assert detail.english_srt_path_mac is None
+    assert detail.english_srt_path_windows is None
