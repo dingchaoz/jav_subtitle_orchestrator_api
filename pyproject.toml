@@ -31,6 +31,9 @@ windows = [
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.setuptools.packages.find]
+include = ["orchestrator*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
