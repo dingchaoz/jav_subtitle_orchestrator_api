@@ -84,6 +84,24 @@ def test_allowlisted_log_symlink_outside_logs_is_not_listed_or_tailed(
         read_job_log_tail(job, "translate.log")
 
 
+def test_symlinked_logs_directory_is_not_listed_or_tailed(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-112", priority=100, force=False).job
+    outside_logs_dir = mac_jobs_root / "outside-logs"
+    outside_logs_dir.mkdir(parents=True)
+    (outside_logs_dir / "translate.log").write_text("outside\n", encoding="utf-8")
+    logs_dir = mac_jobs_root / "ktb-112" / "logs"
+    logs_dir.parent.mkdir(parents=True)
+    logs_dir.symlink_to(outside_logs_dir, target_is_directory=True)
+
+    response = list_job_logs(job)
+
+    assert [log.name for log in response.logs] == []
+    with pytest.raises(FileNotFoundError):
+        read_job_log_tail(job, "translate.log")
+
+
 def test_allowlisted_log_directory_is_not_listed_or_tailed(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

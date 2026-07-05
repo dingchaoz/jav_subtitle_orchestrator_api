@@ -143,7 +143,10 @@ def _job_logs_dir(job: JobRecord) -> Path:
 def _resolve_allowed_log_path(job: JobRecord, log_name: str) -> Path:
     if log_name not in ALLOWED_LOG_NAMES:
         raise FileNotFoundError(log_name)
-    logs_dir = _job_logs_dir(job).resolve()
+    logs_dir_raw = _job_logs_dir(job)
+    if logs_dir_raw.is_symlink():
+        raise FileNotFoundError(log_name)
+    logs_dir = logs_dir_raw.resolve()
     path = (logs_dir / log_name).resolve()
     if path.parent != logs_dir:
         raise FileNotFoundError(log_name)
