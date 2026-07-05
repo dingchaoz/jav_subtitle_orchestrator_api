@@ -677,6 +677,10 @@ def dashboard_html() -> str:
       metaEl.textContent = meta;
     }
 
+    function workerStatusClass(status) {
+      return status && status !== "idle" ? "status-warn" : "status-ok";
+    }
+
     function renderHealth(state) {
       setHealth(
         "api",
@@ -693,13 +697,13 @@ def dashboard_html() -> str:
         "mac",
         text(mac.status, "Idle"),
         mac.movie_number ? `${mac.movie_number} updated ${formatDate(mac.updated_at)}` : "No active Mac job",
-        mac.status ? "status-warn" : "status-ok"
+        workerStatusClass(mac.status)
       );
       setHealth(
         "windows",
         text(windows.status, "Idle"),
         windows.movie_number ? `${windows.movie_number} updated ${formatDate(windows.updated_at)}` : "No active Windows job",
-        windows.status ? "status-warn" : "status-ok"
+        workerStatusClass(windows.status)
       );
       setHealth(
         "errors",

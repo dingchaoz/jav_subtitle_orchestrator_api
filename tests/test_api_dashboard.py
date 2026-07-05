@@ -115,3 +115,4 @@ def test_dashboard_page_returns_operator_html_without_force_controls(
     assert 'name="force"' not in html.lower()
     assert 'type="checkbox"' not in html.lower()
     assert "force: false" in html
+    assert 'status !== "idle"' in html
