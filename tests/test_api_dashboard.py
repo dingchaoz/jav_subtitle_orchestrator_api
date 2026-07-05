@@ -90,3 +90,28 @@ def test_dashboard_routes_return_404_for_missing_job(sqlite_path, mac_jobs_root)
 
     assert detail.status_code == 404
     assert logs.status_code == 404
+
+
+def test_dashboard_page_returns_operator_html_without_force_controls(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    client = TestClient(create_app(store))
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    html = response.text
+    assert "JAV Subtitle Orchestrator" in html
+    assert 'href="/docs"' in html
+    assert 'id="single-movie-form"' in html
+    assert 'id="batch-movie-form"' in html
+    assert 'id="jobs-list"' in html
+    assert 'id="job-detail"' in html
+    assert 'id="log-output"' in html
+    assert 'id="force"' not in html.lower()
+    assert 'name="force"' not in html.lower()
+    assert 'type="checkbox"' not in html.lower()
+    assert "force: false" in html

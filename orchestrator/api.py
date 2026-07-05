@@ -3,10 +3,12 @@ from pathlib import Path
 from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
 from orchestrator.dashboard import (
     build_dashboard_state,
     build_job_detail,
+    dashboard_html,
     list_job_logs,
     read_job_log_tail,
 )
@@ -82,6 +84,10 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard_page() -> str:
+        return dashboard_html()
 
     @app.post("/jobs", response_model=JobResponse)
     def submit_job(request: SubmitJobRequest) -> JobResponse:

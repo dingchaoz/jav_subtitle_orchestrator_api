@@ -185,3 +185,697 @@ def read_job_log_tail(job: JobRecord, log_name: str, tail: int = 200) -> JobLogT
         tail=bounded_tail,
         lines=lines[-bounded_tail:],
     )
+
+
+def dashboard_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JAV Subtitle Orchestrator</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f0f4f8;
+      --text: #16202a;
+      --muted: #5d6b78;
+      --border: #d7dee7;
+      --accent: #1463ff;
+      --accent-dark: #0b4fd0;
+      --danger: #b42318;
+      --ok: #067647;
+      --warn: #b54708;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px clamp(16px, 3vw, 32px);
+      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(10px);
+    }
+
+    h1, h2, h3, p { margin: 0; }
+
+    h1 {
+      font-size: 20px;
+      line-height: 1.2;
+      overflow-wrap: anywhere;
+    }
+
+    h2 { font-size: 16px; }
+    h3 { font-size: 14px; }
+
+    nav {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 14px;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 18px;
+      width: min(1440px, 100%);
+      margin: 0 auto;
+      padding: 18px clamp(16px, 3vw, 32px) 32px;
+    }
+
+    .health-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .health-card,
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .health-card {
+      min-height: 112px;
+      padding: 14px;
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+
+    .health-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    .health-value {
+      font-size: 20px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .health-meta {
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .status-ok { color: var(--ok); }
+    .status-warn { color: var(--warn); }
+    .status-error { color: var(--danger); }
+
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .side-stack,
+    .main-stack {
+      display: grid;
+      gap: 18px;
+      min-width: 0;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 48px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .panel-header button { width: auto; }
+
+    .panel-body {
+      padding: 14px;
+      min-width: 0;
+    }
+
+    form {
+      display: grid;
+      gap: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      min-width: 0;
+    }
+
+    input,
+    textarea,
+    select,
+    button {
+      width: 100%;
+      min-width: 0;
+      border-radius: 8px;
+      font: inherit;
+    }
+
+    input,
+    textarea,
+    select {
+      border: 1px solid var(--border);
+      background: #ffffff;
+      color: var(--text);
+      padding: 9px 10px;
+    }
+
+    textarea {
+      min-height: 118px;
+      resize: vertical;
+    }
+
+    button {
+      min-height: 40px;
+      border: 1px solid var(--accent-dark);
+      background: var(--accent);
+      color: #ffffff;
+      padding: 9px 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:hover { background: var(--accent-dark); }
+    button:disabled { cursor: not-allowed; opacity: 0.62; }
+
+    .message {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .jobs-list {
+      display: grid;
+      gap: 0;
+    }
+
+    .job-row {
+      display: grid;
+      grid-template-columns: minmax(120px, 1.2fr) minmax(112px, 1fr) 80px minmax(150px, 1.4fr);
+      gap: 12px;
+      align-items: center;
+      width: 100%;
+      padding: 11px 14px;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      border-radius: 0;
+      background: #ffffff;
+      color: var(--text);
+      text-align: left;
+      font-weight: 400;
+    }
+
+    .job-row:hover,
+    .job-row:focus {
+      background: var(--panel-soft);
+      outline: none;
+    }
+
+    .job-row:last-child { border-bottom: 0; }
+
+    .job-code,
+    .job-status,
+    .job-priority,
+    .job-updated {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .job-code { font-weight: 700; }
+    .job-status, .job-priority, .job-updated { color: var(--muted); font-size: 13px; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: minmax(120px, 180px) minmax(0, 1fr);
+      gap: 8px 12px;
+      font-size: 13px;
+    }
+
+    .detail-grid dt {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .detail-grid dd {
+      margin: 0;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .log-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .log-buttons button {
+      width: auto;
+      min-height: 34px;
+      max-width: 100%;
+      border-color: var(--border);
+      background: #ffffff;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    .log-buttons button:hover { background: var(--panel-soft); }
+
+    #log-output {
+      min-height: 220px;
+      max-height: 520px;
+      overflow: auto;
+      border-radius: 8px;
+      background: #111827;
+      color: #f9fafb;
+      padding: 12px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 12px 0;
+    }
+
+    @media (max-width: 980px) {
+      .health-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .content-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+
+    @media (max-width: 640px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .health-grid { grid-template-columns: minmax(0, 1fr); }
+
+      .job-row {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 4px;
+      }
+
+      .job-code,
+      .job-status,
+      .job-priority,
+      .job-updated {
+        white-space: normal;
+      }
+
+      .detail-grid { grid-template-columns: minmax(0, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>JAV Subtitle Orchestrator</h1>
+    <nav aria-label="Primary">
+      <a href="/dashboard">Dashboard</a>
+      <a href="/docs">Swagger</a>
+    </nav>
+  </header>
+  <main>
+    <section class="health-grid" aria-label="Health">
+      <article class="health-card">
+        <div class="health-title">API</div>
+        <div class="health-value" id="api-status">Loading</div>
+        <div class="health-meta" id="api-meta">Fetching state</div>
+      </article>
+      <article class="health-card">
+        <div class="health-title">Mac worker</div>
+        <div class="health-value" id="mac-status">Loading</div>
+        <div class="health-meta" id="mac-meta">Fetching state</div>
+      </article>
+      <article class="health-card">
+        <div class="health-title">Windows worker</div>
+        <div class="health-value" id="windows-status">Loading</div>
+        <div class="health-meta" id="windows-meta">Fetching state</div>
+      </article>
+      <article class="health-card">
+        <div class="health-title">Active errors</div>
+        <div class="health-value" id="errors-status">Loading</div>
+        <div class="health-meta" id="errors-meta">Fetching state</div>
+      </article>
+    </section>
+
+    <section class="content-grid">
+      <div class="side-stack">
+        <section class="panel" aria-labelledby="single-submit-title">
+          <div class="panel-header">
+            <h2 id="single-submit-title">Single movie</h2>
+          </div>
+          <div class="panel-body">
+            <form id="single-movie-form">
+              <label>
+                Movie number
+                <input id="single-movie-number" name="movie_number" autocomplete="off" required>
+              </label>
+              <label>
+                Priority
+                <input id="single-priority" name="priority" type="number" value="100" min="0" max="9999" required>
+              </label>
+              <button type="submit">Submit movie</button>
+              <div class="message" id="single-message" role="status"></div>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="batch-submit-title">
+          <div class="panel-header">
+            <h2 id="batch-submit-title">Batch movies</h2>
+          </div>
+          <div class="panel-body">
+            <form id="batch-movie-form">
+              <label>
+                Movie numbers
+                <textarea id="batch-movie-numbers" name="movie_numbers" required></textarea>
+              </label>
+              <label>
+                Priority
+                <input id="batch-priority" name="priority" type="number" value="100" min="0" max="9999" required>
+              </label>
+              <button type="submit">Submit batch</button>
+              <div class="message" id="batch-message" role="status"></div>
+            </form>
+          </div>
+        </section>
+      </div>
+
+      <div class="main-stack">
+        <section class="panel" aria-labelledby="latest-jobs-title">
+          <div class="panel-header">
+            <h2 id="latest-jobs-title">Latest jobs</h2>
+            <button type="button" id="refresh-button">Refresh</button>
+          </div>
+          <div id="jobs-list" class="jobs-list"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="job-detail-title">
+          <div class="panel-header">
+            <h2 id="job-detail-title">Selected job</h2>
+          </div>
+          <div class="panel-body">
+            <div id="job-detail" class="empty">Select a job from the latest jobs list.</div>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="logs-title">
+          <div class="panel-header">
+            <h2 id="logs-title">Logs</h2>
+          </div>
+          <div class="panel-body">
+            <pre id="log-output">Select a job log.</pre>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let selectedJobId = null;
+
+    async function fetchJson(url, options = {}) {
+      const response = await fetch(url, {
+        headers: {
+          "Accept": "application/json",
+          ...(options.body ? {"Content-Type": "application/json"} : {})
+        },
+        ...options
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const message = typeof body.detail === "string" ? body.detail : response.statusText;
+        throw new Error(message || `Request failed: ${response.status}`);
+      }
+      return body;
+    }
+
+    function text(value, fallback = "None") {
+      return value === null || value === undefined || value === "" ? fallback : String(value);
+    }
+
+    function formatDate(value) {
+      if (!value) {
+        return "No timestamp";
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return value;
+      }
+      return date.toLocaleString();
+    }
+
+    function setHealth(id, value, meta, className) {
+      const valueEl = document.getElementById(`${id}-status`);
+      const metaEl = document.getElementById(`${id}-meta`);
+      valueEl.textContent = value;
+      valueEl.className = `health-value ${className || ""}`.trim();
+      metaEl.textContent = meta;
+    }
+
+    function renderHealth(state) {
+      setHealth(
+        "api",
+        state.api.online ? "Online" : "Offline",
+        `Server time ${formatDate(state.api.server_time)}`,
+        state.api.online ? "status-ok" : "status-error"
+      );
+
+      const mac = state.activity.mac || {};
+      const windows = state.activity.windows || {};
+      const errors = state.active_errors || [];
+
+      setHealth(
+        "mac",
+        text(mac.status, "Idle"),
+        mac.movie_number ? `${mac.movie_number} updated ${formatDate(mac.updated_at)}` : "No active Mac job",
+        mac.status ? "status-warn" : "status-ok"
+      );
+      setHealth(
+        "windows",
+        text(windows.status, "Idle"),
+        windows.movie_number ? `${windows.movie_number} updated ${formatDate(windows.updated_at)}` : "No active Windows job",
+        windows.status ? "status-warn" : "status-ok"
+      );
+      setHealth(
+        "errors",
+        String(errors.length),
+        errors.length ? errors.map((job) => job.movie_number).slice(0, 3).join(", ") : "No active errors",
+        errors.length ? "status-error" : "status-ok"
+      );
+    }
+
+    function renderJobs(jobs) {
+      const list = document.getElementById("jobs-list");
+      list.replaceChildren();
+
+      if (!jobs.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No jobs yet.";
+        list.append(empty);
+        return;
+      }
+
+      for (const job of jobs) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "job-row";
+        row.dataset.jobId = job.id;
+        row.innerHTML = `
+          <span class="job-code"></span>
+          <span class="job-status"></span>
+          <span class="job-priority"></span>
+          <span class="job-updated"></span>
+        `;
+        row.querySelector(".job-code").textContent = job.movie_number;
+        row.querySelector(".job-status").textContent = job.status;
+        row.querySelector(".job-priority").textContent = `P${job.priority}`;
+        row.querySelector(".job-updated").textContent = formatDate(job.updated_at);
+        row.addEventListener("click", () => selectJob(job.id));
+        list.append(row);
+      }
+    }
+
+    function detailRows(detail) {
+      const fields = [
+        ["Movie", detail.normalized_movie_number],
+        ["Status", detail.status],
+        ["Priority", detail.priority],
+        ["Attempts", `${detail.attempt_count} mac / ${detail.worker_attempt_count} worker`],
+        ["Claimed by", detail.claimed_by],
+        ["Updated", formatDate(detail.updated_at)],
+        ["Job dir Mac", detail.job_dir_mac],
+        ["Job dir Windows", detail.job_dir_windows],
+        ["Audio Windows", detail.audio_path_windows],
+        ["Japanese SRT", detail.japanese_srt_path_windows],
+        ["English SRT", detail.english_srt_path_windows],
+        ["Error", detail.error]
+      ];
+      return fields.map(([name, value]) => `<dt>${name}</dt><dd>${escapeHtml(text(value))}</dd>`).join("");
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function selectJob(jobId) {
+      selectedJobId = jobId;
+      const detailEl = document.getElementById("job-detail");
+      const logOutput = document.getElementById("log-output");
+      detailEl.textContent = "Loading job detail...";
+      logOutput.textContent = "Loading logs...";
+
+      try {
+        const [detail, logsResponse] = await Promise.all([
+          fetchJson(`/jobs/${jobId}/detail`),
+          fetchJson(`/jobs/${jobId}/logs`)
+        ]);
+        detailEl.className = "";
+        detailEl.innerHTML = `<dl class="detail-grid">${detailRows(detail)}</dl><div class="log-buttons"></div>`;
+        const logButtons = detailEl.querySelector(".log-buttons");
+        if (!logsResponse.logs.length) {
+          logButtons.textContent = "No logs available.";
+          logOutput.textContent = "No logs available.";
+          return;
+        }
+        for (const log of logsResponse.logs) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = `${log.name} (${log.size_bytes} bytes)`;
+          button.addEventListener("click", () => loadLog(jobId, log.name));
+          logButtons.append(button);
+        }
+        await loadLog(jobId, logsResponse.logs[0].name);
+      } catch (error) {
+        detailEl.className = "empty";
+        detailEl.textContent = error.message;
+        logOutput.textContent = "";
+      }
+    }
+
+    async function loadLog(jobId, logName) {
+      const logOutput = document.getElementById("log-output");
+      logOutput.textContent = `Loading ${logName}...`;
+      try {
+        const payload = await fetchJson(`/jobs/${jobId}/logs/${encodeURIComponent(logName)}?tail=200`);
+        logOutput.textContent = payload.lines.length ? payload.lines.join("\\n") : `${logName} is empty.`;
+      } catch (error) {
+        logOutput.textContent = error.message;
+      }
+    }
+
+    async function refreshState() {
+      const list = document.getElementById("jobs-list");
+      try {
+        const state = await fetchJson("/dashboard/state");
+        renderHealth(state);
+        renderJobs(state.latest_jobs || []);
+      } catch (error) {
+        list.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+        setHealth("api", "Error", error.message, "status-error");
+      }
+    }
+
+    async function submitSingle(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const message = document.getElementById("single-message");
+      const movie = document.getElementById("single-movie-number").value.trim();
+      const priority = Number(document.getElementById("single-priority").value);
+      message.textContent = "Submitting...";
+      try {
+        const result = await fetchJson("/jobs", {
+          method: "POST",
+          body: JSON.stringify({movie_number: movie, priority, force: false})
+        });
+        message.textContent = `Submitted ${result.movie_number}`;
+        form.reset();
+        document.getElementById("single-priority").value = "100";
+        await refreshState();
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    async function submitBatch(event) {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const message = document.getElementById("batch-message");
+      const movies = document.getElementById("batch-movie-numbers").value
+        .split(/[\\s,]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      const priority = Number(document.getElementById("batch-priority").value);
+      message.textContent = "Submitting...";
+      try {
+        const result = await fetchJson("/jobs/batch", {
+          method: "POST",
+          body: JSON.stringify({movie_numbers: movies, priority, force: false})
+        });
+        message.textContent = `Created ${result.created.length}, existing ${result.existing.length}, invalid ${result.invalid.length}`;
+        form.reset();
+        document.getElementById("batch-priority").value = "100";
+        await refreshState();
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
+    document.getElementById("refresh-button").addEventListener("click", refreshState);
+    document.getElementById("single-movie-form").addEventListener("submit", submitSingle);
+    document.getElementById("batch-movie-form").addEventListener("submit", submitBatch);
+    window.addEventListener("load", refreshState);
+  </script>
+</body>
+</html>
+"""
