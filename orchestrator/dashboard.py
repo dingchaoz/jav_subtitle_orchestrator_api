@@ -409,7 +409,13 @@ def dashboard_html() -> str:
 
     .job-row {
       display: grid;
-      grid-template-columns: minmax(120px, 1.2fr) minmax(112px, 1fr) 80px minmax(150px, 1.4fr);
+      grid-template-columns:
+        minmax(120px, 1.2fr)
+        minmax(112px, 1fr)
+        72px
+        minmax(120px, 1fr)
+        minmax(150px, 1.2fr)
+        minmax(150px, 1.2fr);
       gap: 12px;
       align-items: center;
       width: 100%;
@@ -434,6 +440,8 @@ def dashboard_html() -> str:
     .job-code,
     .job-status,
     .job-priority,
+    .job-worker,
+    .job-error,
     .job-updated {
       min-width: 0;
       overflow: hidden;
@@ -442,7 +450,8 @@ def dashboard_html() -> str:
     }
 
     .job-code { font-weight: 700; }
-    .job-status, .job-priority, .job-updated { color: var(--muted); font-size: 13px; }
+    .job-status, .job-priority, .job-worker, .job-error, .job-updated { color: var(--muted); font-size: 13px; }
+    .job-error { color: var(--danger); }
 
     .detail-grid {
       display: grid;
@@ -522,6 +531,8 @@ def dashboard_html() -> str:
       .job-code,
       .job-status,
       .job-priority,
+      .job-worker,
+      .job-error,
       .job-updated {
         white-space: normal;
       }
@@ -658,6 +669,11 @@ def dashboard_html() -> str:
       return value === null || value === undefined || value === "" ? fallback : String(value);
     }
 
+    function concise(value, limit = 120) {
+      const rendered = text(value, "");
+      return rendered.length > limit ? `${rendered.slice(0, limit - 3)}...` : rendered;
+    }
+
     function formatDate(value) {
       if (!value) {
         return "No timestamp";
@@ -730,15 +746,24 @@ def dashboard_html() -> str:
         row.type = "button";
         row.className = "job-row";
         row.dataset.jobId = job.id;
-        row.innerHTML = `
-          <span class="job-code"></span>
-          <span class="job-status"></span>
-          <span class="job-priority"></span>
-          <span class="job-updated"></span>
-        `;
+        const code = document.createElement("span");
+        const status = document.createElement("span");
+        const priority = document.createElement("span");
+        const worker = document.createElement("span");
+        const error = document.createElement("span");
+        const updated = document.createElement("span");
+        code.className = "job-code";
+        status.className = "job-status";
+        priority.className = "job-priority";
+        worker.className = "job-worker";
+        error.className = "job-error";
+        updated.className = "job-updated";
+        row.append(code, status, priority, worker, error, updated);
         row.querySelector(".job-code").textContent = job.movie_number;
         row.querySelector(".job-status").textContent = job.status;
         row.querySelector(".job-priority").textContent = `P${job.priority}`;
+        row.querySelector(".job-worker").textContent = job.claimed_by ? `Claimed ${job.claimed_by}` : "";
+        row.querySelector(".job-error").textContent = job.error ? `Error ${concise(job.error)}` : "";
         row.querySelector(".job-updated").textContent = formatDate(job.updated_at);
         row.addEventListener("click", () => selectJob(job.id));
         list.append(row);
@@ -747,17 +772,26 @@ def dashboard_html() -> str:
 
     function detailRows(detail) {
       const fields = [
-        ["Movie", detail.normalized_movie_number],
+        ["Job ID", detail.id],
+        ["Original movie", detail.movie_number],
+        ["Normalized movie", detail.normalized_movie_number],
         ["Status", detail.status],
         ["Priority", detail.priority],
-        ["Attempts", `${detail.attempt_count} mac / ${detail.worker_attempt_count} worker`],
+        ["Mac attempts", detail.attempt_count],
+        ["Worker attempts", detail.worker_attempt_count],
         ["Claimed by", detail.claimed_by],
+        ["Lease expires", formatDate(detail.lease_expires_at)],
+        ["Created", formatDate(detail.created_at)],
         ["Updated", formatDate(detail.updated_at)],
         ["Job dir Mac", detail.job_dir_mac],
         ["Job dir Windows", detail.job_dir_windows],
+        ["Metadata Mac", detail.metadata_path_mac],
+        ["Audio Mac", detail.audio_path_mac],
         ["Audio Windows", detail.audio_path_windows],
-        ["Japanese SRT", detail.japanese_srt_path_windows],
-        ["English SRT", detail.english_srt_path_windows],
+        ["Japanese SRT Mac", detail.japanese_srt_path_mac],
+        ["Japanese SRT Windows", detail.japanese_srt_path_windows],
+        ["English SRT Mac", detail.english_srt_path_mac],
+        ["English SRT Windows", detail.english_srt_path_windows],
         ["Error", detail.error]
       ];
       return fields.map(([name, value]) => `<dt>${name}</dt><dd>${escapeHtml(text(value))}</dd>`).join("");

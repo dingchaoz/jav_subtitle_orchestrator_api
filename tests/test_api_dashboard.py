@@ -26,6 +26,38 @@ def test_dashboard_state_endpoint_returns_counts_latest_jobs_and_errors(
     assert {job["movie_number"] for job in body["latest_jobs"]} == {"ktb-096", "ktb-095"}
 
 
+def test_dashboard_state_includes_claimed_worker_and_error_in_latest_jobs(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    claimed_job = store.submit_job("ktb-097", priority=100, force=False).job
+    failed_job = store.submit_job("ktb-098", priority=100, force=False).job
+    store.mark_audio_ready(claimed_job.id)
+    store.mark_audio_ready(failed_job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    assert claimed is not None
+    store.heartbeat(claimed.id, "windows-gpu-1", JobStatus.TRANSCRIBING, lease_seconds=1800)
+    failed = store.claim_next_worker_job("windows-gpu-2", lease_seconds=1800)
+    assert failed is not None
+    store.fail_worker_job(
+        failed.id,
+        "windows-gpu-2",
+        JobStatus.TRANSCRIBING,
+        "CUDA out of memory",
+        max_worker_attempts=3,
+    )
+    client = TestClient(create_app(store))
+
+    response = client.get("/dashboard/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    latest_jobs = {job["movie_number"]: job for job in body["latest_jobs"]}
+    assert latest_jobs["ktb-097"]["claimed_by"] == "windows-gpu-1"
+    assert latest_jobs["ktb-098"]["error"] == "transcribing: CUDA out of memory"
+
+
 def test_job_detail_endpoint_returns_full_paths(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -111,6 +143,18 @@ def test_dashboard_page_returns_operator_html_without_force_controls(
     assert 'id="jobs-list"' in html
     assert 'id="job-detail"' in html
     assert 'id="log-output"' in html
+    assert "Job ID" in html
+    assert "Original movie" in html
+    assert "Created" in html
+    assert "Lease expires" in html
+    assert "Metadata Mac" in html
+    assert "Audio Mac" in html
+    assert "Japanese SRT Mac" in html
+    assert "English SRT Mac" in html
+    assert "job-worker" in html
+    assert "job-error" in html
+    assert "job.claimed_by" in html
+    assert "job.error" in html
     assert 'id="force"' not in html.lower()
     assert 'name="force"' not in html.lower()
     assert 'type="checkbox"' not in html.lower()
