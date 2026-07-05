@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tags_zh",
+    "tags_en",
+    "setting",
+    "roles",
+    "relationship",
+    "body_traits",
+    "outfit",
+    "scenario",
+    "mood_style",
+    "audio_style",
+    "dialogue_density",
+    "tag_quality",
+    "warnings",
+    "blocked_minor_coded_terms"
+  ],
+  "properties": {
+    "tags_zh": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tags_en": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "setting": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "roles": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "relationship": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "body_traits": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "outfit": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "scenario": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "mood_style": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "audio_style": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "dialogue_density": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "unknown"]
+    },
+    "tag_quality": {
+      "type": "string",
+      "enum": ["low_information", "inferred", "good"]
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blocked_minor_coded_terms": {
+      "type": "boolean"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["translations"],
+  "properties": {
+    "translations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "zh-CN", "en"],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "zh-CN": {
+            "type": "string"
+          },
+          "en": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
