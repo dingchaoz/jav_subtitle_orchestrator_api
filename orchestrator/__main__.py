@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from orchestrator.logging_config import configure_logging
 
@@ -38,6 +39,10 @@ def run_mac_worker() -> None:
     run_mac_forever(worker)
 
 
+def _export_windows_runtime_env(settings) -> None:
+    os.environ["OPENAI_API_KEY"] = settings.openai_api_key
+
+
 def run_windows_worker() -> None:
     from orchestrator.config import WindowsSettings
     from orchestrator.transcription import FasterWhisperTranscriber
@@ -49,6 +54,7 @@ def run_windows_worker() -> None:
     )
 
     settings = WindowsSettings()
+    _export_windows_runtime_env(settings)
     client = MacApiClient(settings.mac_api_base_url, settings.worker_id)
     transcriber = FasterWhisperTranscriber(
         settings.whisper_model,

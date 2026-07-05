@@ -2,7 +2,7 @@
 
 1. Map the Mac SMB share as `M:\`.
 
-2. Create `.env` from `.env.windows.example`:
+2. Create `.env.windows` from `.env.windows.example`:
 
 ```text
 MAC_API_BASE_URL=http://192.168.1.25:8000

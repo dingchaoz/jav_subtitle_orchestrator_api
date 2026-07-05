@@ -1,6 +1,8 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from orchestrator.config import MacSettings, WindowsSettings
 from orchestrator.paths import build_job_paths, normalize_movie_number
@@ -50,6 +52,16 @@ def test_module_cli_prints_help():
     assert "api" in result.stdout
     assert "mac-worker" in result.stdout
     assert "windows-worker" in result.stdout
+
+
+def test_windows_runtime_env_exports_openai_api_key(monkeypatch):
+    from orchestrator.__main__ import _export_windows_runtime_env
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    _export_windows_runtime_env(SimpleNamespace(openai_api_key="loaded-key"))
+
+    assert os.environ["OPENAI_API_KEY"] == "loaded-key"
 
 
 def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
