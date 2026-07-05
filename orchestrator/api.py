@@ -4,8 +4,18 @@ from typing import Protocol
 
 from fastapi import FastAPI, HTTPException, Query
 
+from orchestrator.dashboard import (
+    build_dashboard_state,
+    build_job_detail,
+    list_job_logs,
+    read_job_log_tail,
+)
 from orchestrator.models import (
     BatchJobResponse,
+    DashboardStateResponse,
+    JobDetailResponse,
+    JobLogTailResponse,
+    JobLogsResponse,
     JobResponse,
     JobStatus,
     SubmitBatchRequest,
@@ -98,12 +108,42 @@ def create_app(
     def list_jobs(status: JobStatus | None = Query(default=None)) -> list[JobResponse]:
         return [job_response(job) for job in store.list_jobs(status)]
 
+    @app.get("/dashboard/state", response_model=DashboardStateResponse)
+    def dashboard_state() -> DashboardStateResponse:
+        return build_dashboard_state(store)
+
     @app.get("/jobs/{job_id}", response_model=JobResponse)
     def get_job(job_id: str) -> JobResponse:
         job = store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         return job_response(job)
+
+    @app.get("/jobs/{job_id}/detail", response_model=JobDetailResponse)
+    def get_job_detail(job_id: str) -> JobDetailResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return build_job_detail(job)
+
+    @app.get("/jobs/{job_id}/logs", response_model=JobLogsResponse)
+    def get_job_logs(job_id: str) -> JobLogsResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return list_job_logs(job)
+
+    @app.get("/jobs/{job_id}/logs/{log_name}", response_model=JobLogTailResponse)
+    def get_job_log_tail(
+        job_id: str, log_name: str, tail: int = Query(default=200)
+    ) -> JobLogTailResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            return read_job_log_tail(job, log_name, tail)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="log not found") from exc
 
     @app.get("/worker/next-job", response_model=WorkerNextJobResponse)
     def next_job(worker_id: str) -> WorkerNextJobResponse:
