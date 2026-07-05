@@ -8,6 +8,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
 .worktrees/
 data/*.sqlite3
 data/*.sqlite3-*
