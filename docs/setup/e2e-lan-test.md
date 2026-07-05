@@ -4,7 +4,8 @@ Use this runbook after all unit and integration tests pass. It verifies one movi
 
 ## Preconditions
 
-- Mac API is running on `http://0.0.0.0:8000`.
+- Mac API is bound to `0.0.0.0:8000`.
+- Windows `.env.windows` sets `MAC_API_BASE_URL` to the Mac LAN address, for example `http://192.168.1.25:8000`.
 - Mac downloader worker is running.
 - Windows worker is running.
 - Windows can read and write `M:\`.
@@ -36,6 +37,16 @@ Expected queued response:
   "error": null
 }
 ```
+
+## Confirm Windows API Reachability
+
+From Windows, confirm the worker can reach the Mac API through the same LAN address configured in `.env.windows`:
+
+```powershell
+Invoke-RestMethod http://192.168.1.25:8000/jobs
+```
+
+Expected result: the request succeeds and returns the current JSON job list. If this fails, fix LAN routing, firewall rules, or `MAC_API_BASE_URL` before relying on the Windows worker.
 
 ## Confirm Mac Job Folder
 
@@ -90,13 +101,22 @@ curl http://127.0.0.1:8000/jobs
 
 Expected `ktb-096` status:
 
-```text
-english_srt_ready
+```json
+[
+  {
+    "id": "job_...",
+    "movie_number": "ktb-096",
+    "status": "english_srt_ready",
+    "job_dir_mac": "/Users/ytt/MissAVJobs/ktb-096",
+    "job_dir_windows": "M:\\ktb-096",
+    "error": null
+  }
+]
 ```
 
 ## Failure Checks
 
-If status is `failed`, inspect:
+If status is `failed`, stuck in an intermediate state, or repeatedly requeued to `queued` or `audio_ready`, inspect:
 
 ```text
 /Users/ytt/MissAVJobs/ktb-096/job.json
