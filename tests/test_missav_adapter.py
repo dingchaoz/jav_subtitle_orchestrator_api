@@ -78,6 +78,28 @@ def test_adapter_uses_explicit_python_executable(monkeypatch, tmp_path):
     assert json.loads(output_path.read_text(encoding="utf-8"))["number"] == "ktb-096"
 
 
+def test_download_metadata_uses_existing_catalog_without_refresh(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    output_path = tmp_path / "jobs" / "ktb-096" / "metadata.json"
+    catalog_path.write_text(
+        json.dumps({"movies": [{"number": "ktb-096", "title": "Already cached"}]}) + "\n",
+        encoding="utf-8",
+    )
+
+    def fail_if_run(command, **kwargs):
+        raise AssertionError("cached metadata should not refresh MissAV catalog")
+
+    monkeypatch.setattr(subprocess, "run", fail_if_run)
+
+    MissAVAdapter(pipeline_root).download_metadata("ktb-096", output_path)
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == {
+        "number": "ktb-096",
+        "title": "Already cached",
+    }
+
+
 def test_download_metadata_raises_when_requested_movie_missing(monkeypatch, tmp_path):
     pipeline_root = _fake_pipeline_root(tmp_path)
     catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"

@@ -30,6 +30,15 @@ class MissAVAdapter:
 
     def download_metadata(self, movie_number: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        catalog_path = self.missav_pipeline_root / "new-release" / "release_movies_complete.json"
+        try:
+            movie = self._find_movie_in_catalog(movie_number, catalog_path)
+        except FileNotFoundError:
+            movie = None
+        if movie is not None:
+            self._write_json(movie, output_path)
+            return
+
         command = [
             str(self.python_executable),
             str(self.missav_pipeline_root / "new-release" / "unified_download.py"),
@@ -43,7 +52,6 @@ class MissAVAdapter:
         )
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr or completed.stdout)
-        catalog_path = self.missav_pipeline_root / "new-release" / "release_movies_complete.json"
         movie = self._find_movie_in_catalog(movie_number, catalog_path)
         self._write_json(movie, output_path)
 
