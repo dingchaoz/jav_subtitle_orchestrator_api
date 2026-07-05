@@ -154,17 +154,18 @@ def _resolve_allowed_log_path(job: JobRecord, log_name: str) -> Path:
 
 def list_job_logs(job: JobRecord) -> JobLogsResponse:
     logs: list[JobLogSummary] = []
-    logs_dir = _job_logs_dir(job)
     for log_name in ALLOWED_LOG_NAMES:
-        path = logs_dir / log_name
-        if path.exists() and path.is_file():
-            logs.append(
-                JobLogSummary(
-                    name=log_name,
-                    size_bytes=path.stat().st_size,
-                    available=True,
-                )
+        try:
+            path = _resolve_allowed_log_path(job, log_name)
+        except FileNotFoundError:
+            continue
+        logs.append(
+            JobLogSummary(
+                name=log_name,
+                size_bytes=path.stat().st_size,
+                available=True,
             )
+        )
     return JobLogsResponse(job_id=job.id, logs=logs)
 
 

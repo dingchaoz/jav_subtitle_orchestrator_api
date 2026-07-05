@@ -62,3 +62,56 @@ def test_read_job_log_tail_rejects_missing_allowlisted_log(sqlite_path, mac_jobs
 
     with pytest.raises(FileNotFoundError):
         read_job_log_tail(job, "whisper.log")
+
+
+def test_allowlisted_log_symlink_outside_logs_is_not_listed_or_tailed(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-112", priority=100, force=False).job
+    logs_dir = mac_jobs_root / "ktb-112" / "logs"
+    logs_dir.mkdir(parents=True)
+    outside_log = mac_jobs_root / "outside-translate.log"
+    outside_log.write_text("outside\n", encoding="utf-8")
+    (logs_dir / "translate.log").symlink_to(outside_log)
+
+    response = list_job_logs(job)
+
+    assert [log.name for log in response.logs] == []
+    with pytest.raises(FileNotFoundError):
+        read_job_log_tail(job, "translate.log")
+
+
+def test_allowlisted_log_directory_is_not_listed_or_tailed(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-112", priority=100, force=False).job
+    logs_dir = mac_jobs_root / "ktb-112" / "logs"
+    (logs_dir / "whisper.log").mkdir(parents=True)
+
+    response = list_job_logs(job)
+
+    assert [log.name for log in response.logs] == []
+    with pytest.raises(FileNotFoundError):
+        read_job_log_tail(job, "whisper.log")
+
+
+@pytest.mark.parametrize("tail", [0, -10])
+def test_read_job_log_tail_clamps_zero_and_negative_tail_to_one(
+    sqlite_path,
+    mac_jobs_root,
+    tail,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-112", priority=100, force=False).job
+    logs_dir = mac_jobs_root / "ktb-112" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / "translate.log").write_text("first\nsecond\n", encoding="utf-8")
+
+    response = read_job_log_tail(job, "translate.log", tail=tail)
+
+    assert response.tail == 1
+    assert response.lines == ["second"]
