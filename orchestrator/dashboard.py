@@ -143,6 +143,9 @@ def _job_logs_dir(job: JobRecord) -> Path:
 def _resolve_allowed_log_path(job: JobRecord, log_name: str) -> Path:
     if log_name not in ALLOWED_LOG_NAMES:
         raise FileNotFoundError(log_name)
+    job_dir = Path(job.job_dir_mac)
+    if job_dir.is_symlink():
+        raise FileNotFoundError(log_name)
     logs_dir_raw = _job_logs_dir(job)
     if logs_dir_raw.is_symlink():
         raise FileNotFoundError(log_name)
