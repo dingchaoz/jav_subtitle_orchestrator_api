@@ -46,7 +46,7 @@ class SubmitBatchRequest(BaseModel):
 
 class ImportRequestedSubtitlesRequest(BaseModel):
     min_count: int = Field(default=1, ge=1)
-    limit: int = Field(default=100, ge=1, le=500)
+    limit: int = Field(default=500, ge=1, le=500)
     priority: int = 100
     force: bool = False
 

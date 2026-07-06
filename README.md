@@ -37,7 +37,7 @@ python -m orchestrator windows-worker
 Import requested subtitles into the queue:
 
 ```bash
-python -m orchestrator import-subtitle-requests --min-count 1 --limit 100 --priority 100
+python -m orchestrator import-subtitle-requests --min-count 1 --limit 500 --priority 100
 ```
 
 This reads javsubtitle request counts from Cloudflare D1 and skips movies that already have

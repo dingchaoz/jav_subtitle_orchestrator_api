@@ -229,7 +229,7 @@ def main() -> None:
     publish_parser.add_argument("movie_number")
     import_parser = subcommands.add_parser("import-subtitle-requests")
     import_parser.add_argument("--min-count", type=int, default=1)
-    import_parser.add_argument("--limit", type=int, default=100)
+    import_parser.add_argument("--limit", type=int, default=500)
     import_parser.add_argument("--priority", type=int, default=100)
     import_parser.add_argument("--force", action="store_true")
     args = parser.parse_args()

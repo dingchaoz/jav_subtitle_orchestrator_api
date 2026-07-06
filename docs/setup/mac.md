@@ -68,7 +68,7 @@ curl -X POST http://127.0.0.1:8010/jobs/batch \
 6. Import javsubtitle requested subtitles on demand:
 
 ```bash
-python -m orchestrator import-subtitle-requests --min-count 1 --limit 100 --priority 100
+python -m orchestrator import-subtitle-requests --min-count 1 --limit 500 --priority 100
 ```
 
 The dashboard button at `http://127.0.0.1:8010/dashboard` uses the same import path.
@@ -76,5 +76,5 @@ The dashboard button at `http://127.0.0.1:8010/dashboard` uses the same import p
 To run the import every 30 minutes with cron:
 
 ```cron
-*/30 * * * * cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator && /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/.venv/bin/python -m orchestrator import-subtitle-requests --min-count 1 --limit 100 --priority 100 >> /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/logs/import-subtitle-requests.log 2>&1
+*/30 * * * * cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator && /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/.venv/bin/python -m orchestrator import-subtitle-requests --min-count 1 --limit 500 --priority 100 >> /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/logs/import-subtitle-requests.log 2>&1
 ```

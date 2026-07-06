@@ -645,7 +645,7 @@ def dashboard_html() -> str:
               </label>
               <label>
                 Limit
-                <input id="import-requested-limit" name="limit" type="number" value="100" min="1" max="500" required>
+                <input id="import-requested-limit" name="limit" type="number" value="500" min="1" max="500" required>
               </label>
               <label>
                 Priority
@@ -963,7 +963,7 @@ def dashboard_html() -> str:
       event.preventDefault();
       const message = document.getElementById("import-requested-message");
       const minCount = Number(document.getElementById("import-requested-min-count").value || "1");
-      const limit = Number(document.getElementById("import-requested-limit").value || "100");
+      const limit = Number(document.getElementById("import-requested-limit").value || "500");
       const priority = Number(document.getElementById("import-requested-priority").value || "100");
       message.textContent = "Importing requested subtitles...";
       try {

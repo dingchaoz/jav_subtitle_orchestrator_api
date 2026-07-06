@@ -119,7 +119,7 @@ def test_import_requested_subtitles_endpoint_queues_valid_requested_movies(
 
     assert response.status_code == 200
     body = response.json()
-    assert importer.calls == [{"min_count": 1, "limit": 100}]
+    assert importer.calls == [{"min_count": 1, "limit": 500}]
     assert [item["movie_number"] for item in body["created"]] == ["abc-002"]
     assert [item["movie_number"] for item in body["existing"]] == ["abc-001"]
     assert body["invalid"] == ["bad id"]
@@ -175,6 +175,7 @@ def test_dashboard_page_includes_requested_subtitle_import_controls(
     html = response.text
     assert 'id="import-requested-form"' in html
     assert 'id="import-requested-message"' in html
+    assert 'id="import-requested-limit" name="limit" type="number" value="500"' in html
     assert "/jobs/import-subtitle-requests" in html
     assert "Import requested subtitles" in html
     assert "skipped available" in html

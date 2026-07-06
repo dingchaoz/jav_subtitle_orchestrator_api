@@ -177,7 +177,7 @@ Request:
 ```json
 {
   "min_count": 1,
-  "limit": 100,
+  "limit": 500,
   "priority": 100,
   "force": false
 }
