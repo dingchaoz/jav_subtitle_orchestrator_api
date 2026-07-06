@@ -15,6 +15,7 @@ OPENAI_API_KEY=replace-with-key
 TRANSLATE_SCRIPT_PATH=C:\Users\ytt\Documents\startup\E2E-download-subtitle-generation-translation-scripts\scripts\subtitle_translate.py
 POLL_INTERVAL_SECONDS=10
 HEARTBEAT_INTERVAL_SECONDS=60
+DELETE_AUDIO_AFTER_TRANSCRIPTION=true
 ```
 
 3. Install and run:
@@ -27,4 +28,5 @@ pip install -e ".[dev,windows]"
 python -m orchestrator windows-worker
 ```
 
-4. The worker polls the Mac API and processes one GPU job at a time.
+4. The worker polls the Mac API and processes one GPU job at a time. By default it deletes
+`audio.wav` after Japanese transcription succeeds and keeps audio on transcription failure.

@@ -158,6 +158,67 @@ def test_windows_worker_processes_one_job(tmp_path):
     ]
 
 
+def test_windows_worker_deletes_audio_after_successful_transcription(tmp_path):
+    job = make_job(tmp_path)
+    audio_path = Path(job["audio_path_windows"])
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
+
+    assert worker.process_one() is True
+
+    assert not audio_path.exists()
+    job_dir = audio_path.parent
+    assert "deleted audio " in (job_dir / "logs" / "windows-worker.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_windows_worker_keeps_audio_after_transcription_failure(tmp_path):
+    job = make_job(tmp_path)
+    audio_path = Path(job["audio_path_windows"])
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FailingTranscriber("whisper crashed"), FakeTranslator())
+
+    assert worker.process_one() is True
+
+    assert audio_path.exists()
+    assert client.failed == [("job_1", "transcribing", "whisper crashed")]
+
+
+def test_windows_worker_audio_delete_failure_does_not_fail_completed_job(
+    tmp_path,
+    monkeypatch,
+):
+    job = make_job(tmp_path)
+    audio_path = Path(job["audio_path_windows"])
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
+
+    original_unlink = Path.unlink
+
+    def fail_audio_unlink(path, *args, **kwargs):
+        if path == audio_path:
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_audio_unlink)
+
+    assert worker.process_one() is True
+
+    assert audio_path.exists()
+    assert client.completed == [
+        (
+            "job_1",
+            job["japanese_srt_path_windows"],
+            job["english_srt_path_windows"],
+        )
+    ]
+    job_dir = audio_path.parent
+    assert "failed to delete audio " in (job_dir / "logs" / "windows-worker.log").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
     job = make_job(tmp_path)
     client = FakeClient(job)
@@ -171,6 +232,7 @@ def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
 
     assert (job_dir / "logs" / "windows-worker.log").read_text(encoding="utf-8") == (
         "claimed job_1\n"
+        f"deleted audio {audio_path}\n"
         "completed job_1\n"
     )
     assert (job_dir / "logs" / "whisper.log").read_text(encoding="utf-8") == (

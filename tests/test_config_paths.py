@@ -22,7 +22,13 @@ MAC_ENV_ALIASES = (
     "MAX_WORKER_ATTEMPTS",
     "JAVSUBTITLE_API_BASE",
     "JAVSUBTITLE_ADMIN_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_D1_API_TOKEN",
+    "CLOUDFLARE_D1_DATABASE_ID",
     "JAVSUBTITLE_POST_SYNC_ENABLED",
+    "CALLBACK_CLIENTS_JSON",
+    "CALLBACK_TIMEOUT_SECONDS",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -36,6 +42,7 @@ WINDOWS_ENV_ALIASES = (
     "TRANSLATE_SCRIPT_PATH",
     "POLL_INTERVAL_SECONDS",
     "HEARTBEAT_INTERVAL_SECONDS",
+    "DELETE_AUDIO_AFTER_TRANSCRIPTION",
 )
 
 
@@ -99,6 +106,10 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.max_worker_attempts == 3
     assert settings.javsubtitle_api_base == "https://javsubtitle.com"
     assert settings.javsubtitle_admin_api_token is None
+    assert settings.cloudflare_account_id is None
+    assert settings.cloudflare_api_token is None
+    assert settings.cloudflare_d1_api_token is None
+    assert settings.cloudflare_d1_database_id == "401de37d-51fc-44b1-aacc-6ccff9d74f52"
     assert settings.javsubtitle_post_sync_enabled is False
 
 
@@ -113,6 +124,44 @@ def test_mac_settings_load_catalog_sync_env(monkeypatch):
     assert settings.javsubtitle_api_base == "https://javsubtitle.com/"
     assert settings.javsubtitle_admin_api_token == "secret-token"
     assert settings.javsubtitle_post_sync_enabled is True
+
+
+def test_mac_settings_loads_cloudflare_api_token_alias(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv("CLOUDFLARE_ACCOUNT_ID", "account-id")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "api-token")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.cloudflare_account_id == "account-id"
+    assert settings.cloudflare_api_token == "api-token"
+
+
+def test_mac_settings_parses_callback_clients_json(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv(
+        "CALLBACK_CLIENTS_JSON",
+        '{"machine-a.access":{"url":"https://client.example.com/ready","secret":"hmac-secret"}}',
+    )
+    monkeypatch.setenv("CALLBACK_TIMEOUT_SECONDS", "5")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.callback_timeout_seconds == 5
+    assert settings.callback_clients["machine-a.access"].url == "https://client.example.com/ready"
+    assert settings.callback_clients["machine-a.access"].secret == "hmac-secret"
+
+
+def test_mac_settings_rejects_invalid_callback_clients_json(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv("CALLBACK_CLIENTS_JSON", "[]")
+
+    try:
+        MacSettings(_env_file=None)
+    except ValueError as exc:
+        assert "CALLBACK_CLIENTS_JSON must be a JSON object" in str(exc)
+    else:
+        raise AssertionError("expected invalid callback JSON to fail settings load")
 
 
 def test_build_supabase_publisher_requires_catalog_sync_token_when_enabled():
@@ -158,6 +207,7 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
     assert settings.openai_api_key == "test-key"
     assert settings.poll_interval_seconds == 10
     assert settings.heartbeat_interval_seconds == 60
+    assert settings.delete_audio_after_transcription is True
 
 
 def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):

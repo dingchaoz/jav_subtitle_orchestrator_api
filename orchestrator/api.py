@@ -2,9 +2,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
+from orchestrator.callbacks import CallbackClient, CallbackNotifier, CallbackSender
 from orchestrator.dashboard import (
     build_dashboard_state,
     build_job_detail,
@@ -15,11 +16,13 @@ from orchestrator.dashboard import (
 from orchestrator.models import (
     BatchJobResponse,
     DashboardStateResponse,
+    ImportRequestedSubtitlesRequest,
     JobDetailResponse,
     JobLogTailResponse,
     JobLogsResponse,
     JobResponse,
     JobStatus,
+    RequestedSubtitleImportResponse,
     SubmitBatchRequest,
     SubmitJobRequest,
     WorkerCompleteRequest,
@@ -28,11 +31,22 @@ from orchestrator.models import (
     WorkerJobResponse,
     WorkerNextJobResponse,
 )
+from orchestrator.subtitle_request_importer import RequestedSubtitleImportSelection
 from orchestrator.store import JobRecord, JobStore
 
 
 class EnglishAiPublisher(Protocol):
     def publish_english_ai(self, movie_code: str, srt_path: Path) -> object:
+        ...
+
+
+class RequestedSubtitleImporterProtocol(Protocol):
+    def fetch_requested_subtitles(
+        self,
+        *,
+        min_count: int,
+        limit: int,
+    ) -> RequestedSubtitleImportSelection:
         ...
 
 
@@ -81,17 +95,39 @@ def create_app(
     max_worker_attempts: int = 3,
     final_file_exists: Callable[[str], bool] | None = None,
     publisher: EnglishAiPublisher | None = None,
+    requested_subtitle_importer: RequestedSubtitleImporterProtocol | None = None,
+    callback_clients: dict[str, CallbackClient] | None = None,
+    callback_sender: CallbackSender | None = None,
+    callback_timeout_seconds: int = 10,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
+    callback_clients = callback_clients or {}
+    callback_notifier = CallbackNotifier(
+        store,
+        callback_clients,
+        sender=callback_sender,
+        timeout_seconds=callback_timeout_seconds,
+    )
+
+    def callback_client_key_from_request(request: Request) -> str | None:
+        client_id = request.headers.get("cf-access-client-id")
+        if client_id and client_id in callback_clients:
+            return client_id
+        return None
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard_page() -> str:
         return dashboard_html()
 
     @app.post("/jobs", response_model=JobResponse)
-    def submit_job(request: SubmitJobRequest) -> JobResponse:
-        result = store.submit_job(request.movie_number, request.priority, request.force)
+    def submit_job(request: Request, payload: SubmitJobRequest) -> JobResponse:
+        result = store.submit_job(
+            payload.movie_number,
+            payload.priority,
+            payload.force,
+            callback_client_key=callback_client_key_from_request(request),
+        )
         if result.kind == "invalid":
             raise HTTPException(status_code=422, detail="invalid movie_number")
         if result.kind == "conflict":
@@ -102,9 +138,47 @@ def create_app(
         return job_response(result.job)
 
     @app.post("/jobs/batch", response_model=BatchJobResponse)
-    def submit_batch(request: SubmitBatchRequest) -> BatchJobResponse:
-        result = store.submit_batch(request.movie_numbers, request.priority, request.force)
+    def submit_batch(request: Request, payload: SubmitBatchRequest) -> BatchJobResponse:
+        result = store.submit_batch(
+            payload.movie_numbers,
+            payload.priority,
+            payload.force,
+            callback_client_key=callback_client_key_from_request(request),
+        )
         return BatchJobResponse(
+            created=[job_response(item.job) for item in result.created],
+            existing=[job_response(item.job) for item in result.existing if item.job is not None],
+            invalid=[item.movie_number for item in result.invalid],
+        )
+
+    @app.post("/jobs/import-subtitle-requests", response_model=RequestedSubtitleImportResponse)
+    def import_subtitle_requests(
+        http_request: Request,
+        payload: ImportRequestedSubtitlesRequest | None = None,
+    ) -> RequestedSubtitleImportResponse:
+        if requested_subtitle_importer is None:
+            raise HTTPException(
+                status_code=503,
+                detail="requested subtitle importer is not configured",
+            )
+        import_request = payload or ImportRequestedSubtitlesRequest()
+        try:
+            selection = requested_subtitle_importer.fetch_requested_subtitles(
+                min_count=import_request.min_count,
+                limit=import_request.limit,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        result = store.submit_batch(
+            [item.code for item in selection.imported],
+            priority=import_request.priority,
+            force=import_request.force,
+            callback_client_key=callback_client_key_from_request(http_request),
+        )
+        return RequestedSubtitleImportResponse(
+            requested=selection.requested,
+            imported=selection.imported,
+            skipped_available=selection.skipped_available,
             created=[job_response(item.job) for item in result.created],
             existing=[job_response(item.job) for item in result.existing if item.job is not None],
             invalid=[item.movie_number for item in result.invalid],
@@ -130,7 +204,7 @@ def create_app(
         job = store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        return build_job_detail(job)
+        return build_job_detail(job, store.get_latest_callback_event(job_id))
 
     @app.get("/jobs/{job_id}/logs", response_model=JobLogsResponse)
     def get_job_logs(job_id: str) -> JobLogsResponse:
@@ -186,6 +260,7 @@ def create_app(
                 job.normalized_movie_number,
                 Path(job.english_srt_path_mac),
             )
+            callback_notifier.notify_subtitle_ready(job)
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/failed", response_model=JobResponse)

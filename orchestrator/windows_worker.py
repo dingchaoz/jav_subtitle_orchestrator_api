@@ -69,11 +69,13 @@ class WindowsWorker:
         transcriber,
         translator,
         heartbeat_interval_seconds: float = 60,
+        delete_audio_after_transcription: bool = True,
     ) -> None:
         self.client = client
         self.transcriber = transcriber
         self.translator = translator
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.delete_audio_after_transcription = delete_audio_after_transcription
 
     def process_one(self) -> bool:
         job = self.client.next_job()
@@ -99,6 +101,7 @@ class WindowsWorker:
                 audio_path,
                 japanese_srt,
             )
+            self._delete_audio_after_transcription(job_dir, audio_path, japanese_srt)
 
             stage = "transcription_done"
             self.client.heartbeat(job_id, stage)
@@ -156,6 +159,28 @@ class WindowsWorker:
                 self.client.heartbeat(job_id, stage)
             except Exception:
                 continue
+
+    def _delete_audio_after_transcription(
+        self,
+        job_dir: Path,
+        audio_path: Path,
+        japanese_srt: Path,
+    ) -> None:
+        if not self.delete_audio_after_transcription:
+            return
+        if not japanese_srt.exists() or japanese_srt.stat().st_size <= 0:
+            return
+        try:
+            audio_path.unlink()
+            _append_job_log_safely(job_dir, "windows-worker.log", f"deleted audio {audio_path}")
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            _append_job_log_safely(
+                job_dir,
+                "windows-worker.log",
+                f"failed to delete audio {audio_path}: {exc}",
+            )
 
 
 def run_forever(worker: WindowsWorker, poll_interval_seconds: int) -> None:

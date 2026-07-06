@@ -9,7 +9,7 @@ import requests
 
 MOVIE_CODE_RE = re.compile(r"^([a-zA-Z]+)-?(\d+)$")
 AI_ENGLISH_LANGUAGE = "English_AI"
-AI_SUBTITLE_SOURCE = "ai_orchestrator"
+AI_SUBTITLE_SOURCE = "human"
 
 logger = logging.getLogger(__name__)
 

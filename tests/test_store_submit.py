@@ -57,6 +57,56 @@ def test_submit_job_creates_sqlite_row(sqlite_path, mac_jobs_root):
     assert result.job.job_dir_windows == "M:\\ktb-096"
 
 
+def test_submit_job_persists_callback_client_key(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    result = store.submit_job(
+        "KTB-096",
+        priority=100,
+        force=False,
+        callback_client_key="machine-a.access",
+    )
+
+    assert result.kind == "created"
+    assert result.job.callback_client_key == "machine-a.access"
+    assert store.get_job(result.job.id).callback_client_key == "machine-a.access"
+
+
+def test_callback_event_lifecycle_records_delivery_status(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("KTB-096", priority=100, force=False).job
+
+    event = store.create_callback_event(
+        job_id=job.id,
+        event_type="subtitle.ready",
+        target_url="https://client.example.com/ready",
+        payload_json='{"event":"subtitle.ready"}',
+    )
+
+    assert event.status == "pending"
+    assert event.attempt_count == 0
+
+    failed = store.record_callback_delivery(
+        event.id,
+        status="failed",
+        last_error="connection refused",
+    )
+
+    assert failed.status == "failed"
+    assert failed.attempt_count == 1
+    assert failed.last_error == "connection refused"
+    assert store.get_latest_callback_event(job.id).status == "failed"
+
+    delivered = store.record_callback_delivery(event.id, status="delivered")
+
+    assert delivered.status == "delivered"
+    assert delivered.attempt_count == 2
+    assert delivered.delivered_at is not None
+    assert delivered.last_error is None
+
+
 def test_initialize_closes_connection(sqlite_path, mac_jobs_root):
     store = TrackingJobStore(sqlite_path, mac_jobs_root, "M:\\")
 

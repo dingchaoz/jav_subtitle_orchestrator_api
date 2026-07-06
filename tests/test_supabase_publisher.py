@@ -79,7 +79,7 @@ def test_publish_uploads_english_ai_and_inserts_language_row(tmp_path):
     ][0]
     assert post_language[2]["json"]["language"] == "English_AI"
     assert post_language[2]["json"]["subtitle_source"] == AI_SUBTITLE_SOURCE
-    assert post_language[2]["json"]["subtitle_source"] == "ai_orchestrator"
+    assert post_language[2]["json"]["subtitle_source"] == "human"
     assert post_language[2]["json"]["file_path"] == "ktb/ktb-112/ktb-112-English_AI.srt"
 
 

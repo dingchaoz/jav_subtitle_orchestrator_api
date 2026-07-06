@@ -44,6 +44,13 @@ class SubmitBatchRequest(BaseModel):
     force: bool = False
 
 
+class ImportRequestedSubtitlesRequest(BaseModel):
+    min_count: int = Field(default=1, ge=1)
+    limit: int = Field(default=100, ge=1, le=500)
+    priority: int = 100
+    force: bool = False
+
+
 class WorkerHeartbeatRequest(BaseModel):
     worker_id: str
     stage: JobStatus
@@ -71,6 +78,22 @@ class JobResponse(BaseModel):
 
 
 class BatchJobResponse(BaseModel):
+    created: list[JobResponse]
+    existing: list[JobResponse]
+    invalid: list[str]
+
+
+class RequestedSubtitle(BaseModel):
+    code: str
+    movie_id: str | None = None
+    request_count: int
+    last_requested_at: str | None = None
+
+
+class RequestedSubtitleImportResponse(BaseModel):
+    requested: list[RequestedSubtitle]
+    imported: list[RequestedSubtitle]
+    skipped_available: list[RequestedSubtitle]
     created: list[JobResponse]
     existing: list[JobResponse]
     invalid: list[str]
@@ -106,6 +129,15 @@ class DashboardStateResponse(BaseModel):
     active_errors: list[DashboardJobSummary]
 
 
+class CallbackStatusResponse(BaseModel):
+    event_type: str
+    status: str
+    attempt_count: int
+    updated_at: str
+    delivered_at: str | None = None
+    last_error: str | None = None
+
+
 class JobDetailResponse(BaseModel):
     id: str
     movie_number: str
@@ -128,6 +160,7 @@ class JobDetailResponse(BaseModel):
     japanese_srt_path_windows: str | None = None
     english_srt_path_mac: str | None = None
     english_srt_path_windows: str | None = None
+    callback: CallbackStatusResponse | None = None
 
 
 class JobLogSummary(BaseModel):

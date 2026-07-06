@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from orchestrator.models import (
+    CallbackStatusResponse,
     DashboardJobSummary,
     DashboardStateResponse,
     JobDetailResponse,
@@ -13,7 +14,7 @@ from orchestrator.models import (
     JobLogsResponse,
     JobStatus,
 )
-from orchestrator.store import JobRecord, JobStore
+from orchestrator.store import CallbackEventRecord, JobRecord, JobStore
 
 
 MAC_ACTIVE_STATUSES = {
@@ -41,7 +42,23 @@ def job_summary(job: JobRecord) -> DashboardJobSummary:
     )
 
 
-def build_job_detail(job: JobRecord) -> JobDetailResponse:
+def callback_status(event: CallbackEventRecord | None) -> CallbackStatusResponse | None:
+    if event is None:
+        return None
+    return CallbackStatusResponse(
+        event_type=event.event_type,
+        status=event.status,
+        attempt_count=event.attempt_count,
+        updated_at=event.updated_at,
+        delivered_at=event.delivered_at,
+        last_error=event.last_error,
+    )
+
+
+def build_job_detail(
+    job: JobRecord,
+    callback_event: CallbackEventRecord | None = None,
+) -> JobDetailResponse:
     return JobDetailResponse(
         id=job.id,
         movie_number=job.movie_number,
@@ -64,6 +81,7 @@ def build_job_detail(job: JobRecord) -> JobDetailResponse:
         japanese_srt_path_windows=job.japanese_srt_path_windows,
         english_srt_path_mac=job.english_srt_path_mac,
         english_srt_path_windows=job.english_srt_path_windows,
+        callback=callback_status(callback_event),
     )
 
 
@@ -614,6 +632,30 @@ def dashboard_html() -> str:
             </form>
           </div>
         </section>
+
+        <section class="panel" aria-labelledby="import-requested-title">
+          <div class="panel-header">
+            <h2 id="import-requested-title">Requested subtitles</h2>
+          </div>
+          <div class="panel-body">
+            <form id="import-requested-form">
+              <label>
+                Minimum requests
+                <input id="import-requested-min-count" name="min_count" type="number" value="1" min="1" max="9999" required>
+              </label>
+              <label>
+                Limit
+                <input id="import-requested-limit" name="limit" type="number" value="100" min="1" max="500" required>
+              </label>
+              <label>
+                Priority
+                <input id="import-requested-priority" name="priority" type="number" value="100" min="0" max="9999" required>
+              </label>
+              <button type="submit">Import requested subtitles</button>
+              <div class="message" id="import-requested-message" role="status"></div>
+            </form>
+          </div>
+        </section>
       </div>
 
       <div class="main-stack">
@@ -909,9 +951,42 @@ def dashboard_html() -> str:
       }
     }
 
+    function importRequestRange(requested) {
+      const counts = (requested || []).map((item) => Number(item.request_count || 0));
+      if (!counts.length) return "no request counts";
+      const min = Math.min(...counts);
+      const max = Math.max(...counts);
+      return min === max ? `request count ${min}` : `request counts ${min}-${max}`;
+    }
+
+    async function importRequestedSubtitles(event) {
+      event.preventDefault();
+      const message = document.getElementById("import-requested-message");
+      const minCount = Number(document.getElementById("import-requested-min-count").value || "1");
+      const limit = Number(document.getElementById("import-requested-limit").value || "100");
+      const priority = Number(document.getElementById("import-requested-priority").value || "100");
+      message.textContent = "Importing requested subtitles...";
+      try {
+        const result = await fetchJson("/jobs/import-subtitle-requests", {
+          method: "POST",
+          body: JSON.stringify({
+            min_count: minCount,
+            limit,
+            priority,
+            force: false
+          })
+        });
+        message.textContent = `Requested ${result.requested.length} (${importRequestRange(result.requested)}), imported ${result.imported.length}, skipped available ${result.skipped_available.length}, created ${result.created.length}, existing ${result.existing.length}, invalid ${result.invalid.length}`;
+        await refreshState();
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
     document.getElementById("refresh-button").addEventListener("click", refreshState);
     document.getElementById("single-movie-form").addEventListener("submit", submitSingle);
     document.getElementById("batch-movie-form").addEventListener("submit", submitBatch);
+    document.getElementById("import-requested-form").addEventListener("submit", importRequestedSubtitles);
     window.addEventListener("load", refreshState);
   </script>
 </body>

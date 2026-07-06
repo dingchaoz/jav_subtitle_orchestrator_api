@@ -1,12 +1,18 @@
+import json
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAC_ENV_FILE = PROJECT_ROOT / ".env"
 WINDOWS_ENV_FILE = PROJECT_ROOT / ".env.windows"
+
+
+class CallbackClientSettings(BaseModel):
+    url: str
+    secret: str
 
 
 class MacSettings(BaseSettings):
@@ -43,10 +49,39 @@ class MacSettings(BaseSettings):
         default=None,
         alias="JAVSUBTITLE_ADMIN_API_TOKEN",
     )
+    cloudflare_account_id: str | None = Field(default=None, alias="CLOUDFLARE_ACCOUNT_ID")
+    cloudflare_api_token: str | None = Field(default=None, alias="CLOUDFLARE_API_TOKEN")
+    cloudflare_d1_api_token: str | None = Field(default=None, alias="CLOUDFLARE_D1_API_TOKEN")
+    cloudflare_d1_database_id: str = Field(
+        default="401de37d-51fc-44b1-aacc-6ccff9d74f52",
+        alias="CLOUDFLARE_D1_DATABASE_ID",
+    )
     javsubtitle_post_sync_enabled: bool = Field(
         default=False,
         alias="JAVSUBTITLE_POST_SYNC_ENABLED",
     )
+    callback_clients: dict[str, CallbackClientSettings] = Field(
+        default_factory=dict,
+        alias="CALLBACK_CLIENTS_JSON",
+    )
+    callback_timeout_seconds: int = Field(default=10, alias="CALLBACK_TIMEOUT_SECONDS")
+
+    @field_validator("callback_clients", mode="before")
+    @classmethod
+    def parse_callback_clients_json(cls, value):
+        if value in (None, ""):
+            return {}
+        if isinstance(value, dict):
+            return value
+        if not isinstance(value, str):
+            raise ValueError("CALLBACK_CLIENTS_JSON must be a JSON object")
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("CALLBACK_CLIENTS_JSON must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("CALLBACK_CLIENTS_JSON must be a JSON object")
+        return parsed
 
 
 class WindowsSettings(BaseSettings):
@@ -62,3 +97,7 @@ class WindowsSettings(BaseSettings):
     translate_script_path: str = Field(alias="TRANSLATE_SCRIPT_PATH")
     poll_interval_seconds: int = Field(default=10, alias="POLL_INTERVAL_SECONDS")
     heartbeat_interval_seconds: int = Field(default=60, alias="HEARTBEAT_INTERVAL_SECONDS")
+    delete_audio_after_transcription: bool = Field(
+        default=True,
+        alias="DELETE_AUDIO_AFTER_TRANSCRIPTION",
+    )

@@ -59,6 +59,29 @@ def test_catalog_sync_posts_canonical_codes_to_admin_endpoint():
     }
 
 
+def test_catalog_sync_normalizes_www_base_to_exact_production_domain():
+    session = FakeSession([FakeResponse(payload={"success": True, "synced": 1})])
+    client = CatalogSyncClient(
+        "https://www.javsubtitle.com/",
+        "secret-token",
+        session=session,
+    )
+
+    client.sync_subtitles(
+        ["mida-686"],
+        source="jav-subtitle-orchestrator",
+        reason="orchestrator_ai_subtitle_publish",
+    )
+
+    url, kwargs = session.calls[0]
+    assert url == "https://javsubtitle.com/api/admin/catalog/sync-subtitles"
+    assert kwargs["json"] == {
+        "canonicalCodes": ["mida-686"],
+        "source": "jav-subtitle-orchestrator",
+        "reason": "orchestrator_ai_subtitle_publish",
+    }
+
+
 def test_catalog_sync_retries_then_succeeds_after_transient_failure():
     session = FakeSession(
         [

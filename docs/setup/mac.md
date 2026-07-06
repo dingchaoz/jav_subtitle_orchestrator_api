@@ -25,11 +25,19 @@ SUPABASE_SERVICE_ROLE_KEY=replace-with-service-role-key
 SUPABASE_STORAGE_BUCKET=subtitles
 JAVSUBTITLE_API_BASE=https://javsubtitle.com
 JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-admin-token
-JAVSUBTITLE_POST_SYNC_ENABLED=false
+JAVSUBTITLE_POST_SYNC_ENABLED=true
+CLOUDFLARE_ACCOUNT_ID=replace-with-account-id
+CLOUDFLARE_API_TOKEN=replace-with-d1-read-token
+CLOUDFLARE_D1_API_TOKEN=replace-with-d1-read-token
+CLOUDFLARE_D1_DATABASE_ID=401de37d-51fc-44b1-aacc-6ccff9d74f52
 ```
 
-Keep `JAVSUBTITLE_ADMIN_API_TOKEN` only in the Mac API `.env`. Do not put it in browser,
-dashboard, or Windows frontend code.
+Keep `JAVSUBTITLE_ADMIN_API_TOKEN`, `CLOUDFLARE_D1_API_TOKEN`, and
+`SUPABASE_SERVICE_ROLE_KEY` only in the Mac API `.env`. Do not put them in browser,
+dashboard, or Windows frontend code. Requested subtitle import reads request counts from
+Cloudflare D1 and skips movies that already have an `English_AI` row in Supabase
+`movie_subtitle_catalog`.
+`CLOUDFLARE_API_TOKEN` is also accepted as an alias for `CLOUDFLARE_D1_API_TOKEN`.
 
 3. Install and run the API:
 
@@ -55,4 +63,18 @@ python -m orchestrator mac-worker
 curl -X POST http://127.0.0.1:8010/jobs/batch \
   -H "Content-Type: application/json" \
   -d '{"movie_numbers":["ktb-096","ktb-095","ktb-093"],"priority":100,"force":false}'
+```
+
+6. Import javsubtitle requested subtitles on demand:
+
+```bash
+python -m orchestrator import-subtitle-requests --min-count 1 --limit 100 --priority 100
+```
+
+The dashboard button at `http://127.0.0.1:8010/dashboard` uses the same import path.
+
+To run the import every 30 minutes with cron:
+
+```cron
+*/30 * * * * cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator && /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/.venv/bin/python -m orchestrator import-subtitle-requests --min-count 1 --limit 100 --priority 100 >> /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/logs/import-subtitle-requests.log 2>&1
 ```

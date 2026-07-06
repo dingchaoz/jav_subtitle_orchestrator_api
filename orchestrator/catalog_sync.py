@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -9,6 +10,7 @@ from orchestrator.supabase_publisher import canonical_movie_code
 
 DEFAULT_SOURCE = "jav-subtitle-orchestrator"
 DEFAULT_REASON = "orchestrator_ai_subtitle_publish"
+PRODUCTION_API_BASE = "https://javsubtitle.com"
 
 
 class CatalogSyncError(RuntimeError):
@@ -28,7 +30,7 @@ class CatalogSyncClient:
         max_attempts: int = 2,
         session: requests.Session | None = None,
     ) -> None:
-        self.api_base_url = api_base_url.rstrip("/")
+        self.api_base_url = _normalize_api_base(api_base_url)
         self.admin_api_token = admin_api_token
         self.enabled = enabled
         self.timeout_seconds = timeout_seconds
@@ -83,3 +85,11 @@ class CatalogSyncClient:
             last_error = f"HTTP {response.status_code}: {response.text}"
 
         raise CatalogSyncError(normalized_codes, last_error)
+
+
+def _normalize_api_base(api_base_url: str) -> str:
+    base = api_base_url.strip().rstrip("/")
+    parsed = urlparse(base)
+    if parsed.scheme == "https" and parsed.netloc == "www.javsubtitle.com":
+        return PRODUCTION_API_BASE
+    return urlunparse(parsed._replace(path=parsed.path.rstrip("/"), params="", query="", fragment=""))
