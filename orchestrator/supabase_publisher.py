@@ -1,14 +1,28 @@
 import re
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import requests
 
 
 MOVIE_CODE_RE = re.compile(r"^([a-zA-Z]+)-?(\d+)$")
 AI_ENGLISH_LANGUAGE = "English_AI"
-SUBTITLE_SOURCE = "human"
+AI_SUBTITLE_SOURCE = "ai_orchestrator"
+
+logger = logging.getLogger(__name__)
+
+
+class CatalogSyncer(Protocol):
+    def sync_subtitles(
+        self,
+        canonical_codes: list[str],
+        *,
+        source: str,
+        reason: str,
+    ) -> object | None:
+        ...
 
 
 def parse_movie_code(movie_code: str) -> tuple[str, int]:
@@ -48,12 +62,14 @@ class SupabaseSubtitlePublisher:
         bucket: str = "subtitles",
         timeout_seconds: int = 30,
         session: requests.Session | None = None,
+        catalog_sync: CatalogSyncer | None = None,
     ) -> None:
         self.supabase_url = supabase_url.rstrip("/")
         self.service_role_key = service_role_key
         self.bucket = bucket
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
+        self.catalog_sync = catalog_sync
 
     @property
     def headers(self) -> dict[str, str]:
@@ -75,13 +91,27 @@ class SupabaseSubtitlePublisher:
             storage_path,
             srt_path.stat().st_size,
         )
-        return SupabasePublishResult(
+        result = SupabasePublishResult(
             movie_code=canonical,
             language=AI_ENGLISH_LANGUAGE,
             storage_path=storage_path,
             movie_uuid=movie_uuid,
             subtitle_id=subtitle_id,
         )
+        self._sync_catalog_after_publish(result.movie_code)
+        return result
+
+    def _sync_catalog_after_publish(self, canonical: str) -> None:
+        if self.catalog_sync is None:
+            return
+        try:
+            self.catalog_sync.sync_subtitles(
+                [canonical],
+                source="jav-subtitle-orchestrator",
+                reason="orchestrator_ai_subtitle_publish",
+            )
+        except Exception as exc:
+            logger.warning("Catalog sync failed for %s: %s", canonical, exc)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = {**self.headers, **kwargs.pop("headers", {})}
@@ -159,7 +189,7 @@ class SupabaseSubtitlePublisher:
             "file_path": storage_path,
             "file_size": file_size,
             "subtitle_quality": "auto",
-            "subtitle_source": SUBTITLE_SOURCE,
+            "subtitle_source": AI_SUBTITLE_SOURCE,
             "is_premium": False,
         }
         if rows:

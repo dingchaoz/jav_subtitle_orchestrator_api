@@ -20,6 +20,9 @@ MAC_ENV_ALIASES = (
     "WORKER_LEASE_SECONDS",
     "MAX_DOWNLOAD_ATTEMPTS",
     "MAX_WORKER_ATTEMPTS",
+    "JAVSUBTITLE_API_BASE",
+    "JAVSUBTITLE_ADMIN_API_TOKEN",
+    "JAVSUBTITLE_POST_SYNC_ENABLED",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -94,6 +97,43 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.worker_lease_seconds == 1800
     assert settings.max_download_attempts == 3
     assert settings.max_worker_attempts == 3
+    assert settings.javsubtitle_api_base == "https://javsubtitle.com"
+    assert settings.javsubtitle_admin_api_token is None
+    assert settings.javsubtitle_post_sync_enabled is False
+
+
+def test_mac_settings_load_catalog_sync_env(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv("JAVSUBTITLE_API_BASE", "https://javsubtitle.com/")
+    monkeypatch.setenv("JAVSUBTITLE_ADMIN_API_TOKEN", "secret-token")
+    monkeypatch.setenv("JAVSUBTITLE_POST_SYNC_ENABLED", "true")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.javsubtitle_api_base == "https://javsubtitle.com/"
+    assert settings.javsubtitle_admin_api_token == "secret-token"
+    assert settings.javsubtitle_post_sync_enabled is True
+
+
+def test_build_supabase_publisher_requires_catalog_sync_token_when_enabled():
+    from orchestrator.__main__ import build_supabase_publisher
+
+    settings = SimpleNamespace(
+        publish_to_supabase=True,
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-key",
+        supabase_storage_bucket="subtitles",
+        javsubtitle_post_sync_enabled=True,
+        javsubtitle_api_base="https://javsubtitle.com",
+        javsubtitle_admin_api_token=None,
+    )
+
+    try:
+        build_supabase_publisher(settings)
+    except RuntimeError as exc:
+        assert "JAVSUBTITLE_ADMIN_API_TOKEN" in str(exc)
+    else:
+        raise AssertionError("expected missing catalog sync token to fail startup")
 
 
 def test_windows_settings_defaults_match_design_spec(monkeypatch):

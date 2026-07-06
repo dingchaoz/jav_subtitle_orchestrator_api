@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from orchestrator.supabase_publisher import (
+    AI_SUBTITLE_SOURCE,
     SupabaseSubtitlePublisher,
     build_ai_subtitle_storage_path,
     parse_movie_code,
@@ -77,7 +78,8 @@ def test_publish_uploads_english_ai_and_inserts_language_row(tmp_path):
         if call[0] == "POST" and "/rest/v1/movie_languages" in call[1]
     ][0]
     assert post_language[2]["json"]["language"] == "English_AI"
-    assert post_language[2]["json"]["subtitle_source"] == "human"
+    assert post_language[2]["json"]["subtitle_source"] == AI_SUBTITLE_SOURCE
+    assert post_language[2]["json"]["subtitle_source"] == "ai_orchestrator"
     assert post_language[2]["json"]["file_path"] == "ktb/ktb-112/ktb-112-English_AI.srt"
 
 

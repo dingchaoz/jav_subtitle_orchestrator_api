@@ -15,10 +15,24 @@ def build_supabase_publisher(settings):
 
     from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
 
+    catalog_sync = None
+    if settings.javsubtitle_post_sync_enabled:
+        if not settings.javsubtitle_admin_api_token:
+            raise RuntimeError(
+                "JAVSUBTITLE_POST_SYNC_ENABLED requires JAVSUBTITLE_ADMIN_API_TOKEN"
+            )
+        from orchestrator.catalog_sync import CatalogSyncClient
+
+        catalog_sync = CatalogSyncClient(
+            settings.javsubtitle_api_base,
+            settings.javsubtitle_admin_api_token,
+        )
+
     return SupabaseSubtitlePublisher(
         settings.supabase_url,
         settings.supabase_service_role_key,
         bucket=settings.supabase_storage_bucket,
+        catalog_sync=catalog_sync,
     )
 
 

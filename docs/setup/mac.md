@@ -19,7 +19,17 @@ MAC_DOWNLOAD_CONCURRENCY=1
 WORKER_LEASE_SECONDS=1800
 MAX_DOWNLOAD_ATTEMPTS=3
 MAX_WORKER_ATTEMPTS=3
+PUBLISH_TO_SUPABASE=false
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=replace-with-service-role-key
+SUPABASE_STORAGE_BUCKET=subtitles
+JAVSUBTITLE_API_BASE=https://javsubtitle.com
+JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-admin-token
+JAVSUBTITLE_POST_SYNC_ENABLED=false
 ```
+
+Keep `JAVSUBTITLE_ADMIN_API_TOKEN` only in the Mac API `.env`. Do not put it in browser,
+dashboard, or Windows frontend code.
 
 3. Install and run the API:
 

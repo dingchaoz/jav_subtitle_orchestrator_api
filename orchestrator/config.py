@@ -35,6 +35,18 @@ class MacSettings(BaseSettings):
         alias="SUPABASE_SERVICE_ROLE_KEY",
     )
     supabase_storage_bucket: str = Field(default="subtitles", alias="SUPABASE_STORAGE_BUCKET")
+    javsubtitle_api_base: str = Field(
+        default="https://javsubtitle.com",
+        alias="JAVSUBTITLE_API_BASE",
+    )
+    javsubtitle_admin_api_token: str | None = Field(
+        default=None,
+        alias="JAVSUBTITLE_ADMIN_API_TOKEN",
+    )
+    javsubtitle_post_sync_enabled: bool = Field(
+        default=False,
+        alias="JAVSUBTITLE_POST_SYNC_ENABLED",
+    )
 
 
 class WindowsSettings(BaseSettings):
