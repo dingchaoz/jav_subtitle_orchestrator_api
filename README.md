@@ -40,3 +40,4 @@ Setup details:
 - [Windows setup](docs/setup/windows.md)
 - [SMB setup](docs/setup/smb.md)
 - [Codex translation batch helper](docs/setup/codex-translation.md)
+- [Cloudflare Tunnel setup](docs/setup/cloudflare-tunnel.md)
