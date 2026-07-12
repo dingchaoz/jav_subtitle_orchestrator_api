@@ -52,6 +52,21 @@ class MacSettings(BaseSettings):
         ge=1,
         alias="TRANSLATION_QUALITY_FAILURE_LIMIT",
     )
+    supabase_url: str | None = Field(default=None, alias="SUPABASE_URL")
+    supabase_service_role_key: str | None = Field(
+        default=None,
+        alias="SUPABASE_SERVICE_ROLE_KEY",
+    )
+    subtitle_audit_visibility_enabled: bool = Field(
+        default=False,
+        alias="SUBTITLE_AUDIT_VISIBILITY_ENABLED",
+    )
+    subtitle_audit_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        alias="SUBTITLE_AUDIT_TIMEOUT_SECONDS",
+    )
 
 
 class WindowsSettings(BaseSettings):

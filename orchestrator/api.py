@@ -1,5 +1,7 @@
 from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -15,15 +17,20 @@ from orchestrator.dashboard import (
 
 from orchestrator.models import (
     BatchJobResponse,
+    AuditStatus,
     DashboardStateResponse,
     JobBrowserResponse,
     JobDetailResponse,
     JobLogTailResponse,
     JobLogsResponse,
+    MAX_AUDIT_OFFSET,
     JobResponse,
     JobStatus,
     SubmitBatchRequest,
     SubmitJobRequest,
+    SubtitleAuditItem,
+    SubtitleAuditPageResponse,
+    SubtitleAuditSummaryResponse,
     WorkerCompleteRequest,
     WorkerFailedRequest,
     WorkerHeartbeatRequest,
@@ -32,6 +39,21 @@ from orchestrator.models import (
     WorkerTranscriptionCompleteRequest,
 )
 from orchestrator.store import JobRecord, JobStore
+
+
+class SubtitleAuditServiceProtocol(Protocol):
+    def summary(self) -> SubtitleAuditSummaryResponse: ...
+
+    def list_findings(
+        self,
+        *,
+        status: str | None,
+        language: str | None,
+        page: int,
+        page_size: int,
+    ) -> SubtitleAuditPageResponse: ...
+
+    def get_finding(self, subtitle_id: str) -> SubtitleAuditItem | None: ...
 
 
 def job_response(job: JobRecord) -> JobResponse:
@@ -78,8 +100,12 @@ def create_app(
     worker_lease_seconds: int = 1800,
     max_worker_attempts: int = 3,
     final_file_exists: Callable[[str], bool] | None = None,
+    subtitle_audit_service: SubtitleAuditServiceProtocol | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
+    audit_close = getattr(subtitle_audit_service, "close", None)
+    if callable(audit_close):
+        app.router.add_event_handler("shutdown", audit_close)
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -114,6 +140,82 @@ def create_app(
     @app.get("/dashboard/state", response_model=DashboardStateResponse)
     def dashboard_state() -> DashboardStateResponse:
         return build_dashboard_state(store)
+
+    def require_subtitle_audit_service() -> SubtitleAuditServiceProtocol:
+        if subtitle_audit_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="subtitle audit visibility is unavailable",
+            )
+        return subtitle_audit_service
+
+    @app.get(
+        "/subtitle-audits/summary",
+        response_model=SubtitleAuditSummaryResponse,
+    )
+    def subtitle_audit_summary() -> SubtitleAuditSummaryResponse:
+        try:
+            return require_subtitle_audit_service().summary()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="subtitle audit visibility is unavailable",
+            ) from exc
+
+    @app.get("/subtitle-audits", response_model=SubtitleAuditPageResponse)
+    def subtitle_audit_findings(
+        status: AuditStatus | None = Query(default=None),
+        language: str | None = Query(default=None, min_length=1, max_length=128),
+        page: int = Query(default=1, ge=1, le=MAX_AUDIT_OFFSET + 1),
+        page_size: int = Query(default=50, ge=1, le=100),
+    ) -> SubtitleAuditPageResponse:
+        from orchestrator.subtitle_audit_api import SubtitleAuditApiService
+
+        try:
+            SubtitleAuditApiService.validate_language(language)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="invalid language filter"
+            ) from exc
+        if (page - 1) * page_size > MAX_AUDIT_OFFSET:
+            raise HTTPException(
+                status_code=422,
+                detail="subtitle audit offset exceeds limit",
+            )
+        try:
+            return require_subtitle_audit_service().list_findings(
+                status=status.value if status is not None else None,
+                language=language,
+                page=page,
+                page_size=page_size,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="subtitle audit visibility is unavailable",
+            ) from exc
+
+    @app.get("/subtitle-audits/{subtitle_id}", response_model=SubtitleAuditItem)
+    def subtitle_audit_finding(subtitle_id: UUID) -> SubtitleAuditItem:
+        try:
+            finding = require_subtitle_audit_service().get_finding(str(subtitle_id))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="subtitle audit visibility is unavailable",
+            ) from exc
+        if finding is None:
+            raise HTTPException(
+                status_code=404,
+                detail="subtitle audit finding not found",
+            )
+        return finding
 
     @app.get("/jobs/browser", response_model=JobBrowserResponse)
     def jobs_browser(
