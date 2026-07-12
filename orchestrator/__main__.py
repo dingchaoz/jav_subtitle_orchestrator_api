@@ -10,6 +10,22 @@ from orchestrator.logging_config import configure_logging
 LOGGER = logging.getLogger(__name__)
 
 
+def build_subtitle_audit_api_service(settings):
+    if (
+        not settings.subtitle_audit_visibility_enabled
+        or not settings.supabase_url
+        or not settings.supabase_service_role_key
+    ):
+        return None
+    from orchestrator.subtitle_audit_api import SubtitleAuditApiService
+
+    return SubtitleAuditApiService(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        timeout_seconds=settings.subtitle_audit_timeout_seconds,
+    )
+
+
 def run_api() -> None:
     import uvicorn
 
@@ -24,6 +40,7 @@ def run_api() -> None:
         store,
         worker_lease_seconds=settings.worker_lease_seconds,
         max_worker_attempts=settings.max_worker_attempts,
+        subtitle_audit_service=build_subtitle_audit_api_service(settings),
     )
     uvicorn.run(app, host=settings.host, port=settings.port)
 

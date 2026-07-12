@@ -52,6 +52,10 @@ def test_mac_worker_processes_one_queued_job_to_audio_ready(sqlite_path, mac_job
     assert Path(refreshed.audio_path_mac).exists()
     assert refreshed.audio_path_windows == "M:\\ktb-096\\audio.wav"
     assert (mac_jobs_root / "ktb-096" / "job.json").exists()
+    worker_status = store.get_worker_status("mac-downloader-1")
+    assert worker_status is not None
+    assert worker_status.role == "mac_downloader"
+    assert worker_status.state == "idle"
 
 
 def test_mac_worker_writes_download_log(sqlite_path, mac_jobs_root):
@@ -147,6 +151,9 @@ def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root
     worker = MacDownloadWorker(store, FakeMissAVAdapter(), max_download_attempts=3)
 
     assert worker.process_one() is False
+    worker_status = store.get_worker_status("mac-downloader-1")
+    assert worker_status is not None
+    assert worker_status.state == "idle"
 
 
 def test_mac_worker_requeues_failure_below_max_attempts(sqlite_path, mac_jobs_root):
@@ -251,6 +258,10 @@ def test_mac_translation_worker_claims_transcription_and_marks_quality_pass_read
     assert "Distinct English" in english.read_text(encoding="utf-8")
     quality_log = mac_jobs_root / "ktb-096" / "logs" / "quality.log"
     assert '"passed": true' in quality_log.read_text(encoding="utf-8")
+    worker_status = store.get_worker_status("mac-translation-1")
+    assert worker_status is not None
+    assert worker_status.role == "mac_translator"
+    assert worker_status.state == "idle"
 
 
 def test_mac_translation_worker_permanently_rejects_collapsed_output(
