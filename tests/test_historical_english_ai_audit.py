@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pytest
+import json
+from pathlib import Path
 
 
 def _timestamp(seconds: int) -> str:
@@ -271,3 +273,201 @@ def test_request_rate_limiter_serializes_global_rate():
     limiter.acquire()
 
     assert sleeps == [0.5]
+
+
+def _catalog_record(subtitle_id: str, movie_code: str, *, suffix: str = ""):
+    from orchestrator.historical_english_ai_audit import CatalogRecord
+
+    return CatalogRecord(
+        subtitle_id=subtitle_id,
+        movie_id="10000000-0000-0000-0000-000000000001",
+        movie_code=movie_code,
+        language="English_AI",
+        file_path=f"audit/{movie_code}{suffix}.srt",
+        file_size=123,
+    )
+
+
+class _FakeAuditReader:
+    def __init__(self, records, objects, *, secret: str = "SERVICE-SECRET") -> None:
+        self.records = records
+        self.objects = objects
+        self.downloaded_paths: list[str] = []
+        self._service_role_key = secret
+
+    def iter_catalog(self, *, limit=None):
+        records = self.records if limit is None else self.records[:limit]
+        yield from records
+
+    def download_object(self, path, *, max_bytes):
+        self.downloaded_paths.append(path)
+        value = self.objects[path]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def test_scan_resumes_terminal_ids_and_writes_text_free_reports(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import LocalEnglishAiAuditRunner
+
+    first = _catalog_record("00000000-0000-0000-0000-000000000001", "ok-001")
+    bad = _catalog_record("00000000-0000-0000-0000-000000000002", "bad-002")
+    reader = _FakeAuditReader(
+        [first, bad],
+        {
+            first.file_path: _srt([f"Safe line {index}" for index in range(25)]),
+            bad.file_path: _srt(["Cannot translate"] * 20),
+        },
+    )
+
+    preflight = LocalEnglishAiAuditRunner(reader, workers=1).scan(tmp_path, limit=1)
+    summary = LocalEnglishAiAuditRunner(reader, workers=2).scan(tmp_path)
+
+    assert preflight.complete is False
+    assert preflight.bounded is True
+    assert summary.complete is True
+    assert summary.bounded is False
+    assert summary.discovered == 2
+    assert summary.hard_failure == 1
+    assert summary.skipped == 1
+    assert reader.downloaded_paths == [first.file_path, bad.file_path]
+    assert (tmp_path / "repair-allowlist.txt").read_text() == "bad-002\n"
+    combined = "".join(
+        path.read_text() for path in tmp_path.iterdir() if path.is_file()
+    )
+    assert "Cannot translate" not in combined
+    assert "SERVICE-SECRET" not in combined
+
+
+def test_scan_marks_missing_as_hard_failure_without_exposing_path(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import (
+        LocalEnglishAiAuditRunner,
+        StorageObjectMissing,
+    )
+
+    missing = _catalog_record(
+        "00000000-0000-0000-0000-000000000001", "gone-001"
+    )
+    reader = _FakeAuditReader(
+        [missing], {missing.file_path: StorageObjectMissing("private subtitle path")}
+    )
+
+    summary = LocalEnglishAiAuditRunner(reader).scan(tmp_path)
+    row = json.loads((tmp_path / "audit-results.jsonl").read_text())
+
+    assert summary.complete is True
+    assert summary.hard_failure == 1
+    assert row["reason_codes"] == ["STORAGE_OBJECT_MISSING"]
+    assert "private subtitle path" not in json.dumps(row)
+
+
+def test_scan_sanitizes_per_object_error_and_excludes_it_from_allowlist(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import LocalEnglishAiAuditRunner
+
+    record = _catalog_record(
+        "00000000-0000-0000-0000-000000000001", "error-001"
+    )
+    secret = "SERVICE-SECRET"
+    reader = _FakeAuditReader(
+        [record],
+        {
+            record.file_path: RuntimeError(
+                f"Authorization: Bearer {secret}\nupstream failed"
+            )
+        },
+        secret=secret,
+    )
+
+    summary = LocalEnglishAiAuditRunner(reader).scan(tmp_path)
+    row = json.loads((tmp_path / "audit-results.jsonl").read_text())
+
+    assert summary.errors == 1
+    assert row["status"] == "error"
+    assert secret not in row["error"]
+    assert "Authorization" not in row["error"]
+    assert "\n" not in row["error"]
+    assert (tmp_path / "repair-allowlist.txt").read_text() == ""
+
+
+def test_scan_records_catalog_failure_as_partial_summary(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import LocalEnglishAiAuditRunner
+
+    record = _catalog_record(
+        "00000000-0000-0000-0000-000000000001", "partial-001"
+    )
+
+    class CatalogFailingReader(_FakeAuditReader):
+        def iter_catalog(self, *, limit=None):
+            yield record
+            raise RuntimeError("Authorization: Bearer SERVICE-SECRET\ncatalog failed")
+
+    reader = CatalogFailingReader(
+        [record], {record.file_path: _srt([f"Line {index}" for index in range(25)])}
+    )
+
+    summary = LocalEnglishAiAuditRunner(reader).scan(tmp_path)
+
+    assert summary.complete is False
+    assert summary.bounded is False
+    assert summary.catalog_error is not None
+    assert "SERVICE-SECRET" not in summary.catalog_error
+    on_disk = json.loads((tmp_path / "audit-summary.json").read_text())
+    assert on_disk["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        '{"subtitle_id":',
+        "{}\n",
+    ],
+)
+def test_checkpoint_rejects_truncated_or_incomplete_rows(tmp_path: Path, checkpoint):
+    from orchestrator.historical_english_ai_audit import load_checkpoint
+
+    path = tmp_path / "audit-results.jsonl"
+    path.write_text(checkpoint)
+
+    with pytest.raises(ValueError, match="checkpoint line"):
+        load_checkpoint(path)
+
+
+def test_checkpoint_rejects_duplicate_subtitle_ids(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import (
+        LocalEnglishAiAuditRunner,
+        load_checkpoint,
+    )
+
+    record = _catalog_record(
+        "00000000-0000-0000-0000-000000000001", "duplicate-001"
+    )
+    reader = _FakeAuditReader(
+        [record], {record.file_path: _srt([f"Line {index}" for index in range(25)])}
+    )
+    LocalEnglishAiAuditRunner(reader).scan(tmp_path)
+    path = tmp_path / "audit-results.jsonl"
+    path.write_text(path.read_text() * 2)
+
+    with pytest.raises(ValueError, match="duplicate subtitle_id"):
+        load_checkpoint(path)
+
+
+def test_resume_rejects_catalog_identity_change(tmp_path: Path):
+    from orchestrator.historical_english_ai_audit import LocalEnglishAiAuditRunner
+
+    original = _catalog_record(
+        "00000000-0000-0000-0000-000000000001", "identity-001"
+    )
+    first_reader = _FakeAuditReader(
+        [original], {original.file_path: _srt([f"Line {index}" for index in range(25)])}
+    )
+    LocalEnglishAiAuditRunner(first_reader).scan(tmp_path, limit=1)
+    changed = _catalog_record(
+        original.subtitle_id, original.movie_code, suffix="-changed"
+    )
+    changed_reader = _FakeAuditReader(
+        [changed], {changed.file_path: _srt([f"Line {index}" for index in range(25)])}
+    )
+
+    with pytest.raises(ValueError, match="catalog identity changed"):
+        LocalEnglishAiAuditRunner(changed_reader).scan(tmp_path)

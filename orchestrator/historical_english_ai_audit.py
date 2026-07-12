@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import csv
 from dataclasses import dataclass
 import hashlib
+import json
+import os
+from pathlib import Path
 import re
 import threading
 import time
@@ -604,3 +609,387 @@ class SupabaseEnglishAiReader:
             return b"".join(chunks)
         finally:
             response.close()
+
+
+REPORT_FIELDS = (
+    "subtitle_id",
+    "movie_id",
+    "movie_code",
+    "language",
+    "file_path",
+    "file_size",
+    "status",
+    "reason_codes",
+    "content_sha256",
+    "byte_count",
+    "encoding",
+    "used_fallback",
+    "parse_mode",
+    "cue_count",
+    "text_line_count",
+    "text_character_count",
+    "unique_text_count",
+    "unique_text_ratio",
+    "dominant_text_sha256",
+    "dominant_text_count",
+    "dominant_text_ratio",
+    "invalid_interval_count",
+    "timeline_regression_count",
+    "replacement_character_count",
+    "nul_count",
+    "control_character_count",
+    "mojibake_marker_count",
+    "known_bad_occurrence_count",
+    "error",
+)
+_IDENTITY_FIELDS = (
+    "subtitle_id",
+    "movie_id",
+    "movie_code",
+    "language",
+    "file_path",
+    "file_size",
+)
+_METRIC_FIELDS = tuple(
+    field
+    for field in REPORT_FIELDS
+    if field
+    not in {
+        *_IDENTITY_FIELDS,
+        "status",
+        "reason_codes",
+        "content_sha256",
+        "error",
+    }
+)
+_TERMINAL_STATUSES = {"passed", "hard_failure", "error"}
+_BEARER_RE = re.compile(r"(?i)\bauthorization\s*[:=]\s*bearer\s+\S+")
+_TOKEN_RE = re.compile(
+    r"(?i)\b(?:apikey|x-api-key|access_token|token)\s*[:=]\s*[^\s,;&]+"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AuditSummary:
+    discovered: int
+    passed: int
+    hard_failure: int
+    errors: int
+    skipped: int
+    reason_counts: dict[str, int]
+    complete: bool
+    bounded: bool
+    catalog_error: str | None
+
+
+def sanitize_error(exc: BaseException, secret: str | None = None) -> str:
+    message = str(exc)
+    if secret:
+        message = message.replace(secret, "[redacted]")
+    message = _BEARER_RE.sub("[redacted]", message)
+    message = _TOKEN_RE.sub("[redacted]", message)
+    message = " ".join(message.split())
+    return (message or exc.__class__.__name__)[:500]
+
+
+def _validate_checkpoint_row(raw: object, line_number: int) -> dict[str, object]:
+    if not isinstance(raw, dict) or set(raw) != set(REPORT_FIELDS):
+        raise ValueError(f"checkpoint line {line_number} has invalid fields")
+    try:
+        _uuid(raw["subtitle_id"], "checkpoint subtitle id")
+        _uuid(raw["movie_id"], "checkpoint movie id")
+    except ValueError as exc:
+        raise ValueError(f"checkpoint line {line_number} has invalid identity") from exc
+    if raw["language"] != "English_AI":
+        raise ValueError(f"checkpoint line {line_number} has invalid language")
+    if not isinstance(raw["movie_code"], str) or not _MOVIE_CODE_RE.fullmatch(
+        raw["movie_code"]
+    ):
+        raise ValueError(f"checkpoint line {line_number} has invalid movie code")
+    try:
+        _safe_object_path(raw["file_path"])
+    except ValueError as exc:
+        raise ValueError(f"checkpoint line {line_number} has invalid path") from exc
+    if (
+        not isinstance(raw["file_size"], int)
+        or isinstance(raw["file_size"], bool)
+        or raw["file_size"] < 0
+    ):
+        raise ValueError(f"checkpoint line {line_number} has invalid file size")
+    if raw["status"] not in _TERMINAL_STATUSES:
+        raise ValueError(f"checkpoint line {line_number} has invalid status")
+    reasons = raw["reason_codes"]
+    if not isinstance(reasons, list) or any(
+        not isinstance(reason, str) or not reason for reason in reasons
+    ):
+        raise ValueError(f"checkpoint line {line_number} has invalid reason codes")
+    if raw["content_sha256"] is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", str(raw["content_sha256"])
+    ):
+        raise ValueError(f"checkpoint line {line_number} has invalid content hash")
+    if raw["error"] is not None and not isinstance(raw["error"], str):
+        raise ValueError(f"checkpoint line {line_number} has invalid error")
+    return raw
+
+
+def load_checkpoint(path: Path) -> dict[str, dict[str, object]]:
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("checkpoint path must be a regular file")
+    rows: dict[str, dict[str, object]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"checkpoint line {line_number} is not valid JSON"
+                ) from exc
+            row = _validate_checkpoint_row(raw, line_number)
+            subtitle_id = str(row["subtitle_id"])
+            if subtitle_id in rows:
+                raise ValueError(
+                    f"checkpoint line {line_number} has duplicate subtitle_id"
+                )
+            rows[subtitle_id] = row
+    return rows
+
+
+def _record_identity(record: CatalogRecord) -> tuple[object, ...]:
+    return (
+        record.subtitle_id,
+        record.movie_id,
+        record.movie_code,
+        record.language,
+        record.file_path,
+        record.file_size,
+    )
+
+
+def _row_identity(row: dict[str, object]) -> tuple[object, ...]:
+    return tuple(row[field] for field in _IDENTITY_FIELDS)
+
+
+def _base_row(record: CatalogRecord) -> dict[str, object]:
+    row: dict[str, object] = {
+        "subtitle_id": record.subtitle_id,
+        "movie_id": record.movie_id,
+        "movie_code": record.movie_code,
+        "language": record.language,
+        "file_path": record.file_path,
+        "file_size": record.file_size,
+        "status": "error",
+        "reason_codes": [],
+        "content_sha256": None,
+        "error": None,
+    }
+    row.update({field: None for field in _METRIC_FIELDS})
+    return row
+
+
+def _inspection_row(
+    record: CatalogRecord,
+    inspection: LocalInspection,
+    digest: str,
+) -> dict[str, object]:
+    row = _base_row(record)
+    row.update(inspection.metrics)
+    row.update(
+        {
+            "status": inspection.status,
+            "reason_codes": list(inspection.reason_codes),
+            "content_sha256": digest,
+        }
+    )
+    return row
+
+
+def _missing_row(record: CatalogRecord) -> dict[str, object]:
+    row = _base_row(record)
+    row.update(
+        {
+            "status": "hard_failure",
+            "reason_codes": ["STORAGE_OBJECT_MISSING"],
+        }
+    )
+    return row
+
+
+def _error_row(record: CatalogRecord, error: str) -> dict[str, object]:
+    row = _base_row(record)
+    row["error"] = error
+    return row
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _write_derived_reports(
+    output_dir: Path,
+    rows: list[dict[str, object]],
+    summary: AuditSummary,
+) -> None:
+    csv_lines: list[str] = []
+    from io import StringIO
+
+    csv_buffer = StringIO(newline="")
+    writer = csv.DictWriter(csv_buffer, fieldnames=REPORT_FIELDS)
+    writer.writeheader()
+    for row in rows:
+        projected = dict(row)
+        projected["reason_codes"] = json.dumps(
+            row["reason_codes"], separators=(",", ":")
+        )
+        writer.writerow(projected)
+    csv_lines.append(csv_buffer.getvalue())
+    _atomic_text(output_dir / "audit-results.csv", "".join(csv_lines))
+    _atomic_text(
+        output_dir / "audit-summary.json",
+        json.dumps(
+            {
+                "discovered": summary.discovered,
+                "passed": summary.passed,
+                "hard_failure": summary.hard_failure,
+                "errors": summary.errors,
+                "skipped": summary.skipped,
+                "reason_counts": summary.reason_counts,
+                "complete": summary.complete,
+                "bounded": summary.bounded,
+                "catalog_error": summary.catalog_error,
+            },
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    allowlist = sorted(
+        {str(row["movie_code"]) for row in rows if row["status"] == "hard_failure"}
+    )
+    _atomic_text(
+        output_dir / "repair-allowlist.txt",
+        "".join(f"{movie_code}\n" for movie_code in allowlist),
+    )
+
+
+class LocalEnglishAiAuditRunner:
+    def __init__(
+        self,
+        reader,
+        *,
+        workers: int = 4,
+        max_object_bytes: int = MAX_OBJECT_BYTES,
+    ) -> None:
+        if not isinstance(workers, int) or isinstance(workers, bool) or not 1 <= workers <= 4:
+            raise ValueError("workers must be between 1 and 4")
+        if (
+            not isinstance(max_object_bytes, int)
+            or isinstance(max_object_bytes, bool)
+            or not 1 <= max_object_bytes <= MAX_OBJECT_BYTES
+        ):
+            raise ValueError("max_object_bytes must be between 1 and 33554432")
+        self.reader = reader
+        self.workers = workers
+        self.max_object_bytes = max_object_bytes
+
+    @property
+    def _secret(self) -> str | None:
+        value = getattr(self.reader, "_service_role_key", None)
+        return value if isinstance(value, str) else None
+
+    def inspect_record(self, record: CatalogRecord) -> dict[str, object]:
+        try:
+            data = self.reader.download_object(
+                record.file_path, max_bytes=self.max_object_bytes
+            )
+            inspection = inspect_english_srt(data)
+            return _inspection_row(
+                record, inspection, hashlib.sha256(data).hexdigest()
+            )
+        except StorageObjectMissing:
+            return _missing_row(record)
+        except Exception as exc:
+            return _error_row(record, sanitize_error(exc, self._secret))
+
+    def scan(self, output_dir: Path, *, limit: int | None = None) -> AuditSummary:
+        output_dir = Path(output_dir)
+        if output_dir.exists() and output_dir.is_symlink():
+            raise ValueError("output directory must not be a symlink")
+        output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(output_dir, 0o700)
+        checkpoint_path = output_dir / "audit-results.jsonl"
+        checkpoint_rows = load_checkpoint(checkpoint_path)
+
+        records: list[CatalogRecord] = []
+        catalog_error: str | None = None
+        try:
+            records.extend(self.reader.iter_catalog(limit=limit))
+        except Exception as exc:
+            catalog_error = sanitize_error(exc, self._secret)
+
+        seen_ids: set[str] = set()
+        pending: list[CatalogRecord] = []
+        skipped = 0
+        for record in records:
+            if record.subtitle_id in seen_ids:
+                raise ValueError("catalog contains duplicate subtitle_id")
+            seen_ids.add(record.subtitle_id)
+            prior = checkpoint_rows.get(record.subtitle_id)
+            if prior is None:
+                pending.append(record)
+            elif _row_identity(prior) != _record_identity(record):
+                raise ValueError(
+                    f"catalog identity changed for subtitle {record.subtitle_id}"
+                )
+            else:
+                skipped += 1
+
+        if limit is None and catalog_error is None:
+            stale_ids = set(checkpoint_rows) - seen_ids
+            if stale_ids:
+                raise ValueError("checkpoint contains subtitles absent from current catalog")
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            new_rows = list(executor.map(self.inspect_record, pending))
+        if new_rows:
+            with checkpoint_path.open("a", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                for row in new_rows:
+                    handle.write(
+                        json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n"
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    checkpoint_rows[str(row["subtitle_id"])] = row
+
+        active_rows = [checkpoint_rows[record.subtitle_id] for record in records]
+        reason_counts: Counter[str] = Counter(
+            reason for row in active_rows for reason in row["reason_codes"]
+        )
+        summary = AuditSummary(
+            discovered=len(records),
+            passed=sum(row["status"] == "passed" for row in active_rows),
+            hard_failure=sum(
+                row["status"] == "hard_failure" for row in active_rows
+            ),
+            errors=sum(row["status"] == "error" for row in active_rows),
+            skipped=skipped,
+            reason_counts=dict(sorted(reason_counts.items())),
+            complete=limit is None and catalog_error is None,
+            bounded=limit is not None,
+            catalog_error=catalog_error,
+        )
+        _write_derived_reports(output_dir, active_rows, summary)
+        return summary
