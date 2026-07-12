@@ -238,6 +238,7 @@ class JobStore:
         update_poll: bool = True,
     ) -> WorkerStatusRecord:
         now = utc_now_iso()
+        last_error = last_error[:1000] if last_error else None
         last_poll_at = now if update_poll else None
         with self.connection() as conn:
             conn.execute(
@@ -257,6 +258,50 @@ class JobStore:
                   last_error = excluded.last_error
                 """,
                 (worker_id, role, now, last_poll_at, last_ip, stage, now, last_error),
+            )
+            status = self.get_worker_status(worker_id, conn=conn)
+            assert status is not None
+            return status
+
+    def record_worker_processing(
+        self,
+        worker_id: str,
+        *,
+        role: str,
+        job: JobRecord,
+        stage: str,
+        last_ip: str | None = None,
+    ) -> WorkerStatusRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_statuses (
+                  worker_id, role, state, last_seen_at, last_poll_at, last_ip,
+                  current_job_id, current_movie_number, stage, updated_at, last_error
+                )
+                VALUES (?, ?, 'processing', ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                  role = excluded.role, state = 'processing',
+                  last_seen_at = excluded.last_seen_at,
+                  last_poll_at = excluded.last_poll_at,
+                  last_ip = COALESCE(excluded.last_ip, worker_statuses.last_ip),
+                  current_job_id = excluded.current_job_id,
+                  current_movie_number = excluded.current_movie_number,
+                  stage = excluded.stage, updated_at = excluded.updated_at,
+                  last_error = NULL
+                """,
+                (
+                    worker_id,
+                    role,
+                    now,
+                    now,
+                    last_ip,
+                    job.id,
+                    job.normalized_movie_number,
+                    stage,
+                    now,
+                ),
             )
             status = self.get_worker_status(worker_id, conn=conn)
             assert status is not None

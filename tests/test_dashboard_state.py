@@ -137,6 +137,39 @@ def test_build_dashboard_state_includes_idle_windows_worker_health(
     assert state.activity["windows"]["updated_at"] == worker.last_seen_at
 
 
+def test_dashboard_state_separates_windows_and_mac_translation_workers(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    windows_job = store.submit_job("abc-201", priority=100, force=False).job
+    translation_job = store.submit_job("abc-202", priority=100, force=False).job
+
+    store.record_worker_processing(
+        "windows-gpu-1",
+        role="windows_transcriber",
+        job=windows_job,
+        stage="transcribing",
+    )
+    store.record_worker_processing(
+        "mac-translation-1",
+        role="mac_translator",
+        job=translation_job,
+        stage="translating",
+    )
+
+    state = build_dashboard_state(store)
+
+    assert state.activity["windows"]["worker_id"] == "windows-gpu-1"
+    assert state.activity["windows"]["status"] == "transcribing"
+    assert state.activity["translation"]["worker_id"] == "mac-translation-1"
+    assert state.activity["translation"]["status"] == "translating"
+    assert {worker.role for worker in state.workers} == {
+        "windows_transcriber",
+        "mac_translator",
+    }
+
+
 def test_build_dashboard_state_uses_deterministic_recency_for_same_second_ties(
     sqlite_path,
     mac_jobs_root,
@@ -391,4 +424,3 @@ def test_build_job_browser_filters_sorts_and_paginates(sqlite_path, mac_jobs_roo
     assert [job.movie_number for job in queued_page.items] == ["abc-003", "abc-002"]
     assert [job.movie_number for job in ready_page.items] == ["abc-102", "abc-101"]
     assert [job.movie_number for job in search_page.items] == ["abc-102"]
-

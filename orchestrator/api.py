@@ -166,7 +166,18 @@ def create_app(
         store.recover_expired_worker_leases(max_worker_attempts)
         job = store.claim_next_worker_job(worker_id, worker_lease_seconds)
         if job is None:
+            store.record_worker_idle(
+                worker_id,
+                role="windows_transcriber",
+                stage="polling",
+            )
             return WorkerNextJobResponse(job=None)
+        store.record_worker_processing(
+            worker_id,
+            role="windows_transcriber",
+            job=job,
+            stage=JobStatus.TRANSCRIPTION_CLAIMED.value,
+        )
         return WorkerNextJobResponse(job=worker_job_response(job))
 
     @app.post("/worker/jobs/{job_id}/heartbeat", response_model=JobResponse)
@@ -177,6 +188,12 @@ def create_app(
             job = store.heartbeat(job_id, request.worker_id, request.stage, worker_lease_seconds)
         except (KeyError, PermissionError, FileNotFoundError) as exc:
             raise worker_mutation_http_error(exc) from exc
+        store.record_worker_processing(
+            request.worker_id,
+            role="windows_transcriber",
+            job=job,
+            stage=request.stage.value,
+        )
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/complete", response_model=JobResponse)
@@ -206,6 +223,11 @@ def create_app(
             )
         except (KeyError, PermissionError, FileNotFoundError) as exc:
             raise worker_mutation_http_error(exc) from exc
+        store.record_worker_idle(
+            request.worker_id,
+            role="windows_transcriber",
+            stage=JobStatus.TRANSCRIPTION_DONE.value,
+        )
         return job_response(job)
 
     @app.post("/worker/jobs/{job_id}/failed", response_model=JobResponse)
@@ -221,6 +243,12 @@ def create_app(
             )
         except (KeyError, PermissionError, FileNotFoundError) as exc:
             raise worker_mutation_http_error(exc) from exc
+        store.record_worker_idle(
+            request.worker_id,
+            role="windows_transcriber",
+            stage=job.status.value,
+            last_error=request.error,
+        )
         return job_response(job)
 
     return app

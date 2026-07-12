@@ -14,6 +14,10 @@ def test_worker_next_job_returns_null_when_no_work(sqlite_path, mac_jobs_root):
 
     assert response.status_code == 200
     assert response.json() == {"job": None}
+    status = store.get_worker_status("windows-gpu-1")
+    assert status is not None
+    assert status.role == "windows_transcriber"
+    assert status.state == "idle"
 
 
 def test_worker_next_job_claims_audio_ready_job(sqlite_path, mac_jobs_root):

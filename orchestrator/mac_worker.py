@@ -20,20 +20,52 @@ def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
 
 
 class MacDownloadWorker:
-    def __init__(self, store: JobStore, adapter, max_download_attempts: int) -> None:
+    def __init__(
+        self,
+        store: JobStore,
+        adapter,
+        max_download_attempts: int,
+        worker_id: str = "mac-downloader-1",
+    ) -> None:
         self.store = store
         self.adapter = adapter
         self.max_download_attempts = max_download_attempts
+        self.worker_id = worker_id
+
+    def _record_idle(self, *, error: str | None = None) -> None:
+        try:
+            self.store.record_worker_idle(
+                self.worker_id,
+                role="mac_downloader",
+                stage="polling" if error is None else "error",
+                last_error=error,
+            )
+        except Exception:
+            return
 
     def process_one(self) -> bool:
         self.store.recover_interrupted_downloads(self.max_download_attempts)
         job = self.store.claim_next_download_job()
         if job is None:
+            self._record_idle()
             return False
+        try:
+            self.store.record_worker_processing(
+                self.worker_id,
+                role="mac_downloader",
+                job=job,
+                stage=job.status.value,
+            )
+        except Exception:
+            pass
+        error: str | None = None
         try:
             self._process_job(job)
         except Exception as exc:
-            self._record_failure(job, str(exc))
+            error = str(exc)
+            self._record_failure(job, error)
+        finally:
+            self._record_idle(error=error)
         return True
 
     def _process_job(self, job: JobRecord) -> None:
@@ -120,6 +152,17 @@ class MacTranslationWorker:
         self.quality_failure_limit = quality_failure_limit
         self.consecutive_quality_failures = 0
 
+    def _record_idle(self, *, error: str | None = None) -> None:
+        try:
+            self.store.record_worker_idle(
+                self.worker_id,
+                role="mac_translator",
+                stage="polling" if error is None else "error",
+                last_error=error,
+            )
+        except Exception:
+            return
+
     def process_one(self) -> bool:
         if self.consecutive_quality_failures >= self.quality_failure_limit:
             raise MacTranslationUnhealthyError(
@@ -129,10 +172,22 @@ class MacTranslationWorker:
         self.store.recover_expired_translation_leases(self.max_translation_attempts)
         job = self.store.claim_next_translation_job(self.worker_id, self.lease_seconds)
         if job is None:
+            self._record_idle()
             return False
+        try:
+            self.store.record_worker_processing(
+                self.worker_id,
+                role="mac_translator",
+                job=job,
+                stage=JobStatus.TRANSLATING.value,
+            )
+        except Exception:
+            pass
+        error: str | None = None
         try:
             self._process_job(job)
         except Exception as exc:
+            error = str(exc)
             if isinstance(exc, MacTranslationQualityError):
                 self.consecutive_quality_failures += 1
             updated = self.store.fail_mac_translation(
@@ -148,6 +203,8 @@ class MacTranslationWorker:
                 "mac-translation.log",
                 f"failed {job.id}: {exc}",
             )
+        finally:
+            self._record_idle(error=error)
         return True
 
     def _process_job(self, job: JobRecord) -> None:
