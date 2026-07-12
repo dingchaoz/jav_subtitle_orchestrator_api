@@ -2,9 +2,24 @@ from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
+
+from orchestrator.dashboard import (
+    build_dashboard_state,
+    build_job_browser,
+    build_job_detail,
+    dashboard_html,
+    list_job_logs,
+    read_job_log_tail,
+)
 
 from orchestrator.models import (
     BatchJobResponse,
+    DashboardStateResponse,
+    JobBrowserResponse,
+    JobDetailResponse,
+    JobLogTailResponse,
+    JobLogsResponse,
     JobResponse,
     JobStatus,
     SubmitBatchRequest,
@@ -67,6 +82,10 @@ def create_app(
     app = FastAPI(title="JAV Subtitle Orchestrator")
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
 
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard_page() -> str:
+        return dashboard_html()
+
     @app.post("/jobs", response_model=JobResponse)
     def submit_job(request: SubmitJobRequest) -> JobResponse:
         result = store.submit_job(request.movie_number, request.priority, request.force)
@@ -92,12 +111,55 @@ def create_app(
     def list_jobs(status: JobStatus | None = Query(default=None)) -> list[JobResponse]:
         return [job_response(job) for job in store.list_jobs(status)]
 
+    @app.get("/dashboard/state", response_model=DashboardStateResponse)
+    def dashboard_state() -> DashboardStateResponse:
+        return build_dashboard_state(store)
+
+    @app.get("/jobs/browser", response_model=JobBrowserResponse)
+    def jobs_browser(
+        view: str = "active",
+        q: str = "",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> JobBrowserResponse:
+        return build_job_browser(
+            store, view=view, q=q, page=page, page_size=page_size
+        )
+
     @app.get("/jobs/{job_id}", response_model=JobResponse)
     def get_job(job_id: str) -> JobResponse:
         job = store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         return job_response(job)
+
+    @app.get("/jobs/{job_id}/detail", response_model=JobDetailResponse)
+    def job_detail(job_id: str) -> JobDetailResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return build_job_detail(job)
+
+    @app.get("/jobs/{job_id}/logs", response_model=JobLogsResponse)
+    def job_logs(job_id: str) -> JobLogsResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return list_job_logs(job)
+
+    @app.get(
+        "/jobs/{job_id}/logs/{log_name}", response_model=JobLogTailResponse
+    )
+    def job_log_tail(
+        job_id: str, log_name: str, tail: int = 200
+    ) -> JobLogTailResponse:
+        job = store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        try:
+            return read_job_log_tail(job, log_name, tail)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="log not found") from exc
 
     @app.get("/worker/next-job", response_model=WorkerNextJobResponse)
     def next_job(worker_id: str) -> WorkerNextJobResponse:
