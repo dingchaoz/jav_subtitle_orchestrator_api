@@ -27,6 +27,29 @@ def build_subtitle_audit_api_service(settings):
     )
 
 
+def build_supabase_publisher(settings):
+    if not settings.mac_translation_publish_enabled:
+        return None
+    if (
+        not settings.supabase_url
+        or not settings.supabase_service_role_key
+        or not settings.supabase_subtitle_bucket
+    ):
+        raise RuntimeError(
+            "Supabase publication is enabled but URL, service key, or bucket is missing"
+        )
+    from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
+
+    return SupabaseSubtitlePublisher(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        bucket=settings.supabase_subtitle_bucket,
+        verification_timeout_seconds=(
+            settings.supabase_publish_verify_timeout_seconds
+        ),
+    )
+
+
 def run_api() -> None:
     import uvicorn
 
@@ -161,6 +184,7 @@ def run_mac_translation_worker() -> None:
     from orchestrator.translation import SubtitleTranslator
 
     settings = MacSettings()
+    publisher = build_supabase_publisher(settings)
     _export_mac_translation_runtime_env(settings)
     translator = SubtitleTranslator(settings.mac_translate_script_path)
     _run_mac_translation_smoke(settings, translator)
@@ -173,8 +197,39 @@ def run_mac_translation_worker() -> None:
         worker_id=settings.mac_translation_worker_id,
         lease_seconds=settings.mac_translation_lease_seconds,
         quality_failure_limit=settings.translation_quality_failure_limit,
+        publisher=publisher,
     )
     run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
+
+
+def run_mac_translation_worker_once(job_id: str) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.mac_worker import MacTranslationWorker
+    from orchestrator.models import JobStatus
+    from orchestrator.store import JobStore
+    from orchestrator.translation import SubtitleTranslator
+
+    settings = MacSettings()
+    publisher = build_supabase_publisher(settings)
+    _export_mac_translation_runtime_env(settings)
+    translator = SubtitleTranslator(settings.mac_translate_script_path)
+    _run_mac_translation_smoke(settings, translator)
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+    worker = MacTranslationWorker(
+        store,
+        translator,
+        max_translation_attempts=settings.max_translation_attempts,
+        worker_id=f"{settings.mac_translation_worker_id}-once",
+        lease_seconds=settings.mac_translation_lease_seconds,
+        quality_failure_limit=settings.translation_quality_failure_limit,
+        publisher=publisher,
+    )
+    worker.process_job_id(job_id)
+    completed = store.get_job(job_id)
+    if completed is None or completed.status is not JobStatus.ENGLISH_SRT_READY:
+        status = completed.status.value if completed is not None else "missing"
+        raise SystemExit(f"exact translation job did not become ready: {status}")
 
 
 def run_plan_historical_repairs(
@@ -345,6 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("mac-worker")
     subcommands.add_parser("mac-translation-smoke-test")
     subcommands.add_parser("mac-translation-worker")
+    one_shot = subcommands.add_parser("mac-translation-worker-once")
+    one_shot.add_argument("--job-id", required=True)
     subcommands.add_parser("windows-worker")
     repair_parser = subcommands.add_parser(
         "plan-historical-subtitle-repair",
@@ -395,6 +452,8 @@ def main() -> None:
         run_mac_translation_smoke_test()
     elif args.command == "mac-translation-worker":
         run_mac_translation_worker()
+    elif args.command == "mac-translation-worker-once":
+        run_mac_translation_worker_once(args.job_id)
     elif args.command == "windows-worker":
         run_windows_worker()
     elif args.command == "plan-historical-subtitle-repair":

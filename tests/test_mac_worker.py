@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -214,6 +215,31 @@ class FailingMacTranslator:
         raise RuntimeError("Mac translation runtime unavailable")
 
 
+class RecordingPublisher:
+    def __init__(self, events=None, *, error=None):
+        self.events = events if events is not None else []
+        self.error = error
+
+    def publish_english_ai(self, movie, path):
+        self.events.append(("publish", movie, path.name))
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            content_sha256="a" * 64,
+            file_size=path.stat().st_size,
+            verified=True,
+        )
+
+
+class RecordingTranslator(DiverseMacTranslator):
+    def __init__(self, events):
+        self.events = events
+
+    def translate_to_english(self, input_srt, output_srt):
+        self.events.append(("translate", input_srt.name, output_srt.name))
+        super().translate_to_english(input_srt, output_srt)
+
+
 def prepare_transcription_done_job(store, mac_jobs_root, cue_count=20, movie="ktb-096"):
     job = store.submit_job(movie, priority=100, force=False).job
     store.mark_audio_ready(job.id)
@@ -264,6 +290,75 @@ def test_mac_translation_worker_claims_transcription_and_marks_quality_pass_read
     assert worker_status.state == "idle"
 
 
+def test_good_translation_publishes_before_ready(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+    )
+
+    assert worker.process_one() is True
+
+    assert [event[0] for event in events] == ["translate", "publish"]
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
+    assert "publish_verified" in log.read_text(encoding="utf-8")
+    assert "Distinct English" not in log.read_text(encoding="utf-8")
+
+
+def test_publish_failure_is_transient_and_never_ready(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(error=RuntimeError("publish unavailable")),
+    )
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.TRANSCRIPTION_DONE
+    assert refreshed.translation_attempt_count == 1
+    assert refreshed.claimed_by is None
+    assert audio.read_bytes() == b"keep-audio"
+
+
+def test_exact_job_worker_does_not_claim_other_translation(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-001")
+    second = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-002")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-canary",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+    )
+
+    assert worker.process_job_id(second.id) is True
+
+    assert store.get_job(first.id).status is JobStatus.TRANSCRIPTION_DONE
+    assert store.get_job(second.id).status is JobStatus.ENGLISH_SRT_READY
+
+
 def test_mac_translation_worker_permanently_rejects_collapsed_output(
     sqlite_path,
     mac_jobs_root,
@@ -273,12 +368,14 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
     job = prepare_transcription_done_job(store, mac_jobs_root)
     audio = mac_jobs_root / "ktb-096" / "audio.wav"
     audio.write_bytes(b"keep-audio")
+    publisher = RecordingPublisher()
     worker = MacTranslationWorker(
         store,
         CollapsedMacTranslator(),
         max_translation_attempts=3,
         worker_id="mac-translation-1",
         lease_seconds=60,
+        publisher=publisher,
     )
 
     assert worker.process_one() is True
@@ -291,6 +388,7 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
     assert not english.exists()
     assert len(list((english.parent / "rejected").glob("*.srt"))) == 1
     assert audio.read_bytes() == b"keep-audio"
+    assert publisher.events == []
     assert '"passed": false' in (
         english.parent / "logs" / "quality.log"
     ).read_text(encoding="utf-8")

@@ -229,3 +229,14 @@ def test_canary_cli_requires_explicit_safe_arguments(tmp_path):
     for parsed in (selector, prepare):
         for forbidden in ("force", "delete", "batch", "upload", "overwrite"):
             assert not hasattr(parsed, forbidden)
+
+
+def test_one_shot_translation_cli_requires_exact_job_id():
+    from orchestrator.__main__ import build_parser
+
+    args = build_parser().parse_args(
+        ["mac-translation-worker-once", "--job-id", "job-safe"]
+    )
+
+    assert args.command == "mac-translation-worker-once"
+    assert args.job_id == "job-safe"
