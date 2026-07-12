@@ -88,6 +88,19 @@ the existing idempotent SQLite initialization path. Windows continues to own
 new translation counter. Existing rows migrate to zero without changing status or
 paths.
 
+### Exact-job one-shot worker
+
+Canary execution never starts the unconstrained polling loop. The CLI gains an
+explicit one-shot translation mode requiring `--job-id`; JobStore claims that exact
+row only when it is `transcription_done` and unclaimed. The process runs startup
+smoke, processes at most that one job, and exits. It cannot fall through to the next
+queued translation.
+
+Before prepare, the existing general Mac translation worker is stopped so it cannot
+race the exact-job process. After a successful canary and verification, the normal
+Mac translation worker is restarted with publishing enabled. Historical batch work
+remains unprepared and therefore cannot be claimed as part of the canary.
+
 ### Mac worker publication
 
 Supabase publication becomes an optional runtime capability that is explicitly
@@ -169,6 +182,8 @@ Tests must prove:
 - repaired-subtitle same-path Storage upsert and catalog PATCH work;
 - a stale CDN response is not accepted and a later matching response is accepted;
 - logs and reports contain no full subtitle text or secrets;
+- exact-job one-shot mode cannot claim a different `transcription_done` job and
+  exits after one processing attempt;
 - existing downloader, Windows transcription-only, disabled legacy complete, Mac
   smoke, dashboard, and audit tests continue passing.
 
@@ -183,13 +198,17 @@ immediately before canary execution.
 3. Implement the controlled repair and worker publication path with test-first
    red-green cycles and frequent commits.
 4. Update the production Mac `.env` with explicit publishing settings.
-5. Run `mac-translation-smoke-test`; do not restart translation if it fails.
-6. Restart only the Mac translation worker with the verified code and settings.
-7. Run the read-only selector against the 340-candidate allowlist.
-8. Execute prepare for exactly one selected canary using its exact job ID.
+5. Stop the existing general Mac translation worker and run
+   `mac-translation-smoke-test`; do not prepare a canary if smoke fails.
+6. Run the read-only selector against the 340-candidate allowlist.
+7. Execute prepare for exactly one selected canary using its exact job ID.
+8. Run the exact-job one-shot translation worker for that job ID and wait for it to
+   exit.
 9. Monitor the complete state sequence, local quarantine, quality log, Supabase
    verification, and `https://javsubtitle.com` result.
-10. Report the canary outcome and stop. Ask the user whether to begin a five-to-ten
+10. After successful canary verification, restart the normal Mac translation worker
+    with publishing enabled.
+11. Report the canary outcome and stop. Ask the user whether to begin a five-to-ten
     candidate batch.
 
 ## Supabase references
