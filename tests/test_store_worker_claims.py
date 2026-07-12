@@ -4,7 +4,37 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from orchestrator.models import JobStatus
+from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
+
+
+def _prepare_translation_job(store, root: Path, movie: str):
+    job = store.submit_job(movie, priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-test", lease_seconds=60)
+    paths = build_job_paths(movie, root, "M:\\")
+    paths.job_dir_mac.mkdir(parents=True, exist_ok=True)
+    paths.japanese_srt_path_mac.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nsource\n",
+        encoding="utf-8",
+    )
+    return store.complete_worker_transcription(
+        claimed.id,
+        "windows-gpu-test",
+        paths.japanese_srt_path_windows,
+        lambda path: Path(path).exists(),
+    )
+
+
+def _write_historical_files(root: Path, movie: str):
+    paths = build_job_paths(movie, root, "M:\\")
+    paths.job_dir_mac.mkdir(parents=True, exist_ok=True)
+    japanese = b"1\n00:00:00,000 --> 00:00:01,000\nsource\n"
+    english = b"1\n00:00:00,000 --> 00:00:01,000\nCannot translate\n"
+    paths.audio_path_mac.write_bytes(b"synthetic-audio")
+    paths.japanese_srt_path_mac.write_bytes(japanese)
+    paths.english_srt_path_mac.write_bytes(english)
+    return paths, japanese, english
 
 
 def test_claim_next_download_job_is_atomic_and_ordered(sqlite_path, mac_jobs_root):
@@ -20,6 +50,59 @@ def test_claim_next_download_job_is_atomic_and_ordered(sqlite_path, mac_jobs_roo
     assert claimed.status == JobStatus.DOWNLOADING_METADATA
     assert second_claim.id == slow.id
     assert second_claim.status == JobStatus.DOWNLOADING_METADATA
+
+
+def test_historical_reset_preserves_windows_attempts_and_paths(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-001", priority=100, force=False).job
+    paths, japanese, english = _write_historical_files(mac_jobs_root, "abc-001")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, worker_attempt_count = 2, "
+            "translation_attempt_count = 2, audio_path_mac = ?, "
+            "japanese_srt_path_mac = ?, english_srt_path_mac = ? WHERE id = ?",
+            (
+                JobStatus.ENGLISH_SRT_READY.value,
+                str(paths.audio_path_mac),
+                str(paths.japanese_srt_path_mac),
+                str(paths.english_srt_path_mac),
+                job.id,
+            ),
+        )
+
+    reset = store.prepare_historical_translation_repair(
+        job.id, expected_status=JobStatus.ENGLISH_SRT_READY
+    )
+
+    assert reset.status is JobStatus.TRANSCRIPTION_DONE
+    assert reset.worker_attempt_count == 2
+    assert reset.translation_attempt_count == 0
+    assert reset.audio_path_mac == str(paths.audio_path_mac)
+    assert reset.japanese_srt_path_mac == str(paths.japanese_srt_path_mac)
+    assert reset.english_srt_path_mac is None
+    assert paths.audio_path_mac.read_bytes() == b"synthetic-audio"
+    assert paths.japanese_srt_path_mac.read_bytes() == japanese
+    assert paths.english_srt_path_mac.read_bytes() == english
+
+
+def test_exact_translation_claim_cannot_claim_another_job(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = _prepare_translation_job(store, mac_jobs_root, "abc-001")
+    second = _prepare_translation_job(store, mac_jobs_root, "abc-002")
+
+    claimed = store.claim_translation_job(
+        second.id, "mac-translation-canary", lease_seconds=60
+    )
+
+    assert claimed.id == second.id
+    assert store.get_job(first.id).status is JobStatus.TRANSCRIPTION_DONE
+    assert store.get_job(second.id).status is JobStatus.TRANSLATING
 
 
 def test_claim_next_download_job_removes_claimed_job_from_queue(sqlite_path, mac_jobs_root):

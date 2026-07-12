@@ -285,6 +285,7 @@ def test_build_job_detail_returns_full_operational_fields(sqlite_path, mac_jobs_
     assert detail.priority == 50
     assert detail.attempt_count == 0
     assert detail.worker_attempt_count == 0
+    assert detail.translation_attempt_count == 0
     assert detail.claimed_by is None
     assert detail.lease_expires_at is None
     assert detail.created_at == ready.created_at

@@ -315,7 +315,8 @@ def test_mac_translation_worker_retries_transient_failure_from_transcription_don
 
     refreshed = store.get_job(job.id)
     assert refreshed.status == JobStatus.TRANSCRIPTION_DONE
-    assert refreshed.worker_attempt_count == 1
+    assert refreshed.worker_attempt_count == 0
+    assert refreshed.translation_attempt_count == 1
     assert refreshed.claimed_by is None
     assert refreshed.error == "translating: Mac translation runtime unavailable"
 
