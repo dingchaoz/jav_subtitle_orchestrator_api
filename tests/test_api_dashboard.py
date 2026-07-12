@@ -165,3 +165,50 @@ def test_dashboard_page_returns_operator_html_without_force_controls(
     assert "Mac Translation" in html
     assert 'id="import-requested-form"' not in html
     assert "/jobs/import-subtitle-requests" not in html
+
+
+def test_dashboard_contains_safe_independent_subtitle_quality_section(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    html = TestClient(create_app(store)).get("/dashboard").text
+
+    assert "Subtitle Quality" in html
+    for name in ("bad", "invalid", "missing", "review"):
+        assert f'id="subtitle-quality-{name}"' in html
+    assert 'id="subtitle-quality-progress"' in html
+    assert 'id="subtitle-quality-status-filter"' in html
+    assert 'id="subtitle-quality-language-filter"' in html
+    assert 'fetchJson("/subtitle-audits/summary", {signal: controller.signal})' in html
+    assert "renderSubtitleQualityUnavailable" in html
+    assert "subtitleRow.replaceChildren" in html
+    assert "subtitleRow.innerHTML" not in html
+
+
+def test_dashboard_audit_refresh_failure_is_isolated_from_job_state(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    html = TestClient(create_app(store)).get("/dashboard").text
+
+    assert "subtitleAuditRequestGeneration" in html
+    assert "subtitleAuditAbortController.abort()" in html
+    assert "new AbortController()" in html
+    assert 'error.name === "AbortError"' in html
+    assert "renderSubtitleQualityUnavailable(error)" in html
+    assert "refreshState" in html
+
+
+def test_dashboard_shows_only_read_only_historical_repair_guidance(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    html = TestClient(create_app(store)).get("/dashboard").text
+
+    assert "Historical repair planning is dry-run only" in html
+    assert "plan-historical-subtitle-repair" in html
+    assert "--allowlist abc-001 --limit 1" in html
+    assert "repair/apply" not in html

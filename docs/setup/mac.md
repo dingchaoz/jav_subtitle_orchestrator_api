@@ -27,7 +27,16 @@ MAC_TRANSLATION_LEASE_SECONDS=1800
 MAX_TRANSLATION_ATTEMPTS=3
 MAC_TRANSLATION_POLL_INTERVAL_SECONDS=10
 TRANSLATION_QUALITY_FAILURE_LIMIT=3
+SUBTITLE_AUDIT_VISIBILITY_ENABLED=true
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=replace-with-server-side-key
+SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 ```
+
+The Supabase key is server-side only. Never place it in dashboard HTML, browser
+JavaScript, logs, screenshots, or committed files. If audit visibility is disabled
+or credentials are absent, the jobs dashboard continues working and the Subtitle
+Quality panel shows unavailable.
 
 3. Install and run the API:
 

@@ -971,6 +971,10 @@ def dashboard_html() -> str:
           <button type="button" id="subtitle-quality-next">Next</button>
         </div>
       </div>
+      <p class="health-meta">
+        Historical repair planning is dry-run only. Run on the Mac:
+        <code>python -m orchestrator plan-historical-subtitle-repair --allowlist abc-001 --limit 1</code>
+      </p>
     </section>
 
     <section class="content-grid">
@@ -1601,4 +1605,3 @@ def dashboard_html() -> str:
 </body>
 </html>
 """
-
