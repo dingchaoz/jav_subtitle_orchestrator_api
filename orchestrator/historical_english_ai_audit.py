@@ -4,7 +4,13 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import re
+import threading
+import time
 import unicodedata
+from urllib.parse import quote, urlparse
+import uuid
+
+import requests
 
 
 MAX_OBJECT_BYTES = 32 * 1024 * 1024
@@ -60,11 +66,53 @@ class SubtitleStructureLimitExceeded(ValueError):
     """Raised without subtitle content when an SRT structure bound is exceeded."""
 
 
+class StorageObjectMissing(FileNotFoundError):
+    """Raised without a path when a catalog-referenced object does not exist."""
+
+
+class RequestRateLimiter:
+    def __init__(
+        self,
+        requests_per_second: float,
+        *,
+        clock=time.monotonic,
+        sleeper=time.sleep,
+    ) -> None:
+        if not 0 < requests_per_second <= 10:
+            raise ValueError(
+                "requests_per_second must be greater than 0 and at most 10"
+            )
+        self._interval = 1.0 / requests_per_second
+        self._clock = clock
+        self._sleeper = sleeper
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = self._clock()
+            wait_seconds = max(0.0, self._next_at - now)
+            if wait_seconds:
+                self._sleeper(wait_seconds)
+                now = self._clock()
+            self._next_at = max(now, self._next_at) + self._interval
+
+
 @dataclass(frozen=True, slots=True)
 class LocalInspection:
     status: str
     reason_codes: tuple[str, ...]
     metrics: dict[str, int | float | str | bool | None]
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogRecord:
+    subtitle_id: str
+    movie_id: str
+    movie_code: str
+    language: str
+    file_path: str
+    file_size: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,3 +373,234 @@ def inspect_english_srt(data: bytes) -> LocalInspection:
         reason_codes=tuple(reasons),
         metrics=_safe_metrics(inspection),
     )
+
+
+_BUCKET_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_MOVIE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _safe_bucket(value: str) -> str:
+    if value in {"", ".", ".."} or not _BUCKET_RE.fullmatch(value):
+        raise ValueError("bucket must be a safe path segment")
+    return value
+
+
+def _safe_object_path(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        raise ValueError("object path must be a bounded non-empty string")
+    if value.startswith("/") or "\x00" in value:
+        raise ValueError("object path is unsafe")
+    if any(segment in {"", ".", ".."} for segment in value.split("/")):
+        raise ValueError("object path is unsafe")
+    return value
+
+
+def _uuid(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a UUID") from exc
+    if str(parsed) != value.casefold():
+        raise ValueError(f"{label} must use canonical UUID form")
+    return str(parsed)
+
+
+def _parse_catalog_page(
+    payload: object,
+    page_limit: int,
+    last_id: str | None,
+) -> list[CatalogRecord]:
+    if not isinstance(payload, list) or len(payload) > page_limit:
+        raise ValueError("catalog payload must be a bounded list")
+    records: list[CatalogRecord] = []
+    previous_id = last_id
+    for raw in payload:
+        if not isinstance(raw, dict):
+            raise ValueError("catalog payload row is malformed")
+        subtitle_id = _uuid(raw.get("id"), "subtitle id")
+        movie_id = _uuid(raw.get("movie_id"), "movie id")
+        if previous_id is not None and subtitle_id <= previous_id:
+            raise ValueError("catalog payload is not strictly ordered")
+        previous_id = subtitle_id
+        if raw.get("language") != "English_AI":
+            raise ValueError("catalog payload contains a non-English_AI row")
+        file_path = _safe_object_path(raw.get("file_path"))
+        file_size = raw.get("file_size")
+        if (
+            not isinstance(file_size, int)
+            or isinstance(file_size, bool)
+            or file_size < 0
+        ):
+            raise ValueError("catalog file size must be a non-negative integer")
+        movie_relation = raw.get("movies")
+        if isinstance(movie_relation, list):
+            movie_relation = movie_relation[0] if len(movie_relation) == 1 else None
+        if not isinstance(movie_relation, dict):
+            raise ValueError("catalog movie relation is malformed")
+        movie_code = movie_relation.get("standard_movie_id")
+        if not isinstance(movie_code, str) or not _MOVIE_CODE_RE.fullmatch(movie_code):
+            raise ValueError("catalog movie code is malformed")
+        records.append(
+            CatalogRecord(
+                subtitle_id=subtitle_id,
+                movie_id=movie_id,
+                movie_code=movie_code,
+                language="English_AI",
+                file_path=file_path,
+                file_size=file_size,
+            )
+        )
+    return records
+
+
+class SupabaseEnglishAiReader:
+    def __init__(
+        self,
+        url: str,
+        service_role_key: str,
+        *,
+        bucket: str = "subtitles",
+        page_size: int = 500,
+        timeout_seconds: int = 30,
+        session=None,
+        rate_limiter: RequestRateLimiter | None = None,
+    ) -> None:
+        parsed_url = urlparse(url)
+        if parsed_url.scheme != "https" or not parsed_url.netloc or parsed_url.path not in {"", "/"}:
+            raise ValueError("Supabase URL must be an HTTPS origin")
+        if not service_role_key:
+            raise ValueError("Supabase service role key is required")
+        if not 1 <= page_size <= 500:
+            raise ValueError("page_size must be between 1 and 500")
+        if not 1 <= timeout_seconds <= 120:
+            raise ValueError("timeout_seconds must be between 1 and 120")
+        self.url = url.rstrip("/")
+        self._service_role_key = service_role_key
+        self.bucket = _safe_bucket(bucket)
+        self.page_size = page_size
+        self.timeout_seconds = timeout_seconds
+        self.session = session or requests.Session()
+        self.rate_limiter = rate_limiter or RequestRateLimiter(2.0)
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {
+            "apikey": self._service_role_key,
+            "Authorization": f"Bearer {self._service_role_key}",
+        }
+
+    def _get(self, path: str, **kwargs):
+        headers = {**self._headers, **kwargs.pop("headers", {})}
+        self.rate_limiter.acquire()
+        response = self.session.get(
+            f"{self.url}{path}",
+            headers=headers,
+            timeout=self.timeout_seconds,
+            allow_redirects=False,
+            **kwargs,
+        )
+        return response
+
+    @staticmethod
+    def _require_2xx(response, operation: str) -> None:
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(f"Supabase {operation} failed ({response.status_code})")
+
+    def _get_json(self, path: str, *, params: dict[str, str]) -> object:
+        response = self._get(path, params=params)
+        self._require_2xx(response, "catalog GET")
+        try:
+            return response.json()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("catalog payload is not valid JSON") from exc
+
+    def iter_catalog(self, *, limit: int | None = None):
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
+        ):
+            raise ValueError("limit must be a positive integer")
+        emitted = 0
+        last_id: str | None = None
+        while limit is None or emitted < limit:
+            page_limit = (
+                min(self.page_size, limit - emitted)
+                if limit is not None
+                else self.page_size
+            )
+            params = {
+                "select": (
+                    "id,movie_id,language,file_path,file_size,"
+                    "movies!inner(standard_movie_id)"
+                ),
+                "language": "eq.English_AI",
+                "order": "id.asc",
+                "limit": str(page_limit),
+            }
+            if last_id is not None:
+                params["id"] = f"gt.{last_id}"
+            payload = self._get_json("/rest/v1/movie_languages", params=params)
+            page = _parse_catalog_page(payload, page_limit, last_id)
+            for record in page:
+                yield record
+                emitted += 1
+                last_id = record.subtitle_id
+            if len(page) < page_limit:
+                return
+
+    def download_object(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int = MAX_OBJECT_BYTES,
+    ) -> bytes:
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 1 <= max_bytes <= MAX_OBJECT_BYTES
+        ):
+            raise ValueError("max_bytes must be between 1 and 33554432")
+        encoded_path = quote(_safe_object_path(file_path), safe="/")
+        encoded_bucket = quote(self.bucket, safe="")
+        response = self._get(
+            f"/storage/v1/object/{encoded_bucket}/{encoded_path}",
+            stream=True,
+            headers={"Accept-Encoding": "identity"},
+        )
+        try:
+            if response.status_code == 404:
+                raise StorageObjectMissing("storage object missing")
+            self._require_2xx(response, "Storage GET")
+            content_encoding = response.headers.get("Content-Encoding")
+            if (
+                content_encoding is not None
+                and content_encoding.strip().casefold() != "identity"
+            ):
+                raise RuntimeError("Storage GET returned unsupported content encoding")
+            raw_length = response.headers.get("Content-Length")
+            if raw_length is not None:
+                try:
+                    content_length = int(raw_length)
+                except ValueError as exc:
+                    raise RuntimeError("Storage GET returned invalid content length") from exc
+                if content_length < 0:
+                    raise RuntimeError("Storage GET returned invalid content length")
+                if content_length > max_bytes:
+                    raise ObjectLimitExceeded("storage object exceeds configured byte limit")
+            chunks: list[bytes] = []
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise ObjectLimitExceeded(
+                        "storage object exceeds configured byte limit"
+                    )
+                chunks.append(chunk)
+            if raw_length is not None and downloaded != content_length:
+                raise RuntimeError("Storage GET ended before declared content length")
+            return b"".join(chunks)
+        finally:
+            response.close()
