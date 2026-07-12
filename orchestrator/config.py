@@ -57,6 +57,16 @@ class MacSettings(BaseSettings):
         default=None,
         alias="SUPABASE_SERVICE_ROLE_KEY",
     )
+    supabase_subtitle_bucket: str = Field(
+        default="subtitles",
+        alias="SUPABASE_SUBTITLE_BUCKET",
+    )
+    local_audit_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        alias="LOCAL_AUDIT_TIMEOUT_SECONDS",
+    )
     subtitle_audit_visibility_enabled: bool = Field(
         default=False,
         alias="SUBTITLE_AUDIT_VISIBILITY_ENABLED",

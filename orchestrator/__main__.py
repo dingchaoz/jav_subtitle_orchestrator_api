@@ -192,6 +192,59 @@ def run_plan_historical_repairs(
     print(render_repair_report(plans))
 
 
+def run_local_english_ai_audit(
+    *,
+    output: Path,
+    limit: int | None,
+    workers: int,
+    requests_per_second: float,
+):
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_english_ai_audit import (
+        LocalEnglishAiAuditRunner,
+        RequestRateLimiter,
+        SupabaseEnglishAiReader,
+    )
+
+    settings = MacSettings()
+    if not settings.supabase_url or not settings.supabase_service_role_key:
+        raise SystemExit(
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required"
+        )
+    limiter = RequestRateLimiter(requests_per_second)
+    reader = SupabaseEnglishAiReader(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        bucket=settings.supabase_subtitle_bucket,
+        timeout_seconds=settings.local_audit_timeout_seconds,
+        rate_limiter=limiter,
+    )
+    summary = LocalEnglishAiAuditRunner(reader, workers=workers).scan(
+        output,
+        limit=limit,
+    )
+    print(
+        "local English_AI audit "
+        f"discovered={summary.discovered} "
+        f"passed={summary.passed} "
+        f"hard_failure={summary.hard_failure} "
+        f"errors={summary.errors} "
+        f"skipped={summary.skipped} "
+        f"complete={str(summary.complete).lower()} "
+        f"bounded={str(summary.bounded).lower()}"
+    )
+    print(f"reports={output.resolve()}")
+    if summary.bounded:
+        print(
+            "resume: python -m orchestrator audit-english-ai-local "
+            f"--output {output} --workers {workers} "
+            f"--requests-per-second {requests_per_second:g}"
+        )
+    if summary.catalog_error is not None:
+        raise SystemExit(f"catalog audit interrupted: {summary.catalog_error}")
+    return summary
+
+
 def run_windows_worker() -> None:
     from orchestrator.config import WindowsSettings
     from orchestrator.windows_worker import (
@@ -212,7 +265,7 @@ def run_windows_worker() -> None:
     run_windows_forever(worker, settings.poll_interval_seconds)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m orchestrator")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("api")
@@ -231,6 +284,23 @@ def main() -> None:
         help="only inspect these movie numbers",
     )
     repair_parser.add_argument("--limit", type=int, default=100)
+    audit_parser = subcommands.add_parser(
+        "audit-english-ai-local",
+        help="GET-only local audit of exact English_AI catalog subtitles",
+    )
+    audit_parser.add_argument("--output", type=Path, required=True)
+    audit_parser.add_argument("--limit", type=int)
+    audit_parser.add_argument("--workers", type=int, choices=range(1, 5), default=4)
+    audit_parser.add_argument(
+        "--requests-per-second",
+        type=float,
+        default=2.0,
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     configure_logging()
@@ -249,6 +319,13 @@ def main() -> None:
         run_plan_historical_repairs(
             allowlist=set(args.allowlist) if args.allowlist else None,
             limit=args.limit,
+        )
+    elif args.command == "audit-english-ai-local":
+        run_local_english_ai_audit(
+            output=args.output,
+            limit=args.limit,
+            workers=args.workers,
+            requests_per_second=args.requests_per_second,
         )
 
 

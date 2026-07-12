@@ -30,6 +30,8 @@ TRANSLATION_QUALITY_FAILURE_LIMIT=3
 SUBTITLE_AUDIT_VISIBILITY_ENABLED=true
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=replace-with-server-side-key
+SUPABASE_SUBTITLE_BUCKET=subtitles
+LOCAL_AUDIT_TIMEOUT_SECONDS=30
 SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 ```
 
@@ -92,6 +94,38 @@ Each line identifies the job and movie, preserves the Japanese SRT, names the
 planned `rejected/` quarantine path for the old English SRT, and states whether a
 later authorized repair would requeue or overwrite. There is no apply mode and no
 `force=True` path in this command.
+
+## Historical English_AI read-only audit
+
+This fallback audits exact `English_AI` catalog rows through Supabase GET requests
+and writes reports only to the local output directory. Start with one record:
+
+```bash
+python -m orchestrator audit-english-ai-local \
+  --output reports/subtitle-audit/english-ai-local-20260712 \
+  --limit 1 \
+  --workers 1
+```
+
+The intentionally bounded preflight exits successfully with `complete=false` and
+`bounded=true`. Rerun against the same output directory without `--limit` to resume
+from the durable JSONL checkpoint and exhaust the catalog:
+
+```bash
+python -m orchestrator audit-english-ai-local \
+  --output reports/subtitle-audit/english-ai-local-20260712 \
+  --workers 4 \
+  --requests-per-second 2
+```
+
+The command has no persist, apply, force, upload, overwrite, requeue, deletion, or
+repair mode. It never writes Supabase and never reads or changes the local job
+database or audio files. Reports contain identifiers, structured reason codes,
+metrics, and SHA-256 values, but no subtitle text or service key.
+
+`repair-allowlist.txt` contains hard-failure candidates only. It is evidence for a
+later canary decision, not authorization to translate, quarantine, upload,
+overwrite, or requeue anything.
 
 7. Submit a batch:
 

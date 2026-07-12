@@ -471,3 +471,59 @@ def test_resume_rejects_catalog_identity_change(tmp_path: Path):
 
     with pytest.raises(ValueError, match="catalog identity changed"):
         LocalEnglishAiAuditRunner(changed_reader).scan(tmp_path)
+
+
+def test_cli_parser_exposes_only_read_only_audit_flags(tmp_path: Path):
+    from orchestrator.__main__ import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "audit-english-ai-local",
+            "--output",
+            str(tmp_path),
+            "--limit",
+            "1",
+            "--workers",
+            "2",
+            "--requests-per-second",
+            "2",
+        ]
+    )
+
+    assert args.command == "audit-english-ai-local"
+    assert args.output == tmp_path
+    assert args.limit == 1
+    assert args.workers == 2
+    assert args.requests_per_second == 2.0
+    for forbidden in ("persist", "apply", "force", "upload", "requeue", "overwrite"):
+        assert not hasattr(args, forbidden)
+
+
+def test_cli_refuses_missing_supabase_credentials(monkeypatch, tmp_path: Path):
+    from orchestrator.__main__ import run_local_english_ai_audit
+
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    with pytest.raises(
+        SystemExit, match="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required"
+    ):
+        run_local_english_ai_audit(
+            output=tmp_path,
+            limit=1,
+            workers=1,
+            requests_per_second=2.0,
+        )
+
+
+def test_mac_settings_has_bounded_local_audit_defaults(monkeypatch):
+    from orchestrator.config import MacSettings
+
+    monkeypatch.delenv("SUPABASE_SUBTITLE_BUCKET", raising=False)
+    monkeypatch.delenv("LOCAL_AUDIT_TIMEOUT_SECONDS", raising=False)
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.supabase_subtitle_bucket == "subtitles"
+    assert settings.local_audit_timeout_seconds == 30
