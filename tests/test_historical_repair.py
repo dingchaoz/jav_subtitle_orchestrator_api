@@ -28,16 +28,19 @@ def _prepare_local_job(
     status: JobStatus = JobStatus.FAILED,
     bad: bool = True,
     audio: bool = True,
+    japanese_file: bool = True,
     claimed: bool = False,
 ):
     job = store.submit_job(movie, priority=100, force=False).job
     paths = build_job_paths(movie, root, "M:\\")
     paths.job_dir_mac.mkdir(parents=True, exist_ok=True)
-    japanese = _srt_lines(bad=False).replace("Distinct translation", "日本語")
-    paths.japanese_srt_path_mac.write_text(japanese, encoding="utf-8")
+    japanese_text = _srt_lines(bad=False).replace("Distinct translation", "日本語")
+    paths.japanese_srt_path_mac.write_text(japanese_text, encoding="utf-8")
     paths.english_srt_path_mac.write_text(_srt_lines(bad=bad), encoding="utf-8")
     if audio:
         paths.audio_path_mac.write_bytes(b"synthetic-audio")
+    if not japanese_file:
+        paths.japanese_srt_path_mac.unlink()
     with store.connection() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, claimed_by = ?, audio_path_mac = ?, "
@@ -78,6 +81,7 @@ def test_selector_prefers_eligible_movie_and_is_read_only(
     assert candidate.job_id == preferred.id
     assert candidate.movie_number == "abf-279"
     assert candidate.reason_codes
+    assert candidate.audio_preexisting is True
     assert store.get_job(preferred.id).status is JobStatus.FAILED
     assert store.get_job(fallback.id).status is JobStatus.ENGLISH_SRT_READY
     assert "Cannot translate" not in repr(candidate)
@@ -88,7 +92,7 @@ def test_selector_skips_ineligible_jobs(sqlite_path, mac_jobs_root, tmp_path):
 
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
-    _prepare_local_job(store, mac_jobs_root, "abc-001", audio=False)
+    _prepare_local_job(store, mac_jobs_root, "abc-001", japanese_file=False)
     _prepare_local_job(store, mac_jobs_root, "abc-002", bad=False)
     _prepare_local_job(
         store,
@@ -102,6 +106,30 @@ def test_selector_skips_ineligible_jobs(sqlite_path, mac_jobs_root, tmp_path):
     allowlist.write_text("abc-001\nabc-002\nabc-003\n", encoding="utf-8")
 
     assert select_historical_repair_canary(store, allowlist) is None
+
+
+def test_selector_allows_preexisting_missing_audio(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_repair import select_historical_repair_canary
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = _prepare_local_job(
+        store,
+        mac_jobs_root,
+        "abc-001",
+        audio=False,
+    )
+    allowlist = tmp_path / "repair-allowlist.txt"
+    allowlist.write_text("abc-001\n", encoding="utf-8")
+
+    candidate = select_historical_repair_canary(store, allowlist)
+
+    assert candidate.job_id == job.id
+    assert candidate.audio_preexisting is False
+    assert candidate.audio_path == str(paths.audio_path_mac)
+    assert not paths.audio_path_mac.exists()
 
 
 def test_prepare_requires_exact_limit_and_job_confirmation(

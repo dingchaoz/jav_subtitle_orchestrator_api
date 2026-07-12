@@ -28,6 +28,7 @@ class HistoricalRepairCandidate:
     japanese_path: str
     english_path: str
     audio_path: str
+    audio_preexisting: bool
     quarantine_directory: str
 
     def to_safe_dict(self) -> dict[str, object]:
@@ -80,7 +81,6 @@ def _candidate_for_job(
         for path in (
             paths.japanese_srt_path_mac,
             paths.english_srt_path_mac,
-            paths.audio_path_mac,
         )
     ):
         return None
@@ -98,6 +98,7 @@ def _candidate_for_job(
         japanese_path=str(paths.japanese_srt_path_mac),
         english_path=str(paths.english_srt_path_mac),
         audio_path=str(paths.audio_path_mac),
+        audio_preexisting=_nonempty_file(paths.audio_path_mac),
         quarantine_directory=str(paths.job_dir_mac / "rejected"),
     )
 
