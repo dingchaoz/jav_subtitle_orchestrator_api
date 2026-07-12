@@ -89,6 +89,29 @@ def test_worker_heartbeat_missing_job_returns_404(sqlite_path, mac_jobs_root):
     assert response.json()["detail"] == "job not found"
 
 
+def test_worker_permanent_quality_failure_is_not_requeued(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("roe-179", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    client = TestClient(create_app(store, max_worker_attempts=3))
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/failed",
+        json={
+            "worker_id": "windows-gpu-1",
+            "stage": "translating",
+            "error": "quality_gate_failed:known_bad_collapse",
+            "permanent": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["error"].startswith("translating: quality_gate_failed:")
+
+
 def test_worker_failed_wrong_worker_returns_409(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -106,7 +129,7 @@ def test_worker_failed_wrong_worker_returns_409(sqlite_path, mac_jobs_root):
     assert response.json()["detail"] == "job is not claimed by worker"
 
 
-def test_worker_complete_missing_final_file_returns_409(sqlite_path, mac_jobs_root):
+def test_legacy_worker_complete_is_disabled(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job = store.submit_job("ktb-096", priority=100, force=False).job
@@ -124,10 +147,68 @@ def test_worker_complete_missing_final_file_returns_409(sqlite_path, mac_jobs_ro
     )
 
     assert response.status_code == 409
+    assert "Windows translation completion is disabled" in response.json()["detail"]
+
+
+def test_worker_transcription_complete_releases_job_for_mac_translation(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    japanese = mac_jobs_root / "ktb-096" / "ktb-096.Japanese.srt"
+    japanese.parent.mkdir(parents=True, exist_ok=True)
+    japanese.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nこんにちは\n\n",
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(store))
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/transcription-complete",
+        json={
+            "worker_id": "windows-gpu-1",
+            "japanese_srt_path_windows": "M:\\ktb-096\\ktb-096.Japanese.srt",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "transcription_done"
+    refreshed = store.get_job(job.id)
+    assert refreshed.claimed_by is None
+    assert refreshed.lease_expires_at is None
+    assert refreshed.japanese_srt_path_mac == str(japanese)
+    assert refreshed.japanese_srt_path_windows == "M:\\ktb-096\\ktb-096.Japanese.srt"
+    assert refreshed.english_srt_path_mac is None
+
+
+def test_worker_transcription_complete_rejects_missing_japanese_srt(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+    client = TestClient(create_app(store), raise_server_exceptions=False)
+
+    response = client.post(
+        f"/worker/jobs/{claimed.id}/transcription-complete",
+        json={
+            "worker_id": "windows-gpu-1",
+            "japanese_srt_path_windows": "M:\\ktb-096\\ktb-096.Japanese.srt",
+        },
+    )
+
+    assert response.status_code == 409
     assert "final file not found" in response.json()["detail"]
 
 
-def test_worker_complete_success_with_existing_final_file(sqlite_path, mac_jobs_root):
+def test_legacy_worker_complete_cannot_bypass_mac_quality_gate(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job = store.submit_job("ktb-096", priority=100, force=False).job
@@ -144,5 +225,6 @@ def test_worker_complete_success_with_existing_final_file(sqlite_path, mac_jobs_
         },
     )
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "english_srt_ready"
+    assert response.status_code == 409
+    assert "Mac translation worker" in response.json()["detail"]
+    assert store.get_job(job.id).status == JobStatus.TRANSCRIPTION_CLAIMED

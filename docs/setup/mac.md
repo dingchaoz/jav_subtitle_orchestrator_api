@@ -19,6 +19,14 @@ MAC_DOWNLOAD_CONCURRENCY=1
 WORKER_LEASE_SECONDS=1800
 MAX_DOWNLOAD_ATTEMPTS=3
 MAX_WORKER_ATTEMPTS=3
+MAC_TRANSLATE_SCRIPT_PATH=/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/scripts/translatelocally_translate_single.py
+TRANSLATELOCALLY_PATH=/Applications/translateLocally.app/Contents/MacOS/translateLocally
+TRANSLATELOCALLY_MODEL=ja-en-tiny
+MAC_TRANSLATION_WORKER_ID=mac-translation-1
+MAC_TRANSLATION_LEASE_SECONDS=1800
+MAX_TRANSLATION_ATTEMPTS=3
+MAC_TRANSLATION_POLL_INTERVAL_SECONDS=10
+TRANSLATION_QUALITY_FAILURE_LIMIT=3
 ```
 
 3. Install and run the API:
@@ -39,7 +47,27 @@ source .venv/bin/activate
 python -m orchestrator mac-worker
 ```
 
-5. Submit a batch:
+5. Verify the real Mac translation runtime before starting its queue worker:
+
+```bash
+cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+source .venv/bin/activate
+python -m orchestrator mac-translation-smoke-test
+```
+
+The command must exit 0. It does not claim jobs. If it fails, keep the translation worker stopped; the downloader and Windows transcription worker can continue filling `transcription_done`.
+
+6. In a third terminal, start the Mac translation worker:
+
+```bash
+cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+source .venv/bin/activate
+python -m orchestrator mac-translation-worker
+```
+
+It claims only `transcription_done`, writes English on the Mac/SMB job path, runs the quality gate, and exposes only passing files as `english_srt_ready`.
+
+7. Submit a batch:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/jobs/batch \

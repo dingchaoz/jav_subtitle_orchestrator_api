@@ -1,4 +1,7 @@
+import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
@@ -47,6 +50,28 @@ def test_claim_next_audio_ready_job_is_atomic_and_ordered(sqlite_path, mac_jobs_
     assert claimed.status == JobStatus.TRANSCRIPTION_CLAIMED
     assert claimed.claimed_by == "windows-gpu-1"
     assert second_claim.id == slow.id
+
+
+def test_claim_next_worker_job_returns_none_quickly_when_no_audio_ready_and_db_is_write_locked(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    lock_conn = sqlite3.connect(sqlite_path)
+    try:
+        lock_conn.execute("PRAGMA journal_mode = WAL")
+        lock_conn.execute("BEGIN IMMEDIATE")
+        started = time.perf_counter()
+
+        claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=1800)
+
+        elapsed = time.perf_counter() - started
+        assert claimed is None
+        assert elapsed < 1.0
+    finally:
+        lock_conn.rollback()
+        lock_conn.close()
 
 
 def test_heartbeat_extends_lease_and_updates_stage(sqlite_path, mac_jobs_root):
@@ -133,3 +158,30 @@ def test_expired_transcription_done_worker_lease_returns_job_to_audio_ready(
     assert refreshed.status == JobStatus.AUDIO_READY
     assert refreshed.worker_attempt_count == 1
     assert refreshed.claimed_by is None
+
+
+def test_complete_worker_transcription_records_japanese_and_releases_lease(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    store.mark_audio_ready(job.id)
+    claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=60)
+    japanese = mac_jobs_root / "ktb-096" / "ktb-096.Japanese.srt"
+    japanese.parent.mkdir(parents=True, exist_ok=True)
+    japanese.write_text("valid", encoding="utf-8")
+
+    completed = store.complete_worker_transcription(
+        claimed.id,
+        "windows-gpu-1",
+        "M:\\ktb-096\\ktb-096.Japanese.srt",
+        lambda path: Path(path).exists(),
+    )
+
+    assert completed.status == JobStatus.TRANSCRIPTION_DONE
+    assert completed.claimed_by is None
+    assert completed.lease_expires_at is None
+    assert completed.japanese_srt_path_mac == str(japanese)
+    assert completed.japanese_srt_path_windows == "M:\\ktb-096\\ktb-096.Japanese.srt"

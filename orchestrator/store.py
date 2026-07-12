@@ -275,6 +275,18 @@ class JobStore:
     def claim_next_download_job(self) -> JobRecord | None:
         now = utc_now_iso()
         with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE status = ?
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                (JobStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                return None
+        with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
@@ -304,6 +316,20 @@ class JobStore:
 
     def recover_interrupted_downloads(self, max_download_attempts: int) -> int:
         now = utc_now_iso()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE status IN (?, ?)
+                LIMIT 1
+                """,
+                (
+                    JobStatus.DOWNLOADING_METADATA.value,
+                    JobStatus.DOWNLOADING_AUDIO.value,
+                ),
+            ).fetchone()
+            if row is None:
+                return 0
         recovered = 0
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -318,6 +344,38 @@ class JobStore:
                 ),
             ).fetchall()
             for row in rows:
+                job = self._row_to_job(row)
+                paths = build_job_paths(
+                    job.normalized_movie_number,
+                    self.jobs_root_mac,
+                    self.jobs_root_windows,
+                )
+                if (
+                    job.status == JobStatus.DOWNLOADING_AUDIO
+                    and paths.audio_path_mac.exists()
+                ):
+                    metadata_path_mac = (
+                        str(paths.metadata_path_mac) if paths.metadata_path_mac.exists() else None
+                    )
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = ?, updated_at = ?, error = NULL,
+                            metadata_path_mac = COALESCE(?, metadata_path_mac),
+                            audio_path_mac = ?, audio_path_windows = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            JobStatus.AUDIO_READY.value,
+                            now,
+                            metadata_path_mac,
+                            str(paths.audio_path_mac),
+                            paths.audio_path_windows,
+                            row["id"],
+                        ),
+                    )
+                    recovered += 1
+                    continue
                 attempts = row["attempt_count"] + 1
                 next_status = (
                     JobStatus.FAILED if attempts >= max_download_attempts else JobStatus.QUEUED
@@ -344,6 +402,18 @@ class JobStore:
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
             microsecond=0
         ).isoformat()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id FROM jobs
+                WHERE status = ?
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                (JobStatus.AUDIO_READY.value,),
+            ).fetchone()
+            if row is None:
+                return None
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -441,6 +511,212 @@ class JobStore:
             assert completed is not None
             return completed
 
+    def complete_worker_transcription(
+        self,
+        job_id: str,
+        worker_id: str,
+        japanese_srt_path_windows: str,
+        final_file_exists,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if not final_file_exists(str(paths.japanese_srt_path_mac)):
+                raise FileNotFoundError(paths.japanese_srt_path_mac)
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL,
+                    japanese_srt_path_mac = ?, japanese_srt_path_windows = ?,
+                    english_srt_path_mac = NULL, english_srt_path_windows = NULL
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.TRANSCRIPTION_DONE.value,
+                    now,
+                    str(paths.japanese_srt_path_mac),
+                    japanese_srt_path_windows,
+                    job_id,
+                    worker_id,
+                ),
+            )
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def claim_next_translation_job(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> JobRecord | None:
+        now = utc_now_iso()
+        lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND claimed_by IS NULL
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                (JobStatus.TRANSCRIPTION_DONE.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                """,
+                (
+                    JobStatus.TRANSLATING.value,
+                    worker_id,
+                    lease,
+                    now,
+                    row["id"],
+                    JobStatus.TRANSCRIPTION_DONE.value,
+                ),
+            )
+            return self.get_job(row["id"], conn=conn)
+
+    def complete_mac_translation(
+        self,
+        job_id: str,
+        worker_id: str,
+        final_file_exists,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.claimed_by != worker_id or job.status != JobStatus.TRANSLATING:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if not final_file_exists(str(paths.english_srt_path_mac)):
+                raise FileNotFoundError(paths.english_srt_path_mac)
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL,
+                    english_srt_path_mac = ?, english_srt_path_windows = ?
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    now,
+                    str(paths.english_srt_path_mac),
+                    paths.english_srt_path_windows,
+                    job_id,
+                    worker_id,
+                ),
+            )
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def fail_mac_translation(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        max_translation_attempts: int,
+        *,
+        permanent: bool = False,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            attempts = job.worker_attempt_count + 1
+            next_status = (
+                JobStatus.FAILED
+                if permanent or attempts >= max_translation_attempts
+                else JobStatus.TRANSCRIPTION_DONE
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND claimed_by = ?
+                """,
+                (
+                    next_status.value,
+                    attempts,
+                    now,
+                    f"translating: {error}",
+                    job_id,
+                    worker_id,
+                ),
+            )
+            failed = self.get_job(job_id, conn=conn)
+            assert failed is not None
+            return failed
+
+    def recover_expired_translation_leases(self, max_translation_attempts: int) -> int:
+        now = utc_now_iso()
+        recovered = 0
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (JobStatus.TRANSLATING.value, now),
+            ).fetchall()
+            for row in rows:
+                attempts = row["worker_attempt_count"] + 1
+                next_status = (
+                    JobStatus.FAILED
+                    if attempts >= max_translation_attempts
+                    else JobStatus.TRANSCRIPTION_DONE
+                )
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                        lease_expires_at = NULL, updated_at = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        next_status.value,
+                        attempts,
+                        now,
+                        "translating: translation lease expired",
+                        row["id"],
+                    ),
+                )
+                recovered += 1
+        return recovered
+
     def fail_worker_job(
         self,
         job_id: str,
@@ -448,6 +724,8 @@ class JobStore:
         stage: JobStatus,
         error: str,
         max_worker_attempts: int,
+        *,
+        permanent: bool = False,
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -460,7 +738,7 @@ class JobStore:
             next_attempts = job.worker_attempt_count + 1
             next_status = (
                 JobStatus.FAILED
-                if next_attempts >= max_worker_attempts
+                if permanent or next_attempts >= max_worker_attempts
                 else JobStatus.AUDIO_READY
             )
             conn.execute(
@@ -485,20 +763,36 @@ class JobStore:
 
     def recover_expired_worker_leases(self, max_worker_attempts: int) -> int:
         now = utc_now_iso()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE status IN (?, ?, ?) AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                LIMIT 1
+                """,
+                (
+                    JobStatus.TRANSCRIPTION_CLAIMED.value,
+                    JobStatus.TRANSCRIBING.value,
+                    JobStatus.TRANSCRIPTION_DONE.value,
+                    now,
+                ),
+            ).fetchone()
+            if row is None:
+                return 0
         recovered = 0
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE status IN (?, ?, ?, ?) AND lease_expires_at IS NOT NULL
+                WHERE status IN (?, ?, ?) AND lease_expires_at IS NOT NULL
                   AND lease_expires_at < ?
                 """,
                 (
                     JobStatus.TRANSCRIPTION_CLAIMED.value,
                     JobStatus.TRANSCRIBING.value,
                     JobStatus.TRANSCRIPTION_DONE.value,
-                    JobStatus.TRANSLATING.value,
                     now,
                 ),
             ).fetchall()

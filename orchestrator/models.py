@@ -55,10 +55,16 @@ class WorkerCompleteRequest(BaseModel):
     english_srt_path_windows: str
 
 
+class WorkerTranscriptionCompleteRequest(BaseModel):
+    worker_id: str
+    japanese_srt_path_windows: str
+
+
 class WorkerFailedRequest(BaseModel):
     worker_id: str
     stage: JobStatus
     error: str = Field(min_length=1)
+    permanent: bool = False
 
 
 class JobResponse(BaseModel):

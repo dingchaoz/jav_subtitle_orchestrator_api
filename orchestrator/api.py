@@ -14,6 +14,7 @@ from orchestrator.models import (
     WorkerHeartbeatRequest,
     WorkerJobResponse,
     WorkerNextJobResponse,
+    WorkerTranscriptionCompleteRequest,
 )
 from orchestrator.store import JobRecord, JobStore
 
@@ -118,12 +119,27 @@ def create_app(
 
     @app.post("/worker/jobs/{job_id}/complete", response_model=JobResponse)
     def complete(job_id: str, request: WorkerCompleteRequest) -> JobResponse:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Windows translation completion is disabled; "
+                "use transcription-complete and let the Mac translation worker publish English"
+            ),
+        )
+
+    @app.post(
+        "/worker/jobs/{job_id}/transcription-complete",
+        response_model=JobResponse,
+    )
+    def transcription_complete(
+        job_id: str,
+        request: WorkerTranscriptionCompleteRequest,
+    ) -> JobResponse:
         try:
-            job = store.complete_worker_job(
+            job = store.complete_worker_transcription(
                 job_id,
                 request.worker_id,
                 request.japanese_srt_path_windows,
-                request.english_srt_path_windows,
                 final_file_exists,
             )
         except (KeyError, PermissionError, FileNotFoundError) as exc:
@@ -139,6 +155,7 @@ def create_app(
                 request.stage,
                 request.error,
                 max_worker_attempts,
+                permanent=request.permanent,
             )
         except (KeyError, PermissionError, FileNotFoundError) as exc:
             raise worker_mutation_http_error(exc) from exc

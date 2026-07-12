@@ -28,6 +28,30 @@ class MacSettings(BaseSettings):
     worker_lease_seconds: int = Field(default=1800, alias="WORKER_LEASE_SECONDS")
     max_download_attempts: int = Field(default=3, alias="MAX_DOWNLOAD_ATTEMPTS")
     max_worker_attempts: int = Field(default=3, alias="MAX_WORKER_ATTEMPTS")
+    mac_translate_script_path: str = Field(
+        default=str(PROJECT_ROOT / "scripts" / "translatelocally_translate_single.py"),
+        alias="MAC_TRANSLATE_SCRIPT_PATH",
+    )
+    translatelocally_path: str | None = Field(default=None, alias="TRANSLATELOCALLY_PATH")
+    translatelocally_model: str = Field(default="ja-en-tiny", alias="TRANSLATELOCALLY_MODEL")
+    mac_translation_worker_id: str = Field(
+        default="mac-translation-1",
+        alias="MAC_TRANSLATION_WORKER_ID",
+    )
+    mac_translation_lease_seconds: int = Field(
+        default=1800,
+        alias="MAC_TRANSLATION_LEASE_SECONDS",
+    )
+    max_translation_attempts: int = Field(default=3, alias="MAX_TRANSLATION_ATTEMPTS")
+    mac_translation_poll_interval_seconds: int = Field(
+        default=10,
+        alias="MAC_TRANSLATION_POLL_INTERVAL_SECONDS",
+    )
+    translation_quality_failure_limit: int = Field(
+        default=3,
+        ge=1,
+        alias="TRANSLATION_QUALITY_FAILURE_LIMIT",
+    )
 
 
 class WindowsSettings(BaseSettings):
@@ -39,7 +63,47 @@ class WindowsSettings(BaseSettings):
     whisper_model: str = Field(default="large-v3-turbo", alias="WHISPER_MODEL")
     whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(default="float16", alias="WHISPER_COMPUTE_TYPE")
-    openai_api_key: str = Field(alias="OPENAI_API_KEY")
-    translate_script_path: str = Field(alias="TRANSLATE_SCRIPT_PATH")
+    transcribe_script_path: str | None = Field(default=None, alias="TRANSCRIBE_SCRIPT_PATH")
+    transcribe_python_executable: str | None = Field(
+        default=None,
+        alias="TRANSCRIBE_PYTHON_EXECUTABLE",
+    )
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
+    translate_script_path: str | None = Field(default=None, alias="TRANSLATE_SCRIPT_PATH")
+    translatelocally_path: str | None = Field(default=None, alias="TRANSLATELOCALLY_PATH")
+    translatelocally_model: str | None = Field(default=None, alias="TRANSLATELOCALLY_MODEL")
+    codex_translate_script_path: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATE_SCRIPT_PATH",
+    )
+    codex_translate_python_executable: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATE_PYTHON_EXECUTABLE",
+    )
+    codex_bin_path: str | None = Field(default=None, alias="CODEX_BIN_PATH")
+    codex_translation_provider: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_PROVIDER",
+    )
+    codex_translation_targets: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_TARGETS",
+    )
+    codex_translation_workers: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_WORKERS",
+    )
+    codex_translation_batch_workers: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_BATCH_WORKERS",
+    )
+    codex_translation_anthropic_models: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_ANTHROPIC_MODELS",
+    )
+    codex_translation_anthropic_recheck_minutes: str | None = Field(
+        default=None,
+        alias="CODEX_TRANSLATION_ANTHROPIC_RECHECK_MINUTES",
+    )
     poll_interval_seconds: int = Field(default=10, alias="POLL_INTERVAL_SECONDS")
     heartbeat_interval_seconds: int = Field(default=60, alias="HEARTBEAT_INTERVAL_SECONDS")

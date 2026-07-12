@@ -1,3 +1,4 @@
+import logging
 import time
 from pathlib import Path
 from threading import Event, Thread
@@ -5,6 +6,9 @@ from threading import Event, Thread
 import requests
 
 from orchestrator.job_logs import append_job_log
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
@@ -36,27 +40,30 @@ class MacApiClient:
         )
         response.raise_for_status()
 
-    def complete(
+    def transcription_complete(
         self,
         job_id: str,
         japanese_srt_path_windows: str,
-        english_srt_path_windows: str,
     ) -> None:
         response = requests.post(
-            f"{self.base_url}/worker/jobs/{job_id}/complete",
+            f"{self.base_url}/worker/jobs/{job_id}/transcription-complete",
             json={
                 "worker_id": self.worker_id,
                 "japanese_srt_path_windows": japanese_srt_path_windows,
-                "english_srt_path_windows": english_srt_path_windows,
             },
             timeout=30,
         )
         response.raise_for_status()
 
-    def failed(self, job_id: str, stage: str, error: str) -> None:
+    def failed(self, job_id: str, stage: str, error: str, permanent: bool = False) -> None:
         response = requests.post(
             f"{self.base_url}/worker/jobs/{job_id}/failed",
-            json={"worker_id": self.worker_id, "stage": stage, "error": error},
+            json={
+                "worker_id": self.worker_id,
+                "stage": stage,
+                "error": error,
+                "permanent": permanent,
+            },
             timeout=30,
         )
         response.raise_for_status()
@@ -67,12 +74,11 @@ class WindowsWorker:
         self,
         client,
         transcriber,
-        translator,
+        translator=None,
         heartbeat_interval_seconds: float = 60,
     ) -> None:
         self.client = client
         self.transcriber = transcriber
-        self.translator = translator
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
 
     def process_one(self) -> bool:
@@ -87,39 +93,33 @@ class WindowsWorker:
             audio_path = Path(job["audio_path_windows"])
             job_dir = audio_path.parent
             japanese_srt = Path(job["japanese_srt_path_windows"])
-            english_srt = Path(job["english_srt_path_windows"])
 
             _append_job_log_safely(job_dir, "windows-worker.log", f"claimed {job_id}")
-            self.client.heartbeat(job_id, stage)
-            _append_job_log_safely(job_dir, "whisper.log", f"transcribing {audio_path}")
-            self._run_with_periodic_heartbeat(
-                job_id,
-                stage,
-                self.transcriber.transcribe_to_srt,
-                audio_path,
-                japanese_srt,
-            )
+            if japanese_srt.exists():
+                _append_job_log_safely(
+                    job_dir,
+                    "whisper.log",
+                    f"skipping existing transcript {japanese_srt}",
+                )
+            else:
+                self.client.heartbeat(job_id, stage)
+                _append_job_log_safely(job_dir, "whisper.log", f"transcribing {audio_path}")
+                self._run_with_periodic_heartbeat(
+                    job_id,
+                    stage,
+                    self.transcriber.transcribe_to_srt,
+                    audio_path,
+                    japanese_srt,
+                )
 
             stage = "transcription_done"
             self.client.heartbeat(job_id, stage)
-
-            stage = "translating"
-            self.client.heartbeat(job_id, stage)
+            self.client.transcription_complete(job_id, str(japanese_srt))
             _append_job_log_safely(
                 job_dir,
-                "translate.log",
-                f"translating {japanese_srt}",
+                "windows-worker.log",
+                f"transcription_completed {job_id}",
             )
-            self._run_with_periodic_heartbeat(
-                job_id,
-                stage,
-                self.translator.translate_to_english,
-                japanese_srt,
-                english_srt,
-            )
-
-            self.client.complete(job_id, str(japanese_srt), str(english_srt))
-            _append_job_log_safely(job_dir, "windows-worker.log", f"completed {job_id}")
             return True
         except Exception as exc:
             if job_dir is not None:
@@ -128,7 +128,7 @@ class WindowsWorker:
                     "windows-worker.log",
                     f"failed {job_id} {stage}: {exc}",
                 )
-            self.client.failed(job_id, stage, str(exc))
+            self.client.failed(job_id, stage, str(exc), permanent=False)
             return True
 
     def _run_with_periodic_heartbeat(self, job_id: str, stage: str, operation, *args) -> None:
@@ -160,5 +160,9 @@ class WindowsWorker:
 
 def run_forever(worker: WindowsWorker, poll_interval_seconds: int) -> None:
     while True:
-        worker.process_one()
+        try:
+            worker.process_one()
+        except requests.RequestException as exc:
+            base_url = getattr(getattr(worker, "client", None), "base_url", "unknown")
+            LOGGER.warning("windows worker could not reach Mac API at %s: %s", base_url, exc)
         time.sleep(poll_interval_seconds)

@@ -5,8 +5,10 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
+from orchestrator.__main__ import _build_windows_transcriber
 from orchestrator.config import MacSettings, WindowsSettings
 from orchestrator.paths import build_job_paths, normalize_movie_number
+from orchestrator.transcription import ExternalScriptTranscriber, FasterWhisperTranscriber
 
 
 MAC_ENV_ALIASES = (
@@ -29,8 +31,21 @@ WINDOWS_ENV_ALIASES = (
     "WHISPER_MODEL",
     "WHISPER_DEVICE",
     "WHISPER_COMPUTE_TYPE",
+    "TRANSCRIBE_SCRIPT_PATH",
+    "TRANSCRIBE_PYTHON_EXECUTABLE",
     "OPENAI_API_KEY",
     "TRANSLATE_SCRIPT_PATH",
+    "TRANSLATELOCALLY_PATH",
+    "TRANSLATELOCALLY_MODEL",
+    "CODEX_TRANSLATE_SCRIPT_PATH",
+    "CODEX_TRANSLATE_PYTHON_EXECUTABLE",
+    "CODEX_BIN_PATH",
+    "CODEX_TRANSLATION_PROVIDER",
+    "CODEX_TRANSLATION_TARGETS",
+    "CODEX_TRANSLATION_WORKERS",
+    "CODEX_TRANSLATION_BATCH_WORKERS",
+    "CODEX_TRANSLATION_ANTHROPIC_MODELS",
+    "CODEX_TRANSLATION_ANTHROPIC_RECHECK_MINUTES",
     "POLL_INTERVAL_SECONDS",
     "HEARTBEAT_INTERVAL_SECONDS",
 )
@@ -60,9 +75,120 @@ def test_windows_runtime_env_exports_openai_api_key(monkeypatch):
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    _export_windows_runtime_env(SimpleNamespace(openai_api_key="loaded-key"))
+    _export_windows_runtime_env(
+        SimpleNamespace(
+            openai_api_key="loaded-key",
+            translatelocally_path=None,
+            translatelocally_model=None,
+            codex_translate_script_path=None,
+            codex_translate_python_executable=None,
+            codex_bin_path=None,
+            codex_translation_provider=None,
+            codex_translation_targets=None,
+            codex_translation_workers=None,
+            codex_translation_batch_workers=None,
+            codex_translation_anthropic_models=None,
+            codex_translation_anthropic_recheck_minutes=None,
+        )
+    )
 
     assert os.environ["OPENAI_API_KEY"] == "loaded-key"
+
+
+def test_windows_runtime_env_skips_openai_api_key_when_missing(monkeypatch):
+    from orchestrator.__main__ import _export_windows_runtime_env
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    _export_windows_runtime_env(
+        SimpleNamespace(
+            openai_api_key=None,
+            translatelocally_path=None,
+            translatelocally_model=None,
+            codex_translate_script_path=None,
+            codex_translate_python_executable=None,
+            codex_bin_path=None,
+            codex_translation_provider=None,
+            codex_translation_targets=None,
+            codex_translation_workers=None,
+            codex_translation_batch_workers=None,
+            codex_translation_anthropic_models=None,
+            codex_translation_anthropic_recheck_minutes=None,
+        )
+    )
+
+    assert "OPENAI_API_KEY" not in os.environ
+
+
+def test_windows_runtime_env_exports_codex_translation_settings(monkeypatch):
+    from orchestrator.__main__ import _export_windows_runtime_env
+
+    aliases = (
+        "CODEX_TRANSLATE_SCRIPT_PATH",
+        "CODEX_TRANSLATE_PYTHON_EXECUTABLE",
+        "CODEX_BIN_PATH",
+        "CODEX_TRANSLATION_PROVIDER",
+        "CODEX_TRANSLATION_TARGETS",
+        "CODEX_TRANSLATION_WORKERS",
+        "CODEX_TRANSLATION_BATCH_WORKERS",
+        "CODEX_TRANSLATION_ANTHROPIC_MODELS",
+        "CODEX_TRANSLATION_ANTHROPIC_RECHECK_MINUTES",
+    )
+    clear_env_aliases(monkeypatch, aliases)
+
+    _export_windows_runtime_env(
+        SimpleNamespace(
+            openai_api_key=None,
+            translatelocally_path=None,
+            translatelocally_model=None,
+            codex_translate_script_path="C:\\scripts\\translate_srts.py",
+            codex_translate_python_executable="C:\\Python312\\python.exe",
+            codex_bin_path="C:\\tools\\codex.exe",
+            codex_translation_provider="codex",
+            codex_translation_targets="en",
+            codex_translation_workers="1",
+            codex_translation_batch_workers="5",
+            codex_translation_anthropic_models="haiku",
+            codex_translation_anthropic_recheck_minutes="30",
+        )
+    )
+
+    assert os.environ["CODEX_TRANSLATE_SCRIPT_PATH"] == "C:\\scripts\\translate_srts.py"
+    assert os.environ["CODEX_TRANSLATE_PYTHON_EXECUTABLE"] == "C:\\Python312\\python.exe"
+    assert os.environ["CODEX_BIN_PATH"] == "C:\\tools\\codex.exe"
+    assert os.environ["CODEX_TRANSLATION_PROVIDER"] == "codex"
+    assert os.environ["CODEX_TRANSLATION_TARGETS"] == "en"
+    assert os.environ["CODEX_TRANSLATION_WORKERS"] == "1"
+    assert os.environ["CODEX_TRANSLATION_BATCH_WORKERS"] == "5"
+    assert os.environ["CODEX_TRANSLATION_ANTHROPIC_MODELS"] == "haiku"
+    assert os.environ["CODEX_TRANSLATION_ANTHROPIC_RECHECK_MINUTES"] == "30"
+
+
+def test_windows_runtime_env_exports_translatelocally_settings(monkeypatch):
+    from orchestrator.__main__ import _export_windows_runtime_env
+
+    aliases = ("TRANSLATELOCALLY_PATH", "TRANSLATELOCALLY_MODEL")
+    clear_env_aliases(monkeypatch, aliases)
+
+    _export_windows_runtime_env(
+        SimpleNamespace(
+            openai_api_key=None,
+            translatelocally_path="C:\\tools\\translateLocally.exe",
+            translatelocally_model="ja-en-tiny",
+            codex_translate_script_path=None,
+            codex_translate_python_executable=None,
+            codex_bin_path=None,
+            codex_translation_provider=None,
+            codex_translation_targets=None,
+            codex_translation_workers=None,
+            codex_translation_batch_workers=None,
+            codex_translation_anthropic_models=None,
+            codex_translation_anthropic_recheck_minutes=None,
+        )
+    )
+
+    assert os.environ["TRANSLATELOCALLY_PATH"] == "C:\\tools\\translateLocally.exe"
+    assert os.environ["TRANSLATELOCALLY_MODEL"] == "ja-en-tiny"
 
 
 def test_windows_extra_installs_translation_script_dependencies():
@@ -101,7 +227,6 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
     monkeypatch.setenv("MAC_API_BASE_URL", "http://192.168.1.25:8000")
     monkeypatch.setenv("WORKER_ID", "windows-gpu-1")
     monkeypatch.setenv("WINDOWS_JOBS_ROOT", "M:\\")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv(
         "TRANSLATE_SCRIPT_PATH",
         "C:\\Users\\ytt\\Documents\\startup\\E2E-download-subtitle-generation-translation-scripts\\scripts\\subtitle_translate.py",
@@ -115,9 +240,52 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
     assert settings.whisper_model == "large-v3-turbo"
     assert settings.whisper_device == "cuda"
     assert settings.whisper_compute_type == "float16"
-    assert settings.openai_api_key == "test-key"
+    assert settings.transcribe_script_path is None
+    assert settings.transcribe_python_executable is None
+    assert settings.openai_api_key is None
+    assert settings.translatelocally_path is None
+    assert settings.translatelocally_model is None
+    assert settings.codex_translate_script_path is None
+    assert settings.codex_translate_python_executable is None
+    assert settings.codex_bin_path is None
+    assert settings.codex_translation_provider is None
+    assert settings.codex_translation_targets is None
+    assert settings.codex_translation_workers is None
+    assert settings.codex_translation_batch_workers is None
+    assert settings.codex_translation_anthropic_models is None
+    assert settings.codex_translation_anthropic_recheck_minutes is None
     assert settings.poll_interval_seconds == 10
     assert settings.heartbeat_interval_seconds == 60
+
+
+def test_build_windows_transcriber_prefers_external_script_when_configured():
+    settings = SimpleNamespace(
+        transcribe_script_path="C:\\transcribe.py",
+        transcribe_python_executable="C:\\Python312\\python.exe",
+        whisper_model="large-v3-turbo",
+        whisper_device="cuda",
+        whisper_compute_type="float16",
+    )
+
+    transcriber = _build_windows_transcriber(settings)
+
+    assert isinstance(transcriber, ExternalScriptTranscriber)
+    assert transcriber.script_path == Path("C:/transcribe.py")
+    assert transcriber.python_executable == "C:\\Python312\\python.exe"
+
+
+def test_build_windows_transcriber_falls_back_to_internal_whisper():
+    settings = SimpleNamespace(
+        transcribe_script_path=None,
+        transcribe_python_executable=None,
+        whisper_model="large-v3-turbo",
+        whisper_device="cuda",
+        whisper_compute_type="float16",
+    )
+
+    transcriber = _build_windows_transcriber(settings)
+
+    assert isinstance(transcriber, FasterWhisperTranscriber)
 
 
 def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):

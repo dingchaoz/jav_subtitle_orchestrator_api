@@ -1,5 +1,8 @@
+import os
+import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,10 +13,7 @@ class SubtitleTranslator:
 
     def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
         output_srt.parent.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(
-            prefix=".subtitle-translation-",
-            dir=output_srt.parent,
-        ) as temp_output_dir:
+        with TemporaryDirectory(prefix=".subtitle-translation-") as temp_output_dir:
             temp_output_path = Path(temp_output_dir)
             command = [
                 sys.executable,
@@ -25,7 +25,19 @@ class SubtitleTranslator:
                 "--output-dir",
                 str(temp_output_path),
             ]
-            completed = subprocess.run(command, text=True, capture_output=True, check=False)
+            environment = os.environ.copy()
+            environment["TRANSLATE_BATCH_LOG_PATH"] = str(
+                input_srt.parent / "logs" / "translate-batches.log"
+            )
+            completed = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                env=environment,
+            )
             if completed.returncode != 0:
                 output = (completed.stderr or completed.stdout).strip()
                 raise RuntimeError(
@@ -42,8 +54,15 @@ class SubtitleTranslator:
             ]
             for candidate in candidates:
                 if candidate.exists():
-                    candidate.replace(output_srt)
-                    return
+                    temporary_final = output_srt.with_name(
+                        f".{output_srt.name}.{uuid.uuid4().hex}.tmp"
+                    )
+                    try:
+                        shutil.copyfile(candidate, temporary_final)
+                        os.replace(temporary_final, output_srt)
+                        return
+                    finally:
+                        temporary_final.unlink(missing_ok=True)
             checked_candidates = ", ".join(str(candidate) for candidate in candidates)
             raise FileNotFoundError(
                 f"translation script did not produce {output_srt}; "
