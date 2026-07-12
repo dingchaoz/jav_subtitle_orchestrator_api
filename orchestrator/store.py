@@ -40,6 +40,21 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class WorkerStatusRecord:
+    worker_id: str
+    role: str
+    state: str
+    last_seen_at: str
+    last_poll_at: str | None
+    last_ip: str | None
+    current_job_id: str | None
+    current_movie_number: str | None
+    stage: str | None
+    updated_at: str
+    last_error: str | None
+
+
+@dataclass(frozen=True)
 class SubmitResult:
     kind: Literal["created", "existing", "invalid", "conflict"]
     movie_number: str
@@ -106,6 +121,23 @@ class JobStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created "
                 "ON jobs(status, priority, created_at)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_statuses (
+                  worker_id TEXT PRIMARY KEY,
+                  role TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  last_seen_at TEXT NOT NULL,
+                  last_poll_at TEXT,
+                  last_ip TEXT,
+                  current_job_id TEXT,
+                  current_movie_number TEXT,
+                  stage TEXT,
+                  updated_at TEXT NOT NULL,
+                  last_error TEXT
+                )
+                """
             )
 
     def submit_job(self, movie_number: str, priority: int, force: bool) -> SubmitResult:
@@ -194,6 +226,64 @@ class JobStore:
                     (status.value,),
                 ).fetchall()
             return [self._row_to_job(row) for row in rows]
+
+    def record_worker_idle(
+        self,
+        worker_id: str,
+        *,
+        role: str = "windows",
+        last_ip: str | None = None,
+        stage: str | None = None,
+        last_error: str | None = None,
+        update_poll: bool = True,
+    ) -> WorkerStatusRecord:
+        now = utc_now_iso()
+        last_poll_at = now if update_poll else None
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_statuses (
+                  worker_id, role, state, last_seen_at, last_poll_at, last_ip,
+                  current_job_id, current_movie_number, stage, updated_at, last_error
+                )
+                VALUES (?, ?, 'idle', ?, ?, ?, NULL, NULL, ?, ?, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                  role = excluded.role, state = 'idle',
+                  last_seen_at = excluded.last_seen_at,
+                  last_poll_at = COALESCE(excluded.last_poll_at, worker_statuses.last_poll_at),
+                  last_ip = COALESCE(excluded.last_ip, worker_statuses.last_ip),
+                  current_job_id = NULL, current_movie_number = NULL,
+                  stage = excluded.stage, updated_at = excluded.updated_at,
+                  last_error = excluded.last_error
+                """,
+                (worker_id, role, now, last_poll_at, last_ip, stage, now, last_error),
+            )
+            status = self.get_worker_status(worker_id, conn=conn)
+            assert status is not None
+            return status
+
+    def get_worker_status(
+        self,
+        worker_id: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> WorkerStatusRecord | None:
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM worker_statuses WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            return self._row_to_worker_status(row) if row else None
+        with self.connection() as active_conn:
+            row = active_conn.execute(
+                "SELECT * FROM worker_statuses WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            return self._row_to_worker_status(row) if row else None
+
+    def list_worker_statuses(self) -> list[WorkerStatusRecord]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM worker_statuses ORDER BY last_seen_at DESC, worker_id ASC"
+            ).fetchall()
+            return [self._row_to_worker_status(row) for row in rows]
 
     def update_download_status(
         self,
@@ -899,4 +989,20 @@ class JobStore:
             japanese_srt_path_windows=row["japanese_srt_path_windows"],
             english_srt_path_mac=row["english_srt_path_mac"],
             english_srt_path_windows=row["english_srt_path_windows"],
+        )
+
+    @staticmethod
+    def _row_to_worker_status(row: sqlite3.Row) -> WorkerStatusRecord:
+        return WorkerStatusRecord(
+            worker_id=row["worker_id"],
+            role=row["role"],
+            state=row["state"],
+            last_seen_at=row["last_seen_at"],
+            last_poll_at=row["last_poll_at"],
+            last_ip=row["last_ip"],
+            current_job_id=row["current_job_id"],
+            current_movie_number=row["current_movie_number"],
+            stage=row["stage"],
+            updated_at=row["updated_at"],
+            last_error=row["last_error"],
         )
