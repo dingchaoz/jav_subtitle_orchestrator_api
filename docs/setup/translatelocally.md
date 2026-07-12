@@ -29,6 +29,12 @@ python -m orchestrator mac-translation-smoke-test
 
 The check invokes the configured wrapper and model on ten fixed safe Japanese sentences. It requires ten output cues, normalized unique ratio of at least 50%, and no known collapse phrases. It never claims a job.
 
+Before model invocation, the wrapper removes any preexisting Unicode U+FFFD
+replacement characters from its in-memory translation input. It never rewrites the
+Japanese SRT. The wrapper logs aggregate removal counts without subtitle text and
+fails before model invocation if a source line becomes empty. The unchanged
+Japanese/English pair quality gate still decides whether publication is allowed.
+
 Only after it exits successfully, start:
 
 ```bash
