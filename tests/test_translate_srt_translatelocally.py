@@ -145,3 +145,24 @@ def test_batch_log_contains_statistics_not_subtitle_text(tmp_path, monkeypatch):
     assert '"input_character_count": 40' in text
     assert '"output_line_count": 1' in text
     assert secret_line not in text
+
+
+def test_sanitize_translation_input_removes_only_replacement_characters():
+    result = tl.sanitize_translation_input(
+        ["前\ufffd後", "unchanged punctuation!?", "normal"]
+    )
+
+    assert result.lines == ("前後", "unchanged punctuation!?", "normal")
+    assert result.replacement_character_count == 1
+    assert result.sanitized_line_count == 1
+
+
+def test_sanitize_translation_input_rejects_line_empty_after_removal():
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"translation_input_corrupt: line 2 empty after removing "
+            r"replacement characters"
+        ),
+    ):
+        tl.sanitize_translation_input(["normal", "\ufffd\ufffd"])
