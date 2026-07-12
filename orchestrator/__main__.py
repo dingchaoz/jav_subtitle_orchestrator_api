@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -192,6 +193,78 @@ def run_plan_historical_repairs(
     print(render_repair_report(plans))
 
 
+def _write_private_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def run_select_historical_repair_canary(
+    *,
+    allowlist_file: Path,
+    preferred_movie: str | None,
+    output: Path,
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_repair import select_historical_repair_canary
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    candidate = select_historical_repair_canary(
+        store,
+        allowlist_file,
+        preferred_movie=preferred_movie,
+    )
+    if candidate is None:
+        raise SystemExit("no eligible historical repair canary")
+    _write_private_json(output, candidate.to_safe_dict())
+    print(
+        f"selected=true job_id={candidate.job_id} "
+        f"movie={candidate.movie_number} output={output.resolve()}"
+    )
+
+
+def run_prepare_historical_repair_canary(
+    *,
+    allowlist_file: Path,
+    movie: str,
+    limit: int,
+    confirm_job_id: str,
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_repair import prepare_historical_repair_canary
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+    prior = store.get_job(confirm_job_id)
+    if prior is None:
+        raise SystemExit("confirmed historical repair job does not exist")
+    prepared = prepare_historical_repair_canary(
+        store,
+        allowlist_file,
+        movie=movie,
+        limit=limit,
+        confirm_job_id=confirm_job_id,
+    )
+    print(
+        f"prepared=true job_id={prepared.id} movie={prepared.normalized_movie_number} "
+        f"prior_status={prior.status.value} new_status={prepared.status.value}"
+    )
+
+
 def run_local_english_ai_audit(
     *,
     output: Path,
@@ -296,6 +369,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
     )
+    selector = subcommands.add_parser("select-historical-repair-canary")
+    selector.add_argument("--allowlist-file", type=Path, required=True)
+    selector.add_argument("--preferred-movie")
+    selector.add_argument("--output", type=Path, required=True)
+    prepare = subcommands.add_parser("prepare-historical-repair-canary")
+    prepare.add_argument("--allowlist-file", type=Path, required=True)
+    prepare.add_argument("--movie", required=True)
+    prepare.add_argument("--limit", type=int, required=True)
+    prepare.add_argument("--confirm-job-id", required=True)
     return parser
 
 
@@ -326,6 +408,19 @@ def main() -> None:
             limit=args.limit,
             workers=args.workers,
             requests_per_second=args.requests_per_second,
+        )
+    elif args.command == "select-historical-repair-canary":
+        run_select_historical_repair_canary(
+            allowlist_file=args.allowlist_file,
+            preferred_movie=args.preferred_movie,
+            output=args.output,
+        )
+    elif args.command == "prepare-historical-repair-canary":
+        run_prepare_historical_repair_canary(
+            allowlist_file=args.allowlist_file,
+            movie=args.movie,
+            limit=args.limit,
+            confirm_job_id=args.confirm_job_id,
         )
 
 
