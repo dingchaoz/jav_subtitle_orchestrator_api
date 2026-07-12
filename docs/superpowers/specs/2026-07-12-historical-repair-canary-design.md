@@ -20,8 +20,8 @@ after reporting the canary result and ask the user whether to process a batch of
 five to ten.
 
 Old local English SRT files are moved to `rejected/` and retained. The canary has no
-permanent-delete mode. Japanese SRT, `audio.wav`, and transcription results are
-always preserved.
+permanent-delete mode. Japanese SRT, any preexisting `audio.wav`, and transcription
+results are always preserved. Historical audio absence is preserved as absence.
 
 ## Selected approach
 
@@ -48,7 +48,8 @@ only idle candidates that meet all of these conditions:
   `english_srt_ready`; the transactional prepare step compares that expected status
   again to prevent a worker-claim race;
 - Japanese SRT exists and is non-empty;
-- `audio.wav` exists;
+- `audio.wav` may already be absent for completed historical jobs; the selector
+  records whether it preexisted and the repair never creates or deletes it;
 - the current English SRT exists and fails the production Japanese/English quality
   gate;
 - the candidate appears in the explicit audit allowlist.
@@ -170,7 +171,8 @@ Tests must prove:
 
 - selection requires the explicit allowlist and every local eligibility condition;
 - prepare requires `limit=1`, exact movie, and matching job ID;
-- prepare resets only translation state and preserves Japanese SRT and `audio.wav`;
+- prepare resets only translation state, preserves Japanese SRT and any preexisting
+  `audio.wav`, and preserves audio absence when it was already missing;
 - the SQLite migration preserves the existing Windows worker attempt count and Mac
   retries use only `translation_attempt_count`;
 - the worker quarantines rather than deletes the old English SRT;

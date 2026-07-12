@@ -469,6 +469,7 @@ class HistoricalRepairCandidate:
     japanese_path: str
     english_path: str
     audio_path: str
+    audio_preexisting: bool
     quarantine_directory: str
 
     def to_safe_dict(self) -> dict[str, object]:
@@ -481,7 +482,8 @@ codes, duplicates, and more than 10,000 lines. Normalize through
 
 `select_historical_repair_canary(...)` must iterate `store.list_jobs()` and accept
 only allowlisted, unclaimed jobs in `queued`, `failed`, or `english_srt_ready` with
-non-empty Japanese, audio, and English files whose production pair gate fails.
+non-empty Japanese and English files whose production pair gate fails. Audio is not
+required for historical translation; record whether it existed before selection.
 Sort by normalized movie then job ID, moving the eligible preferred movie to the
 front. Return one candidate or `None`. Never serialize subtitle content.
 
@@ -956,7 +958,7 @@ python -m orchestrator select-historical-repair-canary \
   --allowlist-file reports/subtitle-audit/english-ai-local-20260712/repair-allowlist.txt \
   --preferred-movie abf-279 \
   --output reports/subtitle-audit/english-ai-local-20260712/canary-selection.json
-jq '{job_id,movie_number,expected_status,reason_codes,japanese_path,english_path,audio_path,quarantine_directory}' \
+jq '{job_id,movie_number,expected_status,reason_codes,japanese_path,english_path,audio_path,audio_preexisting,quarantine_directory}' \
   reports/subtitle-audit/english-ai-local-20260712/canary-selection.json
 ```
 
@@ -972,11 +974,16 @@ MOVIE=$(jq -r .movie_number "$SELECTION")
 JA_PATH=$(jq -r .japanese_path "$SELECTION")
 EN_PATH=$(jq -r .english_path "$SELECTION")
 AUDIO_PATH=$(jq -r .audio_path "$SELECTION")
-shasum -a 256 "$JA_PATH" "$EN_PATH" "$AUDIO_PATH" \
+shasum -a 256 "$JA_PATH" "$EN_PATH" \
   > reports/subtitle-audit/english-ai-local-20260712/canary-pre-hashes.txt
+if [ "$(jq -r .audio_preexisting "$SELECTION")" = true ]; then
+  shasum -a 256 "$AUDIO_PATH" >> \
+    reports/subtitle-audit/english-ai-local-20260712/canary-pre-hashes.txt
+fi
 ```
 
-Expected: three hashes recorded locally; no file content printed.
+Expected: Japanese and English hashes are recorded; audio is hashed only when it
+preexisted. No file content is printed.
 
 - [ ] **Step 7: Prepare exactly the selected canary**
 

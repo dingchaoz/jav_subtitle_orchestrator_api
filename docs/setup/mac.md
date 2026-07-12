@@ -163,8 +163,9 @@ python -m orchestrator mac-translation-worker-once --job-id "$JOB_ID"
 ```
 
 The one-shot worker runs startup smoke and can claim only that exact ID. It moves
-the old English SRT into `rejected/`, retains it, preserves Japanese SRT and
-`audio.wav`, translates, runs the pair quality gate, upserts Supabase, and verifies
+the old English SRT into `rejected/`, retains it, preserves Japanese SRT and any
+preexisting `audio.wav`, and preserves audio absence when historical cleanup already
+removed it. It translates, runs the pair quality gate, upserts Supabase, and verifies
 Storage SHA-256 plus catalog metadata before marking ready. A quality failure never
 uploads and is permanent. A transient publishing failure returns to
 `transcription_done` under the bounded translation retry counter.
