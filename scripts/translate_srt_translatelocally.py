@@ -107,6 +107,33 @@ def run_translate_locally(
     if not lines:
         return []
 
+    payload = "\n".join(lines) + "\n"
+    try:
+        completed = subprocess.run(
+            [translate_locally, "-m", model],
+            input=payload,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"translateLocally timed out after {timeout_seconds:g} seconds"
+        ) from exc
+    if completed.returncode == 0:
+        translated = completed.stdout.splitlines()
+        if len(translated) != len(lines):
+            raise RuntimeError(
+                "translateLocally changed the number of translated text lines: "
+                f"input={len(lines)} output={len(translated)}"
+            )
+        return translated
+
+    # Older/non-sandboxed builds may require explicit files. The macOS app build
+    # succeeds through stdin/stdout, while its sandbox rejects temporary file paths.
     with TemporaryDirectory(prefix="translatelocally-") as temp_dir:
         temp_path = Path(temp_dir)
         input_path = temp_path / "input.ja.txt"

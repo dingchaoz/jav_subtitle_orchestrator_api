@@ -72,7 +72,7 @@ def _build_windows_transcriber(settings):
 
     if settings.transcribe_script_path:
         return ExternalScriptTranscriber(
-            settings.transcribe_script_path,
+            settings.transcribe_script_path.replace("\\", "/"),
             python_executable=settings.transcribe_python_executable or None,
             model_name=settings.whisper_model,
             device=settings.whisper_device,
@@ -159,6 +159,22 @@ def run_mac_translation_worker() -> None:
     run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
 
 
+def run_plan_historical_repairs(
+    *, allowlist: set[str] | None, limit: int
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+    from orchestrator.subtitle_repair import (
+        plan_historical_repairs,
+        render_repair_report,
+    )
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plans = plan_historical_repairs(store, allowlist=allowlist, limit=limit)
+    print(render_repair_report(plans))
+
+
 def run_windows_worker() -> None:
     from orchestrator.config import WindowsSettings
     from orchestrator.windows_worker import (
@@ -187,6 +203,17 @@ def main() -> None:
     subcommands.add_parser("mac-translation-smoke-test")
     subcommands.add_parser("mac-translation-worker")
     subcommands.add_parser("windows-worker")
+    repair_parser = subcommands.add_parser(
+        "plan-historical-subtitle-repair",
+        help="print a read-only translation-stage repair plan",
+    )
+    repair_parser.add_argument(
+        "--allowlist",
+        nargs="+",
+        metavar="MOVIE_NUMBER",
+        help="only inspect these movie numbers",
+    )
+    repair_parser.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()
 
     configure_logging()
@@ -201,6 +228,11 @@ def main() -> None:
         run_mac_translation_worker()
     elif args.command == "windows-worker":
         run_windows_worker()
+    elif args.command == "plan-historical-subtitle-repair":
+        run_plan_historical_repairs(
+            allowlist=set(args.allowlist) if args.allowlist else None,
+            limit=args.limit,
+        )
 
 
 if __name__ == "__main__":

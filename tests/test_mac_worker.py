@@ -260,6 +260,8 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
     worker = MacTranslationWorker(
         store,
         CollapsedMacTranslator(),
@@ -277,6 +279,7 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
     english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
     assert not english.exists()
     assert len(list((english.parent / "rejected").glob("*.srt"))) == 1
+    assert audio.read_bytes() == b"keep-audio"
     assert '"passed": false' in (
         english.parent / "logs" / "quality.log"
     ).read_text(encoding="utf-8")

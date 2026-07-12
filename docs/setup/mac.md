@@ -67,6 +67,23 @@ python -m orchestrator mac-translation-worker
 
 It claims only `transcription_done`, writes English on the Mac/SMB job path, runs the quality gate, and exposes only passing files as `english_srt_ready`.
 
+## Historical repair planning (dry-run only)
+
+The planner opens the job database read-only and prints intended translation-stage
+actions. It does not move files, change job state, requeue work, or contact Supabase.
+Use an explicit allowlist and a small batch limit:
+
+```bash
+python -m orchestrator plan-historical-subtitle-repair \
+  --allowlist abc-001 abc-002 \
+  --limit 2
+```
+
+Each line identifies the job and movie, preserves the Japanese SRT, names the
+planned `rejected/` quarantine path for the old English SRT, and states whether a
+later authorized repair would requeue or overwrite. There is no apply mode and no
+`force=True` path in this command.
+
 7. Submit a batch:
 
 ```bash

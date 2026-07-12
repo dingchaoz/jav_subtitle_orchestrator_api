@@ -533,6 +533,10 @@ class JobStore:
             )
             if not final_file_exists(str(paths.japanese_srt_path_mac)):
                 raise FileNotFoundError(paths.japanese_srt_path_mac)
+            if paths.japanese_srt_path_mac.stat().st_size == 0:
+                raise FileNotFoundError(
+                    f"final file empty: {paths.japanese_srt_path_mac}"
+                )
             conn.execute(
                 """
                 UPDATE jobs

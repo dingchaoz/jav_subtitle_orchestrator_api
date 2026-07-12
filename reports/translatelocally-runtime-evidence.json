@@ -1,0 +1,60 @@
+{
+  "collected_at": "2026-07-12T06:58:02Z",
+  "git_commit": "88fc7448ae1eb3cfa6f44cae9dbb01028b7f890b",
+  "executable": {
+    "path": "/Applications/translateLocally.app/Contents/MacOS/translateLocally",
+    "version": "translateLocally v0.0.2+136745e",
+    "sha256": "6162768488ba02acf41281d797c28bfc0e230b772f364359ee6876c32177d153"
+  },
+  "model": {
+    "invocation_name": "ja-en-tiny",
+    "directory": "/Users/ytt/Library/Containers/com.translatelocally.translateLocally/Data/.config/translateLocally/jpn-eng",
+    "modelMeta.json": {
+      "modelUrl": "https://object.pouta.csc.fi/HPLT-bitextor-models/jpn-eng.tar.gz",
+      "repositoryUrl": "https://raw.githubusercontent.com/hplt-project/bitextor-mt-models/refs/heads/main/models.json",
+      "installedOn": "2026-07-06T14:31:00"
+    },
+    "model_info.json": {
+      "modelName": "Japanese-English tiny",
+      "shortName": "ja-en-tiny",
+      "type": "tiny",
+      "src": "Japanese",
+      "trg": "English",
+      "srcTags": {"ja": "Japanese"},
+      "trgTag": "en",
+      "repository": "HPLT",
+      "version": 1,
+      "API": 1
+    },
+    "files_sha256": {
+      "config.intgemm8bitalpha.yml": "13517715e260d78af4d960b8ff62f6fd4b227ae3ed0813cff9554b516e30f406",
+      "flores-200.en-ja.bin.translated.en": "a2c991c9a152f142d1150de5bf3b8f7ae1db47f2ad748bc262f0f450c19ed268",
+      "flores-200.en-ja.bin.translated.en.bleu": "4ee1ab34b92f8a2ff71028fa0394759456286bd16215d8a82bbed062db547636",
+      "lex.s2t.bin": "1737cf38eaf184c42fd1df74971e14083a06bd2fa3bf92af54b734e4e111e5de",
+      "model.ja-en.tiny.intgemm.alphas.bin": "5ff87cd55e60f3fc7b6b1f6eb3233ca87bca3caa2c4db54e46b0a0a13720aa9a",
+      "model.ja-en.tiny.npz.best-bleu-detok.npz": "bf4766b5823f928a5c26eba57a9867f1babb4ca3082489b3f37beef1cdc0fa6b",
+      "model.ja-en.tiny.npz.best-bleu-detok.npz.alphas.npz": "ea65321c73f198a73307cef5914577a7d289ead61dc8efd84107febe4ecd56e4",
+      "model.ja-en.tiny.npz.best-bleu-detok.npz.decoder.yml": "e8b10c4902600143b072a563ecd0433fd44b6b3697717024eaeeacaa33e5356e",
+      "model.ja-en.tiny.npz.decoder.yml": "635a1b377429e1fa635f5761bf4535faf9b2fddb3de38426d9758743a91e173a",
+      "model.ja-en.tiny.npz.progress.yml": "d7ca6aafc813d7ae3d55b1a371b793bfbcaa4cbc06a09f18005b567b4c976216",
+      "model.ja-en.tiny.npz.yml": "b461e701c5487d8273c08614eec7a0edf7dc4bed5e84451c84a2cab989a5b14a",
+      "modelMeta.json": "eae95934312441129de2e79dc518482daae774d20bd87e02df6d226b7946e46e",
+      "model_info.json": "b943023f1245da36e6bf5a1894bddc3af10cc06a45cab46d3a700f3f3544bf4f",
+      "newstest2020.ja-en.bin.translated.en": "ca3094463c915fc3e48a83e18a26a0c6ffd1bf1319dc731832cf6d23e25e70d4",
+      "newstest2020.ja-en.bin.translated.en.bleu": "2773e01ca6234de726d204461ea6d40ba925fe0a629b2c8d2effa74d975fba4e",
+      "quantmults": "0232358183aaf698dc1f656db84958c619b67707ccaf05a73392fb788befac9f",
+      "vocab.spm": "9fc6f5db6b532359b1d9fdbd2597b8620ee0b288f03dc24cd5022c20b6b81b9f"
+    }
+  },
+  "smoke_test": {
+    "input_sentence_count": 10,
+    "english_cue_count": 10,
+    "english_unique_ratio": 1.0,
+    "known_bad_phrase_count": 0,
+    "exit_code": 0
+  },
+  "content_policy": {
+    "contains_secrets": false,
+    "contains_subtitle_text": false
+  }
+}

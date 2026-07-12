@@ -296,7 +296,7 @@ def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):
     )
     monkeypatch.chdir(tmp_path)
 
-    settings = MacSettings()
+    settings = MacSettings(_env_file=None)
 
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000

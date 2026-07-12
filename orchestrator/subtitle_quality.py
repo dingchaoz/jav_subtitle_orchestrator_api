@@ -210,7 +210,8 @@ def validate_translation_quality(
         _append_once(reasons, "encoding_corruption")
     if known_bad_count >= 10 and known_bad_ratio >= 0.05:
         _append_once(reasons, "known_bad_collapse")
-    if refusal_count:
+    refusal_ratio = refusal_count / line_count if line_count else 0.0
+    if refusal_count >= 3 and refusal_ratio >= 0.02:
         _append_once(reasons, "refusal_template")
     if (
         len(english_cues) >= 20

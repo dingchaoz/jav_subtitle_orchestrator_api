@@ -73,6 +73,27 @@ def test_translate_process_timeout_is_enforced(monkeypatch):
         )
 
 
+def test_translate_process_prefers_stdio_for_macos_sandbox(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="Hello\n", stderr="")
+
+    monkeypatch.setattr(tl.subprocess, "run", fake_run)
+
+    translated = tl.run_translate_locally(
+        ["こんにちは"],
+        translate_locally="translateLocally",
+        model="ja-en-tiny",
+        timeout_seconds=7,
+    )
+
+    assert translated == ["Hello"]
+    assert calls[0][0] == ["translateLocally", "-m", "ja-en-tiny"]
+    assert calls[0][1]["input"] == "こんにちは\n"
+
+
 def test_failed_later_batch_does_not_replace_existing_final_output(tmp_path, monkeypatch):
     input_srt = make_srt(tmp_path / "sample.Japanese.srt", 51)
     output_srt = tmp_path / "sample.English.srt"

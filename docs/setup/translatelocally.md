@@ -50,6 +50,12 @@ After three consecutive deterministic quality failures, the Mac translation work
 
 Any existing upload/Supabase process must consume only `english_srt_ready`. File existence alone is not a publication signal.
 
+`SupabaseSubtitlePublisher.publish_english_ai()` also validates the Japanese and
+English files immediately before its first network request. Rejected translations
+raise `quality_gate_failed:<reason-codes>` and cannot reach Storage upload. A
+repaired subtitle uses Storage `x-upsert: true` and updates the existing catalog
+row; invoking that publisher still requires explicit operator authorization.
+
 ## Windows warning
 
 The previously installed Windows HPLT `ja-en-tiny` runtime is known to collapse diverse Japanese input into repeated generic English. Do not reconnect it to the Windows worker and do not use its old benchmark output as a quality reference.
