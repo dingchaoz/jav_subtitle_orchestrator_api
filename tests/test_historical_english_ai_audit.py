@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _timestamp(seconds: int) -> str:
@@ -502,9 +503,18 @@ def test_cli_parser_exposes_only_read_only_audit_flags(tmp_path: Path):
 
 def test_cli_refuses_missing_supabase_credentials(monkeypatch, tmp_path: Path):
     from orchestrator.__main__ import run_local_english_ai_audit
+    import orchestrator.config as config
 
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(
+        config,
+        "MacSettings",
+        lambda: SimpleNamespace(
+            supabase_url=None,
+            supabase_service_role_key=None,
+        ),
+    )
 
     with pytest.raises(
         SystemExit, match="SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required"
