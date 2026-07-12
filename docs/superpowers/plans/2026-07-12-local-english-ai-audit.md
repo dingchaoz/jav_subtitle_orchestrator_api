@@ -392,6 +392,8 @@ class AuditSummary:
     skipped: int
     reason_counts: dict[str, int]
     complete: bool
+    bounded: bool
+    catalog_error: str | None
 
 
 class LocalEnglishAiAuditRunner:
@@ -413,7 +415,7 @@ class LocalEnglishAiAuditRunner:
             return _error_row(record, sanitize_error(exc, self.reader.service_key_for_redaction))
 ```
 
-`scan(output_dir, limit=None)` must create the directory with mode `0700`, validate every existing JSONL line against `REPORT_FIELDS`, retain a `subtitle_id -> identity tuple` map, skip only terminal matching identities, and append each new row with `flush()` plus `os.fsync()`. Use at most four threads for object inspection while preserving deterministic catalog/result ordering. Catch per-object errors into sanitized terminal `error` rows; catch catalog traversal failure at the scan boundary and set `complete=false`. After checkpointing, atomically derive CSV, summary JSON, and the sorted unique movie-code allowlist from `hard_failure` rows only. Set `complete=true` only when catalog iteration exhausted and every discovered ID has one terminal row.
+`scan(output_dir, limit=None)` must create the directory with mode `0700`, validate every existing JSONL line against `REPORT_FIELDS`, retain a `subtitle_id -> identity tuple` map, skip only terminal matching identities, and append each new row with `flush()` plus `os.fsync()`. Use at most four threads for object inspection while preserving deterministic catalog/result ordering. Catch per-object errors into sanitized terminal `error` rows; catch catalog traversal failure at the scan boundary, store only its sanitized message in `catalog_error`, and set `complete=false`. After checkpointing, atomically derive CSV, summary JSON, and the sorted unique movie-code allowlist from `hard_failure` rows only. Set `bounded=true` when a non-null limit intentionally stops traversal. Set `complete=true` only when catalog iteration exhausted without a limit or catalog error and every discovered ID has one terminal row.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -480,7 +482,7 @@ audit_parser.add_argument("--workers", type=int, choices=range(1, 5), default=4)
 audit_parser.add_argument("--requests-per-second", type=float, default=2.0)
 ```
 
-Implement `run_local_english_ai_audit(...)` to load `MacSettings`, require both credentials, construct one shared `RequestRateLimiter`, reader, and runner, execute the scan, and print only counts/output paths/resume command. Exit nonzero when `summary.complete` is false. Do not add persistence, apply, force, upload, requeue, or deletion arguments.
+Implement `run_local_english_ai_audit(...)` to load `MacSettings`, require both credentials, construct one shared `RequestRateLimiter`, reader, and runner, execute the scan, and print only counts/output paths/resume command. An intentionally bounded `--limit` run exits zero with `bounded=true` and `complete=false`; exit nonzero only when `summary.catalog_error` is non-null or local setup/report validation raises. Do not add persistence, apply, force, upload, requeue, or deletion arguments.
 
 Add these settings:
 
@@ -555,7 +557,7 @@ Expected: exit 0; exactly one terminal JSONL row; no subtitle text or key in any
 Run:
 
 ```bash
-jq '{discovered, passed, hard_failure, errors, skipped, reason_counts, complete}' \
+jq '{discovered, passed, hard_failure, errors, skipped, reason_counts, complete, bounded, catalog_error}' \
   reports/subtitle-audit/english-ai-local-20260712/audit-summary.json
 ```
 
