@@ -192,6 +192,7 @@ class JobDetailResponse(BaseModel):
     priority: int
     attempt_count: int
     worker_attempt_count: int
+    translation_attempt_count: int
     claimed_by: str | None = None
     lease_expires_at: str | None = None
     created_at: str

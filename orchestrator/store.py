@@ -23,6 +23,7 @@ class JobRecord:
     priority: int
     attempt_count: int
     worker_attempt_count: int
+    translation_attempt_count: int
     claimed_by: str | None
     lease_expires_at: str | None
     created_at: str
@@ -101,6 +102,7 @@ class JobStore:
                   priority INTEGER NOT NULL DEFAULT 100,
                   attempt_count INTEGER NOT NULL DEFAULT 0,
                   worker_attempt_count INTEGER NOT NULL DEFAULT 0,
+                  translation_attempt_count INTEGER NOT NULL DEFAULT 0,
                   claimed_by TEXT,
                   lease_expires_at TEXT,
                   created_at TEXT NOT NULL,
@@ -118,6 +120,15 @@ class JobStore:
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "translation_attempt_count" not in columns:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN translation_attempt_count "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created "
                 "ON jobs(status, priority, created_at)"
@@ -160,14 +171,15 @@ class JobStore:
                 """
                 INSERT INTO jobs (
                   id, movie_number, normalized_movie_number, status, priority,
-                  attempt_count, worker_attempt_count, claimed_by, lease_expires_at,
+                  attempt_count, worker_attempt_count, translation_attempt_count,
+                  claimed_by, lease_expires_at,
                   created_at, updated_at, error, job_dir_mac, job_dir_windows,
                   metadata_path_mac, audio_path_mac, audio_path_windows,
                   japanese_srt_path_mac, japanese_srt_path_windows,
                   english_srt_path_mac, english_srt_path_windows
                 )
                 VALUES (
-                  ?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, ?, NULL, ?, ?,
+                  ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL, ?, ?, NULL, ?, ?,
                   NULL, NULL, NULL, NULL, NULL, NULL, NULL
                 )
                 """,
@@ -733,6 +745,77 @@ class JobStore:
             )
             return self.get_job(row["id"], conn=conn)
 
+    def claim_translation_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> JobRecord | None:
+        now = utc_now_iso()
+        lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
+            microsecond=0
+        ).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                """,
+                (
+                    JobStatus.TRANSLATING.value,
+                    worker_id,
+                    lease,
+                    now,
+                    job_id,
+                    JobStatus.TRANSCRIPTION_DONE.value,
+                ),
+            )
+            return (
+                self.get_job(job_id, conn=conn)
+                if cursor.rowcount == 1
+                else None
+            )
+
+    def prepare_historical_translation_repair(
+        self,
+        job_id: str,
+        *,
+        expected_status: JobStatus,
+    ) -> JobRecord:
+        if expected_status not in {
+            JobStatus.QUEUED,
+            JobStatus.FAILED,
+            JobStatus.ENGLISH_SRT_READY,
+        }:
+            raise ValueError("historical repair status is not eligible")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    translation_attempt_count = 0, updated_at = ?, error = NULL,
+                    english_srt_path_mac = NULL, english_srt_path_windows = NULL
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                """,
+                (
+                    JobStatus.TRANSCRIPTION_DONE.value,
+                    now,
+                    job_id,
+                    expected_status.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "historical repair state changed before prepare"
+                )
+            prepared = self.get_job(job_id, conn=conn)
+            assert prepared is not None
+            return prepared
+
     def complete_mac_translation(
         self,
         job_id: str,
@@ -792,7 +875,7 @@ class JobStore:
                 raise KeyError(job_id)
             if job.claimed_by != worker_id:
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
-            attempts = job.worker_attempt_count + 1
+            attempts = job.translation_attempt_count + 1
             next_status = (
                 JobStatus.FAILED
                 if permanent or attempts >= max_translation_attempts
@@ -801,7 +884,7 @@ class JobStore:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                SET status = ?, translation_attempt_count = ?, claimed_by = NULL,
                     lease_expires_at = NULL, updated_at = ?, error = ?
                 WHERE id = ? AND claimed_by = ?
                 """,
@@ -832,7 +915,7 @@ class JobStore:
                 (JobStatus.TRANSLATING.value, now),
             ).fetchall()
             for row in rows:
-                attempts = row["worker_attempt_count"] + 1
+                attempts = row["translation_attempt_count"] + 1
                 next_status = (
                     JobStatus.FAILED
                     if attempts >= max_translation_attempts
@@ -841,7 +924,7 @@ class JobStore:
                 conn.execute(
                     """
                     UPDATE jobs
-                    SET status = ?, worker_attempt_count = ?, claimed_by = NULL,
+                    SET status = ?, translation_attempt_count = ?, claimed_by = NULL,
                         lease_expires_at = NULL, updated_at = ?, error = ?
                     WHERE id = ?
                     """,
@@ -996,7 +1079,8 @@ class JobStore:
             """
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
-                error = NULL, metadata_path_mac = NULL, audio_path_mac = NULL,
+                error = NULL, translation_attempt_count = 0,
+                metadata_path_mac = NULL, audio_path_mac = NULL,
                 audio_path_windows = NULL, japanese_srt_path_mac = NULL,
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
@@ -1020,6 +1104,7 @@ class JobStore:
             priority=row["priority"],
             attempt_count=row["attempt_count"],
             worker_attempt_count=row["worker_attempt_count"],
+            translation_attempt_count=row["translation_attempt_count"],
             claimed_by=row["claimed_by"],
             lease_expires_at=row["lease_expires_at"],
             created_at=row["created_at"],

@@ -107,6 +107,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
         sqlite_path,
         created.job.id,
         status=JobStatus.FAILED.value,
+        translation_attempt_count=2,
         claimed_by="worker-1",
         lease_expires_at="2026-07-04T12:00:00+00:00",
         error="transcription failed",
@@ -127,6 +128,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
     assert result.job.claimed_by is None
     assert result.job.lease_expires_at is None
     assert result.job.error is None
+    assert result.job.translation_attempt_count == 0
     assert result.job.metadata_path_mac is None
     assert result.job.audio_path_mac is None
     assert result.job.audio_path_windows is None

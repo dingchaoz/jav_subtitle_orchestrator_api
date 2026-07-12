@@ -52,6 +52,16 @@ class MacSettings(BaseSettings):
         ge=1,
         alias="TRANSLATION_QUALITY_FAILURE_LIMIT",
     )
+    mac_translation_publish_enabled: bool = Field(
+        default=False,
+        alias="MAC_TRANSLATION_PUBLISH_ENABLED",
+    )
+    supabase_publish_verify_timeout_seconds: int = Field(
+        default=90,
+        ge=60,
+        le=300,
+        alias="SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS",
+    )
     supabase_url: str | None = Field(default=None, alias="SUPABASE_URL")
     supabase_service_role_key: str | None = Field(
         default=None,

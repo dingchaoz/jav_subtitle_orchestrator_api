@@ -5,7 +5,9 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
-from orchestrator.__main__ import _build_windows_transcriber
+import pytest
+
+from orchestrator.__main__ import _build_windows_transcriber, build_supabase_publisher
 from orchestrator.config import MacSettings, WindowsSettings
 from orchestrator.paths import build_job_paths, normalize_movie_number
 from orchestrator.transcription import ExternalScriptTranscriber, FasterWhisperTranscriber
@@ -22,6 +24,8 @@ MAC_ENV_ALIASES = (
     "WORKER_LEASE_SECONDS",
     "MAX_DOWNLOAD_ATTEMPTS",
     "MAX_WORKER_ATTEMPTS",
+    "MAC_TRANSLATION_PUBLISH_ENABLED",
+    "SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -220,6 +224,23 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.worker_lease_seconds == 1800
     assert settings.max_download_attempts == 3
     assert settings.max_worker_attempts == 3
+    assert settings.mac_translation_publish_enabled is False
+    assert settings.supabase_publish_verify_timeout_seconds == 90
+
+
+def test_supabase_publisher_factory_requires_credentials_when_enabled():
+    disabled = SimpleNamespace(mac_translation_publish_enabled=False)
+    assert build_supabase_publisher(disabled) is None
+
+    enabled = SimpleNamespace(
+        mac_translation_publish_enabled=True,
+        supabase_url=None,
+        supabase_service_role_key=None,
+        supabase_subtitle_bucket="subtitles",
+        supabase_publish_verify_timeout_seconds=90,
+    )
+    with pytest.raises(RuntimeError, match="publication is enabled"):
+        build_supabase_publisher(enabled)
 
 
 def test_windows_settings_defaults_match_design_spec(monkeypatch):

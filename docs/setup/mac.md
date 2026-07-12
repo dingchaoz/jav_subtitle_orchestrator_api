@@ -127,6 +127,53 @@ metrics, and SHA-256 values, but no subtitle text or service key.
 later canary decision, not authorization to translate, quarantine, upload,
 overwrite, or requeue anything.
 
+## One-job historical repair canary
+
+Enable verified server-side publication only on the production Mac:
+
+```text
+MAC_TRANSLATION_PUBLISH_ENABLED=true
+SUPABASE_SUBTITLE_BUCKET=subtitles
+SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
+```
+
+Keep the Supabase service key server-side. Stop the general translation worker and
+run the startup smoke before selecting or preparing a canary. Select exactly one
+eligible job from the audit allowlist:
+
+```bash
+python -m orchestrator select-historical-repair-canary \
+  --allowlist-file reports/subtitle-audit/english-ai-local-20260712/repair-allowlist.txt \
+  --preferred-movie abf-279 \
+  --output reports/subtitle-audit/english-ai-local-20260712/canary-selection.json
+```
+
+Read the sanitized JSON, then bind prepare to its exact movie and job ID:
+
+```bash
+SELECTION=reports/subtitle-audit/english-ai-local-20260712/canary-selection.json
+JOB_ID=$(jq -r .job_id "$SELECTION")
+MOVIE=$(jq -r .movie_number "$SELECTION")
+python -m orchestrator prepare-historical-repair-canary \
+  --allowlist-file reports/subtitle-audit/english-ai-local-20260712/repair-allowlist.txt \
+  --movie "$MOVIE" \
+  --limit 1 \
+  --confirm-job-id "$JOB_ID"
+python -m orchestrator mac-translation-worker-once --job-id "$JOB_ID"
+```
+
+The one-shot worker runs startup smoke and can claim only that exact ID. It moves
+the old English SRT into `rejected/`, retains it, preserves Japanese SRT and
+`audio.wav`, translates, runs the pair quality gate, upserts Supabase, and verifies
+Storage SHA-256 plus catalog metadata before marking ready. A quality failure never
+uploads and is permanent. A transient publishing failure returns to
+`transcription_done` under the bounded translation retry counter.
+
+After local, Supabase, CDN, and `https://javsubtitle.com` verification succeeds,
+restart the normal `mac-translation-worker`. This procedure authorizes one canary
+only. Do not prepare another historical job or begin a five-to-ten-job batch without
+new approval.
+
 7. Submit a batch:
 
 ```bash
