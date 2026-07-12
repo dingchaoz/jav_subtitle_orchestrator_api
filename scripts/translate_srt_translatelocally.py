@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -19,11 +20,19 @@ DEFAULT_BATCH_LINES = 50
 DEFAULT_BATCH_CHARS = 4000
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_RETRIES = 1
+REPLACEMENT_CHARACTER = "\ufffd"
 TRANSLATELOCALLY_CANDIDATES = [
     r"C:\Users\dingc\AppData\Local\Programs\TranslateLocally\translateLocally.exe",
     r"C:\Program Files\translateLocally\translateLocally.exe",
     r"C:\Program Files\TranslateLocally\translateLocally.exe",
 ]
+
+
+@dataclass(frozen=True)
+class SanitizedTranslationInput:
+    lines: tuple[str, ...]
+    replacement_character_count: int
+    sanitized_line_count: int
 
 
 def detect_newline(text: str) -> str:
@@ -95,6 +104,29 @@ def collect_text_line_indexes(lines: list[str]) -> list[int]:
             indexes.append(index)
         block_line_index += 1
     return indexes
+
+
+def sanitize_translation_input(lines: list[str]) -> SanitizedTranslationInput:
+    sanitized: list[str] = []
+    replacement_count = 0
+    sanitized_line_count = 0
+    for line_number, line in enumerate(lines, start=1):
+        line_replacement_count = line.count(REPLACEMENT_CHARACTER)
+        cleaned = line.replace(REPLACEMENT_CHARACTER, "")
+        if line.strip() and not cleaned.strip():
+            raise ValueError(
+                "translation_input_corrupt: "
+                f"line {line_number} empty after removing replacement characters"
+            )
+        if line_replacement_count:
+            sanitized_line_count += 1
+            replacement_count += line_replacement_count
+        sanitized.append(cleaned)
+    return SanitizedTranslationInput(
+        lines=tuple(sanitized),
+        replacement_character_count=replacement_count,
+        sanitized_line_count=sanitized_line_count,
+    )
 
 
 def run_translate_locally(
@@ -292,29 +324,40 @@ def translate_srt(
     retries: int = DEFAULT_RETRIES,
     batch_log_path: Path | None = None,
 ) -> None:
-    translate_locally = find_translate_locally(translate_locally_path)
-    selected_model = model or os.environ.get("TRANSLATELOCALLY_MODEL") or DEFAULT_MODEL
-    ensure_model_available(translate_locally, selected_model)
-
     source = input_srt.read_bytes().decode("utf-8-sig")
     newline = detect_newline(source)
     lines = source.splitlines()
     text_indexes = collect_text_line_indexes(lines)
     source_text = [lines[index] for index in text_indexes]
+    sanitized_input = sanitize_translation_input(source_text)
+    effective_batch_log_path = batch_log_path or (
+        Path(os.environ["TRANSLATE_BATCH_LOG_PATH"])
+        if os.environ.get("TRANSLATE_BATCH_LOG_PATH")
+        else None
+    )
+    _append_batch_log(
+        effective_batch_log_path,
+        {
+            "event": "input_sanitization",
+            "input_replacement_character_count": (
+                sanitized_input.replacement_character_count
+            ),
+            "sanitized_input_line_count": sanitized_input.sanitized_line_count,
+        },
+    )
+
+    translate_locally = find_translate_locally(translate_locally_path)
+    selected_model = model or os.environ.get("TRANSLATELOCALLY_MODEL") or DEFAULT_MODEL
+    ensure_model_available(translate_locally, selected_model)
     translated_text = run_translate_locally_batched(
-        source_text,
+        list(sanitized_input.lines),
         translate_locally=translate_locally,
         model=selected_model,
         batch_lines=batch_lines,
         batch_chars=batch_chars,
         timeout_seconds=timeout_seconds,
         retries=retries,
-        batch_log_path=batch_log_path
-        or (
-            Path(os.environ["TRANSLATE_BATCH_LOG_PATH"])
-            if os.environ.get("TRANSLATE_BATCH_LOG_PATH")
-            else None
-        ),
+        batch_log_path=effective_batch_log_path,
     )
 
     output_lines = list(lines)

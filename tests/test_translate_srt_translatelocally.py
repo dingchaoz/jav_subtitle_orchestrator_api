@@ -145,3 +145,103 @@ def test_batch_log_contains_statistics_not_subtitle_text(tmp_path, monkeypatch):
     assert '"input_character_count": 40' in text
     assert '"output_line_count": 1' in text
     assert secret_line not in text
+
+
+def test_sanitize_translation_input_removes_only_replacement_characters():
+    result = tl.sanitize_translation_input(
+        ["前\ufffd後", "unchanged punctuation!?", "normal"]
+    )
+
+    assert result.lines == ("前後", "unchanged punctuation!?", "normal")
+    assert result.replacement_character_count == 1
+    assert result.sanitized_line_count == 1
+
+
+def test_sanitize_translation_input_rejects_line_empty_after_removal():
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"translation_input_corrupt: line 2 empty after removing "
+            r"replacement characters"
+        ),
+    ):
+        tl.sanitize_translation_input(["normal", "\ufffd\ufffd"])
+
+
+def test_translate_srt_sanitizes_model_input_preserves_source_and_logs_counts(
+    tmp_path, monkeypatch
+):
+    input_srt = tmp_path / "safe.Japanese.srt"
+    source_bytes = (
+        "1\n00:00:00,000 --> 00:00:01,000\n"
+        "safe-test-before\ufffdsafe-test-after\n\n"
+    ).encode("utf-8")
+    input_srt.write_bytes(source_bytes)
+    output_srt = tmp_path / "safe.English.srt"
+    batch_log = tmp_path / "logs" / "translate-batches.log"
+    observed_lines: list[list[str]] = []
+
+    monkeypatch.setattr(tl, "ensure_model_available", lambda *args: None)
+
+    def fake_run(lines, **kwargs):
+        observed_lines.append(list(lines))
+        return ["clean English"] * len(lines)
+
+    monkeypatch.setattr(tl, "run_translate_locally", fake_run)
+
+    tl.translate_srt(
+        input_srt,
+        output_srt,
+        translate_locally_path=sys.executable,
+        model="ja-en-tiny",
+        batch_log_path=batch_log,
+    )
+
+    assert observed_lines == [["safe-test-beforesafe-test-after"]]
+    assert input_srt.read_bytes() == source_bytes
+    assert "\ufffd" not in output_srt.read_text(encoding="utf-8")
+    log_text = batch_log.read_text(encoding="utf-8")
+    assert '"event": "input_sanitization"' in log_text
+    assert '"input_replacement_character_count": 1' in log_text
+    assert '"sanitized_input_line_count": 1' in log_text
+    assert "safe-test-before" not in log_text
+    assert "safe-test-after" not in log_text
+
+
+def test_translate_srt_rejects_empty_sanitized_line_before_model(
+    tmp_path, monkeypatch
+):
+    input_srt = tmp_path / "safe.Japanese.srt"
+    source_bytes = (
+        "1\n00:00:00,000 --> 00:00:01,000\n\ufffd\ufffd\n\n"
+    ).encode("utf-8")
+    input_srt.write_bytes(source_bytes)
+    output_srt = tmp_path / "safe.English.srt"
+    model_checked = False
+    model_called = False
+
+    def fake_ensure_model_available(*args):
+        nonlocal model_checked
+        model_checked = True
+
+    monkeypatch.setattr(tl, "ensure_model_available", fake_ensure_model_available)
+
+    def fake_run(lines, **kwargs):
+        nonlocal model_called
+        model_called = True
+        return ["unexpected"] * len(lines)
+
+    monkeypatch.setattr(tl, "run_translate_locally", fake_run)
+
+    with pytest.raises(ValueError, match="translation_input_corrupt"):
+        tl.translate_srt(
+            input_srt,
+            output_srt,
+            translate_locally_path=sys.executable,
+            model="ja-en-tiny",
+        )
+
+    assert model_checked is False
+    assert model_called is False
+    assert input_srt.read_bytes() == source_bytes
+    assert not output_srt.exists()
