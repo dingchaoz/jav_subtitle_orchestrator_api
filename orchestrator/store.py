@@ -1079,7 +1079,8 @@ class JobStore:
             """
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
-                error = NULL, metadata_path_mac = NULL, audio_path_mac = NULL,
+                error = NULL, translation_attempt_count = 0,
+                metadata_path_mac = NULL, audio_path_mac = NULL,
                 audio_path_windows = NULL, japanese_srt_path_mac = NULL,
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
