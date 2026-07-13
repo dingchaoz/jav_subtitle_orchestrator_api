@@ -742,6 +742,7 @@ class JobStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("audio_recovery_state_changed")
+            audio_snapshot_check()
             finalized = self.get_job(job_id, conn=conn)
             assert finalized is not None
             return finalized
@@ -841,38 +842,6 @@ class JobStore:
                 ),
             ).fetchall()
             for row in rows:
-                job = self._row_to_job(row)
-                paths = build_job_paths(
-                    job.normalized_movie_number,
-                    self.jobs_root_mac,
-                    self.jobs_root_windows,
-                )
-                if (
-                    job.status == JobStatus.DOWNLOADING_AUDIO
-                    and paths.audio_path_mac.exists()
-                ):
-                    metadata_path_mac = (
-                        str(paths.metadata_path_mac) if paths.metadata_path_mac.exists() else None
-                    )
-                    conn.execute(
-                        """
-                        UPDATE jobs
-                        SET status = ?, updated_at = ?, error = NULL,
-                            metadata_path_mac = COALESCE(?, metadata_path_mac),
-                            audio_path_mac = ?, audio_path_windows = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            JobStatus.AUDIO_READY.value,
-                            now,
-                            metadata_path_mac,
-                            str(paths.audio_path_mac),
-                            paths.audio_path_windows,
-                            row["id"],
-                        ),
-                    )
-                    recovered += 1
-                    continue
                 attempts = row["attempt_count"] + 1
                 next_status = (
                     JobStatus.FAILED if attempts >= max_download_attempts else JobStatus.QUEUED

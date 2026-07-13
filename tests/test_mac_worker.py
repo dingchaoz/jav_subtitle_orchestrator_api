@@ -41,6 +41,15 @@ class FailingMissAVAdapter:
         raise AssertionError("audio should not run after metadata failure")
 
 
+class AudioOSErrorAdapter:
+    def download_metadata(self, movie_number: str, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("{}\n", encoding="utf-8")
+
+    def download_audio(self, movie_number: str, output_path: Path) -> None:
+        raise OSError("audio disk full")
+
+
 def test_mac_worker_processes_one_queued_job_to_audio_ready(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -121,7 +130,7 @@ def test_mac_worker_recovers_interrupted_download_before_claiming_next_job(
     assert Path(refreshed.audio_path_mac).exists()
 
 
-def test_mac_worker_promotes_stale_downloading_audio_when_audio_file_already_exists(
+def test_mac_worker_redownloads_stale_unverified_audio_before_marking_ready(
     sqlite_path,
     mac_jobs_root,
 ):
@@ -137,16 +146,61 @@ def test_mac_worker_promotes_stale_downloading_audio_when_audio_file_already_exi
     )
     audio_path = mac_jobs_root / "ktb-112" / "audio.wav"
     audio_path.parent.mkdir(parents=True, exist_ok=True)
-    audio_path.write_bytes(b"RIFFfakeWAVE")
+    audio_path.write_bytes(b"unverified stale audio")
     worker = MacDownloadWorker(store, FakeMissAVAdapter(), max_download_attempts=3)
 
-    assert worker.process_one() is False
+    assert worker.process_one() is True
 
     refreshed = store.get_job(job.id)
     assert refreshed.status == JobStatus.AUDIO_READY
+    assert refreshed.attempt_count == 1
     assert refreshed.audio_path_mac == str(audio_path)
     assert refreshed.audio_path_windows == "M:\\ktb-112\\audio.wav"
     assert refreshed.error is None
+    assert audio_path.read_bytes() == b"RIFFfakeWAVE"
+
+
+def test_interrupted_download_sweep_never_promotes_unverified_final(
+    sqlite_path,
+    mac_jobs_root,
+):
+    from orchestrator.audio_lock import exclusive_audio_job_lock
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-113", priority=100, force=False).job
+    store.update_download_status(job.id, JobStatus.DOWNLOADING_AUDIO)
+    audio_path = mac_jobs_root / "ktb-113" / "audio.wav"
+    audio_path.parent.mkdir(parents=True)
+    audio_path.write_bytes(b"not a validated wav")
+
+    with exclusive_audio_job_lock(
+        mac_jobs_root,
+        "ktb-113",
+        blocking=True,
+    ):
+        assert store.recover_interrupted_downloads(3) == 1
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.QUEUED
+    assert refreshed.attempt_count == 1
+    assert refreshed.error == "download interrupted"
+
+
+def test_mac_worker_preserves_audio_writer_oserror(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-114", priority=100, force=False).job
+    worker = MacDownloadWorker(store, AudioOSErrorAdapter(), max_download_attempts=3)
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.QUEUED
+    assert refreshed.error == "audio disk full"
 
 
 def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root):

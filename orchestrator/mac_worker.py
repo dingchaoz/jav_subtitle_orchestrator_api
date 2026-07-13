@@ -4,6 +4,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from orchestrator.audio_lock import exclusive_audio_job_lock
 from orchestrator.job_logs import append_job_log
 from orchestrator.job_snapshot import write_job_snapshot
 from orchestrator.models import JobStatus
@@ -99,14 +100,22 @@ class MacDownloadWorker:
             "mac-download.log",
             f"downloading_audio {job.normalized_movie_number}",
         )
-        self.adapter.download_audio(job.normalized_movie_number, paths.audio_path_mac)
-        updated = self.store.update_download_status(
-            job.id,
-            JobStatus.AUDIO_READY,
-            metadata_path_mac=str(paths.metadata_path_mac),
-            audio_path_mac=str(paths.audio_path_mac),
-            audio_path_windows=paths.audio_path_windows,
-        )
+        with exclusive_audio_job_lock(
+            self.store.jobs_root_mac,
+            job.normalized_movie_number,
+            blocking=True,
+        ):
+            self.adapter.download_audio(
+                job.normalized_movie_number,
+                paths.audio_path_mac,
+            )
+            updated = self.store.update_download_status(
+                job.id,
+                JobStatus.AUDIO_READY,
+                metadata_path_mac=str(paths.metadata_path_mac),
+                audio_path_mac=str(paths.audio_path_mac),
+                audio_path_windows=paths.audio_path_windows,
+            )
         write_job_snapshot(updated)
         _append_job_log_safely(
             paths.job_dir_mac,

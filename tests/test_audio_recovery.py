@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import struct
+import threading
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ import pytest
 from orchestrator.audio_recovery import (
     AudioRecoveryError,
     recover_interrupted_audio,
+    validate_pcm_wav,
 )
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
@@ -300,6 +304,169 @@ def test_post_validation_final_replacement_cannot_be_marked_audio_ready(
     assert not replacement.exists()
 
 
+def test_replacement_after_preupdate_snapshot_check_rolls_back_cas(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job, paths, _staged, digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    replacement = tmp_path / "replacement-after-check.wav"
+    replacement.write_bytes(b"replacement after preupdate check")
+    replacement_digest = hashlib.sha256(replacement.read_bytes()).hexdigest()
+    original_finalize = store.finalize_interrupted_audio
+    snapshot_checks = 0
+
+    def finalize_with_replacement_after_first_check(job_id: str, **kwargs):
+        original_check = kwargs["audio_snapshot_check"]
+
+        def replace_after_check() -> None:
+            nonlocal snapshot_checks
+            snapshot_checks += 1
+            original_check()
+            if snapshot_checks == 1:
+                os.replace(replacement, paths.audio_path_mac)
+
+        kwargs["audio_snapshot_check"] = replace_after_check
+        return original_finalize(job_id, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "finalize_interrupted_audio",
+        finalize_with_replacement_after_first_check,
+    )
+
+    with pytest.raises(
+        AudioRecoveryError,
+        match="^audio_recovery_state_changed$",
+    ):
+        recover_interrupted_audio(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=digest,
+        )
+
+    assert snapshot_checks == 2
+    assert store.get_job(job.id).status is JobStatus.DOWNLOADING_AUDIO
+    assert hashlib.sha256(paths.audio_path_mac.read_bytes()).hexdigest() == (
+        replacement_digest
+    )
+
+
+def test_recovery_fails_safe_when_internal_audio_writer_holds_lock(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+) -> None:
+    from orchestrator.audio_lock import exclusive_audio_job_lock
+
+    store, job, _paths, _staged, digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+
+    with exclusive_audio_job_lock(
+        mac_jobs_root,
+        "abc-001",
+        blocking=True,
+    ):
+        with pytest.raises(AudioRecoveryError, match="^audio_recovery_busy$"):
+            recover_interrupted_audio(
+                store,
+                job_id=job.id,
+                movie="abc-001",
+                expected_sha256=digest,
+            )
+
+    assert store.get_job(job.id).status is JobStatus.DOWNLOADING_AUDIO
+
+
+def test_internal_audio_writer_waits_until_recovery_commit(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from orchestrator.audio_lock import exclusive_audio_job_lock
+    from orchestrator.mac_worker import MacDownloadWorker
+
+    store, job, paths, _staged, digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    writer_attempting_lock = threading.Event()
+    writer_entered_audio = threading.Event()
+    writer_errors: list[BaseException] = []
+    writer_payload = b"internal writer replacement"
+
+    class ConcurrentAdapter:
+        def download_metadata(self, _movie: str, output_path: Path) -> None:
+            output_path.write_text("{}\n", encoding="utf-8")
+
+        def download_audio(self, _movie: str, output_path: Path) -> None:
+            writer_entered_audio.set()
+            temporary = output_path.with_name("writer-audio.tmp")
+            temporary.write_bytes(writer_payload)
+            os.replace(temporary, output_path)
+
+    worker = MacDownloadWorker(store, ConcurrentAdapter(), max_download_attempts=3)
+    original_finalize = store.finalize_interrupted_audio
+
+    @contextmanager
+    def observed_worker_lock(root: Path, movie: str, *, blocking: bool):
+        writer_attempting_lock.set()
+        with exclusive_audio_job_lock(root, movie, blocking=blocking) as held:
+            yield held
+
+    monkeypatch.setattr(
+        "orchestrator.mac_worker.exclusive_audio_job_lock",
+        observed_worker_lock,
+        raising=False,
+    )
+
+    writer_thread: threading.Thread | None = None
+
+    def run_writer() -> None:
+        try:
+            worker._process_job(job)
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    def finalize_while_writer_waits(job_id: str, **kwargs):
+        nonlocal writer_thread
+        writer_thread = threading.Thread(target=run_writer)
+        writer_thread.start()
+        assert writer_attempting_lock.wait(timeout=2)
+        assert not writer_entered_audio.wait(timeout=0.1)
+        finalized = original_finalize(job_id, **kwargs)
+        assert not writer_entered_audio.is_set()
+        return finalized
+
+    monkeypatch.setattr(
+        store,
+        "finalize_interrupted_audio",
+        finalize_while_writer_waits,
+    )
+
+    receipt = recover_interrupted_audio(
+        store,
+        job_id=job.id,
+        movie="abc-001",
+        expected_sha256=digest,
+    )
+
+    assert receipt.status is JobStatus.AUDIO_READY
+    assert writer_entered_audio.wait(timeout=2)
+    assert writer_thread is not None
+    writer_thread.join(timeout=2)
+    assert not writer_thread.is_alive()
+    assert writer_errors == []
+    refreshed = store.get_job(job.id)
+    assert refreshed is not None
+    assert refreshed.status is JobStatus.AUDIO_READY
+    assert refreshed.audio_path_mac == str(paths.audio_path_mac)
+    assert paths.audio_path_mac.read_bytes() == writer_payload
+
+
 def test_audio_directory_symlink_loop_is_a_safe_unchanging_error(
     sqlite_path: Path,
     mac_jobs_root: Path,
@@ -323,6 +490,53 @@ def test_audio_directory_symlink_loop_is_a_safe_unchanging_error(
     assert store.get_job(job.id) == before
     assert staged.parent.is_symlink()
     assert not paths.audio_path_mac.exists()
+
+
+def test_job_directory_swap_after_validation_never_moves_external_staged_file(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job, paths, staged, digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    external_job = tmp_path / "external-job"
+    external_audio = external_job / "audio"
+    external_audio.mkdir(parents=True)
+    external_staged = external_audio / staged.name
+    os.link(staged, external_staged)
+    renamed_job = tmp_path / "held-original-job"
+    original_validate = validate_pcm_wav
+    swapped = False
+
+    def validate_then_swap(path: Path, **kwargs):
+        nonlocal swapped
+        validated = original_validate(path, **kwargs)
+        if not swapped and path.name == staged.name:
+            swapped = True
+            os.rename(paths.job_dir_mac, renamed_job)
+            paths.job_dir_mac.symlink_to(external_job, target_is_directory=True)
+        return validated
+
+    monkeypatch.setattr(
+        "orchestrator.audio_recovery.validate_pcm_wav",
+        validate_then_swap,
+    )
+
+    with pytest.raises(AudioRecoveryError, match="^job_path_mismatch$"):
+        recover_interrupted_audio(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=digest,
+        )
+
+    assert swapped is True
+    assert external_staged.is_file()
+    assert not (external_job / "audio.wav").exists()
+    assert (renamed_job / "audio" / staged.name).is_file()
+    assert store.get_job(job.id).status is JobStatus.DOWNLOADING_AUDIO
 
 
 def test_pcm_validation_reads_frame_payload_in_bounded_chunks(
@@ -492,6 +706,31 @@ def test_noncanonical_pcm_wav_is_rejected_without_changes(
     before = _snapshot(store, job.id, mac_jobs_root)
 
     with pytest.raises(AudioRecoveryError):
+        recover_interrupted_audio(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=digest,
+        )
+
+    assert _snapshot(store, job.id, mac_jobs_root) == before
+
+
+def test_truncated_trailing_riff_chunk_is_rejected_without_changes(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+) -> None:
+    store, job, _paths, staged, _digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    payload = bytearray(staged.read_bytes())
+    payload.extend(b"JUNK" + struct.pack("<I", 4) + b"xx")
+    payload[4:8] = struct.pack("<I", len(payload) - 8)
+    staged.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    before = _snapshot(store, job.id, mac_jobs_root)
+
+    with pytest.raises(AudioRecoveryError, match="^invalid_pcm_wav$"):
         recover_interrupted_audio(
             store,
             job_id=job.id,
