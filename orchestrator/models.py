@@ -51,6 +51,8 @@ class JobStatus(StrEnum):
     TRANSLATING = "translating"
     PUBLISH_PENDING = "publish_pending"
     PUBLISHING = "publishing"
+    CATALOG_SYNC_PENDING = "catalog_sync_pending"
+    CATALOG_SYNCING = "catalog_syncing"
     ENGLISH_SRT_READY = "english_srt_ready"
     FAILED = "failed"
     CANCELLED = "cancelled"

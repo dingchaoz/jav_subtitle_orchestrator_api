@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -175,6 +176,34 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+class HistoricalRepairState(StrEnum):
+    PLANNED = "planned"
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    PERMANENT_FAILED = "permanent_failed"
+    PAUSED = "paused"
+
+
+@dataclass(frozen=True)
+class HistoricalRepairRecord:
+    id: str
+    batch_id: str
+    job_id: str
+    movie_code: str
+    allowlist_sha256: str
+    state: HistoricalRepairState
+    attempt_count: int
+    next_attempt_at: str | None
+    reason_code: str | None
+    japanese_sha256: str
+    audio_sha256: str | None
+    english_sha256: str | None
+    created_at: str
+    updated_at: str
+
+
 @dataclass(frozen=True)
 class JobRecord:
     id: str
@@ -187,6 +216,13 @@ class JobRecord:
     translation_attempt_count: int
     publish_attempt_count: int
     next_publish_attempt_at: str | None
+    translation_origin: str
+    published_subtitle_id: str | None
+    published_storage_path: str | None
+    published_content_sha256: str | None
+    published_file_size: int | None
+    catalog_sync_attempt_count: int
+    next_catalog_sync_attempt_at: str | None
     catalog_movie_uuid: str | None
     metadata_status: str | None
     metadata_source: str | None
@@ -271,6 +307,13 @@ class JobStore:
                   translation_attempt_count INTEGER NOT NULL DEFAULT 0,
                   publish_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_publish_attempt_at TEXT,
+                  translation_origin TEXT NOT NULL DEFAULT 'normal',
+                  published_subtitle_id TEXT,
+                  published_storage_path TEXT,
+                  published_content_sha256 TEXT,
+                  published_file_size INTEGER,
+                  catalog_sync_attempt_count INTEGER NOT NULL DEFAULT 0,
+                  next_catalog_sync_attempt_at TEXT,
                   catalog_movie_uuid TEXT,
                   metadata_status TEXT,
                   metadata_source TEXT,
@@ -310,6 +353,18 @@ class JobStore:
             for column, definition in publication_columns.items():
                 if column not in columns:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+            durable_state_columns = {
+                "translation_origin": "TEXT NOT NULL DEFAULT 'normal'",
+                "published_subtitle_id": "TEXT",
+                "published_storage_path": "TEXT",
+                "published_content_sha256": "TEXT",
+                "published_file_size": "INTEGER",
+                "catalog_sync_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "next_catalog_sync_attempt_at": "TEXT",
+            }
+            for column, definition in durable_state_columns.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created "
                 "ON jobs(status, priority, created_at)"
@@ -330,6 +385,31 @@ class JobStore:
                   last_error TEXT
                 )
                 """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS historical_translation_repairs (
+                  id TEXT PRIMARY KEY,
+                  batch_id TEXT NOT NULL,
+                  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+                  movie_code TEXT NOT NULL,
+                  allowlist_sha256 TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  next_attempt_at TEXT,
+                  reason_code TEXT,
+                  japanese_sha256 TEXT NOT NULL,
+                  audio_sha256 TEXT,
+                  english_sha256 TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_historical_translation_repairs_state_created_at "
+                "ON historical_translation_repairs(state, created_at)"
             )
 
     def submit_job(self, movie_number: str, priority: int, force: bool) -> SubmitResult:
@@ -1750,6 +1830,13 @@ class JobStore:
             translation_attempt_count=row["translation_attempt_count"],
             publish_attempt_count=row["publish_attempt_count"],
             next_publish_attempt_at=row["next_publish_attempt_at"],
+            translation_origin=row["translation_origin"],
+            published_subtitle_id=row["published_subtitle_id"],
+            published_storage_path=row["published_storage_path"],
+            published_content_sha256=row["published_content_sha256"],
+            published_file_size=row["published_file_size"],
+            catalog_sync_attempt_count=row["catalog_sync_attempt_count"],
+            next_catalog_sync_attempt_at=row["next_catalog_sync_attempt_at"],
             catalog_movie_uuid=row["catalog_movie_uuid"],
             metadata_status=row["metadata_status"],
             metadata_source=row["metadata_source"],

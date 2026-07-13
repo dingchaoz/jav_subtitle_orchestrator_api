@@ -2,6 +2,7 @@ import hashlib
 import os
 import sqlite3
 import time
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -11,6 +12,150 @@ import orchestrator.store as store_module
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
+
+
+def test_historical_repair_state_and_record_contract():
+    state_type = getattr(store_module, "HistoricalRepairState", None)
+    record_type = getattr(store_module, "HistoricalRepairRecord", None)
+
+    assert state_type is not None
+    assert [state.value for state in state_type] == [
+        "planned",
+        "pending",
+        "running",
+        "retry_wait",
+        "succeeded",
+        "permanent_failed",
+        "paused",
+    ]
+    assert record_type is not None
+    assert record_type.__dataclass_params__.frozen is True
+    assert [field.name for field in fields(record_type)] == [
+        "id",
+        "batch_id",
+        "job_id",
+        "movie_code",
+        "allowlist_sha256",
+        "state",
+        "attempt_count",
+        "next_attempt_at",
+        "reason_code",
+        "japanese_sha256",
+        "audio_sha256",
+        "english_sha256",
+        "created_at",
+        "updated_at",
+    ]
+    assert record_type.__annotations__ == {
+        "id": str,
+        "batch_id": str,
+        "job_id": str,
+        "movie_code": str,
+        "allowlist_sha256": str,
+        "state": state_type,
+        "attempt_count": int,
+        "next_attempt_at": str | None,
+        "reason_code": str | None,
+        "japanese_sha256": str,
+        "audio_sha256": str | None,
+        "english_sha256": str | None,
+        "created_at": str,
+        "updated_at": str,
+    }
+
+
+def test_initialize_adds_catalog_and_historical_repair_schema(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    with store.connection() as conn:
+        job_columns = {
+            row["name"]: row
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        repair_columns = {
+            row["name"]: row
+            for row in conn.execute(
+                "PRAGMA table_info(historical_translation_repairs)"
+            ).fetchall()
+        }
+        repair_foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(historical_translation_repairs)"
+        ).fetchall()
+        repair_indexes = conn.execute(
+            "PRAGMA index_list(historical_translation_repairs)"
+        ).fetchall()
+
+    assert {
+        "translation_origin",
+        "published_subtitle_id",
+        "published_storage_path",
+        "published_content_sha256",
+        "published_file_size",
+        "catalog_sync_attempt_count",
+        "next_catalog_sync_attempt_at",
+    } <= job_columns.keys()
+    assert job_columns["translation_origin"]["dflt_value"] == "'normal'"
+    assert job_columns["catalog_sync_attempt_count"]["dflt_value"] == "0"
+    assert {
+        "id",
+        "batch_id",
+        "job_id",
+        "movie_code",
+        "allowlist_sha256",
+        "state",
+        "attempt_count",
+        "next_attempt_at",
+        "reason_code",
+        "japanese_sha256",
+        "audio_sha256",
+        "english_sha256",
+        "created_at",
+        "updated_at",
+    } <= repair_columns.keys()
+    assert any(
+        row["table"] == "jobs" and row["from"] == "job_id" and row["to"] == "id"
+        for row in repair_foreign_keys
+    )
+    index_names = {row["name"] for row in repair_indexes}
+    assert "idx_historical_translation_repairs_state_created_at" in index_names
+
+
+def test_job_record_reads_durable_catalog_fields_without_fallbacks(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id = store.submit_job("abc-099", priority=100, force=False).job.id
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET translation_origin = ?, published_subtitle_id = ?, "
+            "published_storage_path = ?, published_content_sha256 = ?, "
+            "published_file_size = ?, catalog_sync_attempt_count = ?, "
+            "next_catalog_sync_attempt_at = ? WHERE id = ?",
+            (
+                "historical_repair",
+                "subtitle-uuid",
+                "subtitles/abc-099.srt",
+                "a" * 64,
+                1234,
+                3,
+                "2026-07-13T12:00:00+00:00",
+                job_id,
+            ),
+        )
+
+    job = store.get_job(job_id)
+
+    assert job.translation_origin == "historical_repair"
+    assert job.published_subtitle_id == "subtitle-uuid"
+    assert job.published_storage_path == "subtitles/abc-099.srt"
+    assert job.published_content_sha256 == "a" * 64
+    assert job.published_file_size == 1234
+    assert job.catalog_sync_attempt_count == 3
+    assert job.next_catalog_sync_attempt_at == "2026-07-13T12:00:00+00:00"
 
 
 def _prepare_translation_job(store, root: Path, movie: str):
