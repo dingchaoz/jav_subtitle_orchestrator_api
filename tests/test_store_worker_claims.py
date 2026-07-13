@@ -41,7 +41,7 @@ def test_historical_repair_state_and_record_contract():
         "next_attempt_at",
         "reason_code",
         "japanese_sha256",
-        "audio_sha256",
+        "audio_snapshot_sha256",
         "source_english_sha256",
         "english_sha256",
         "created_at",
@@ -58,7 +58,7 @@ def test_historical_repair_state_and_record_contract():
         "next_attempt_at": str | None,
         "reason_code": str | None,
         "japanese_sha256": str,
-        "audio_sha256": str | None,
+        "audio_snapshot_sha256": str,
         "source_english_sha256": str,
         "english_sha256": str | None,
         "created_at": str,
@@ -115,12 +115,14 @@ def test_initialize_adds_catalog_and_historical_repair_schema(
         "next_attempt_at",
         "reason_code",
         "japanese_sha256",
-        "audio_sha256",
+        "audio_snapshot_sha256",
         "source_english_sha256",
         "english_sha256",
         "created_at",
         "updated_at",
     } <= repair_columns.keys()
+    assert "audio_sha256" not in repair_columns
+    assert repair_columns["audio_snapshot_sha256"]["notnull"] == 1
     assert repair_columns["source_english_sha256"]["notnull"] == 1
     assert any(
         row["table"] == "jobs" and row["from"] == "job_id" and row["to"] == "id"

@@ -24,6 +24,7 @@ _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
 MAX_PUBLICATION_CANARY_SRT_BYTES = 32 * 1024 * 1024
 NORMAL_TRANSLATION_ORIGIN = "normal"
 HISTORICAL_TRANSLATION_ORIGIN = "historical"
+UNAVAILABLE_HISTORICAL_SHA256 = "0" * 64
 _CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
     {
         "catalog_fetch_failed",
@@ -258,11 +259,168 @@ class HistoricalRepairRecord:
     next_attempt_at: str | None
     reason_code: str | None
     japanese_sha256: str
-    audio_sha256: str | None
+    audio_snapshot_sha256: str
     source_english_sha256: str
     english_sha256: str | None
     created_at: str
     updated_at: str
+
+
+def _create_historical_translation_repairs_table(
+    conn: sqlite3.Connection,
+) -> None:
+    conn.execute(
+        """
+        CREATE TABLE historical_translation_repairs (
+          id TEXT PRIMARY KEY,
+          batch_id TEXT NOT NULL,
+          job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+          movie_code TEXT NOT NULL,
+          allowlist_sha256 TEXT NOT NULL,
+          state TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT,
+          reason_code TEXT,
+          japanese_sha256 TEXT NOT NULL,
+          audio_snapshot_sha256 TEXT NOT NULL,
+          source_english_sha256 TEXT NOT NULL,
+          english_sha256 TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _initialize_historical_translation_repairs(
+    conn: sqlite3.Connection,
+) -> None:
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'historical_translation_repairs'"
+    ).fetchone()
+    if exists is None:
+        _create_historical_translation_repairs_table(conn)
+    else:
+        column_rows = conn.execute(
+            "PRAGMA table_info(historical_translation_repairs)"
+        ).fetchall()
+        columns = {row["name"]: row for row in column_rows}
+        required_legacy_columns = {
+            "id",
+            "batch_id",
+            "job_id",
+            "movie_code",
+            "allowlist_sha256",
+            "state",
+            "attempt_count",
+            "next_attempt_at",
+            "reason_code",
+            "japanese_sha256",
+            "english_sha256",
+            "created_at",
+            "updated_at",
+        }
+        if not required_legacy_columns <= columns.keys():
+            raise RuntimeError("historical repair schema is not migratable")
+        current = (
+            "audio_snapshot_sha256" in columns
+            and columns["audio_snapshot_sha256"]["notnull"] == 1
+            and "source_english_sha256" in columns
+            and columns["source_english_sha256"]["notnull"] == 1
+            and "audio_sha256" not in columns
+        )
+        if not current:
+            legacy_table = "historical_translation_repairs_legacy_migration"
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (legacy_table,),
+            ).fetchone() is not None:
+                raise RuntimeError("historical repair migration residue exists")
+            source_expression = (
+                "COALESCE(source_english_sha256, english_sha256, "
+                f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
+                if "source_english_sha256" in columns
+                else "COALESCE(english_sha256, "
+                f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
+            )
+            source_unavailable = (
+                "source_english_sha256 IS NULL AND english_sha256 IS NULL"
+                if "source_english_sha256" in columns
+                else "english_sha256 IS NULL"
+            )
+            if "audio_snapshot_sha256" in columns:
+                audio_expression = (
+                    "COALESCE(audio_snapshot_sha256, "
+                    f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
+                )
+                audio_unavailable = "audio_snapshot_sha256 IS NULL"
+            else:
+                audio_expression = f"'{UNAVAILABLE_HISTORICAL_SHA256}'"
+                audio_unavailable = "1"
+            runnable = (
+                "state IN ('planned', 'pending', 'running', "
+                "'retry_wait', 'paused')"
+            )
+            unavailable_runnable = (
+                f"({runnable} AND (({source_unavailable}) OR "
+                f"({audio_unavailable})))"
+            )
+            state_expression = (
+                f"CASE WHEN {unavailable_runnable} THEN 'permanent_failed' "
+                "ELSE state END"
+            )
+            reason_expression = (
+                f"CASE WHEN {runnable} AND ({source_unavailable}) THEN "
+                "'migration_source_english_unavailable' "
+                f"WHEN {runnable} AND ({audio_unavailable}) THEN "
+                "'migration_audio_snapshot_unavailable' "
+                "ELSE reason_code END"
+            )
+            next_attempt_expression = (
+                f"CASE WHEN {unavailable_runnable} THEN NULL "
+                "ELSE next_attempt_at END"
+            )
+            legacy_count = conn.execute(
+                "SELECT COUNT(*) FROM historical_translation_repairs"
+            ).fetchone()[0]
+            conn.execute(
+                "ALTER TABLE historical_translation_repairs "
+                f"RENAME TO {legacy_table}"
+            )
+            _create_historical_translation_repairs_table(conn)
+            conn.execute(
+                f"""
+                INSERT INTO historical_translation_repairs (
+                  id, batch_id, job_id, movie_code, allowlist_sha256, state,
+                  attempt_count, next_attempt_at, reason_code, japanese_sha256,
+                  audio_snapshot_sha256, source_english_sha256, english_sha256,
+                  created_at, updated_at
+                )
+                SELECT
+                  id, batch_id, job_id, movie_code, allowlist_sha256,
+                  {state_expression}, attempt_count, {next_attempt_expression},
+                  {reason_expression}, japanese_sha256, {audio_expression},
+                  {source_expression}, english_sha256, created_at, updated_at
+                FROM {legacy_table}
+                """
+            )
+            migrated_count = conn.execute(
+                "SELECT COUNT(*) FROM historical_translation_repairs"
+            ).fetchone()[0]
+            if migrated_count != legacy_count:
+                raise RuntimeError("historical repair migration count mismatch")
+            violations = conn.execute(
+                "PRAGMA foreign_key_check(historical_translation_repairs)"
+            ).fetchall()
+            if violations:
+                raise RuntimeError("historical repair migration foreign key failure")
+            conn.execute(f"DROP TABLE {legacy_table}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS "
+        "idx_historical_translation_repairs_state_created_at "
+        "ON historical_translation_repairs(state, created_at)"
+    )
 
 
 @dataclass(frozen=True)
@@ -356,6 +514,7 @@ class JobStore:
 
     def initialize(self) -> None:
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -452,48 +611,7 @@ class JobStore:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS historical_translation_repairs (
-                  id TEXT PRIMARY KEY,
-                  batch_id TEXT NOT NULL,
-                  job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
-                  movie_code TEXT NOT NULL,
-                  allowlist_sha256 TEXT NOT NULL,
-                  state TEXT NOT NULL,
-                  attempt_count INTEGER NOT NULL DEFAULT 0,
-                  next_attempt_at TEXT,
-                  reason_code TEXT,
-                  japanese_sha256 TEXT NOT NULL,
-                  audio_sha256 TEXT,
-                  source_english_sha256 TEXT NOT NULL,
-                  english_sha256 TEXT,
-                  created_at TEXT NOT NULL,
-                  updated_at TEXT NOT NULL
-                )
-                """
-            )
-            repair_columns = {
-                row["name"]
-                for row in conn.execute(
-                    "PRAGMA table_info(historical_translation_repairs)"
-                ).fetchall()
-            }
-            if "source_english_sha256" not in repair_columns:
-                conn.execute(
-                    "ALTER TABLE historical_translation_repairs "
-                    "ADD COLUMN source_english_sha256 TEXT"
-                )
-                conn.execute(
-                    "UPDATE historical_translation_repairs "
-                    "SET source_english_sha256 = english_sha256 "
-                    "WHERE source_english_sha256 IS NULL"
-                )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS "
-                "idx_historical_translation_repairs_state_created_at "
-                "ON historical_translation_repairs(state, created_at)"
-            )
+            _initialize_historical_translation_repairs(conn)
 
     def submit_job(self, movie_number: str, priority: int, force: bool) -> SubmitResult:
         normalized = normalize_movie_number(movie_number)
@@ -1227,7 +1345,7 @@ class JobStore:
         from orchestrator.historical_batch import (
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
-            _prehold_plan_job_files,
+            _scan_filesystem,
             find_idempotent_historical_enqueue,
         )
         from orchestrator.job_files_lock import exclusive_jobs_root_lock
@@ -1242,31 +1360,22 @@ class JobStore:
         )
         if existing is not None:
             return existing
-        with ExitStack() as descriptor_stack:
-            root_lock = descriptor_stack.enter_context(
-                exclusive_jobs_root_lock(
-                    self.jobs_root_mac,
-                    blocking=True,
-                )
-            )
-            preheld_jobs = _prehold_plan_job_files(
-                self,
-                plan,
+        with exclusive_jobs_root_lock(
+            self.jobs_root_mac,
+            blocking=True,
+        ) as root_lock:
+            filesystem = _scan_filesystem(
+                root_lock,
                 Path(allowlist_path),
-                confirm_plan_sha256=confirm_plan_sha256,
-                root_lock=root_lock,
-                descriptor_stack=descriptor_stack,
             )
             with self.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 return _enqueue_historical_repairs_transaction(
-                    self,
                     conn,
                     plan,
                     Path(allowlist_path),
                     confirm_plan_sha256=confirm_plan_sha256,
-                    root_lock=root_lock,
-                    preheld_jobs=preheld_jobs,
+                    filesystem=filesystem,
                 )
 
     def prepare_catalog_publication_repair(

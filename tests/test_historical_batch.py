@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import struct
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +27,23 @@ def _srt(*, bad: bool) -> bytes:
     return "\n".join(blocks).encode()
 
 
+def _wav(*, data_size: int = 64) -> bytes:
+    byte_rate = 16_000 * 2
+    block_align = 2
+    fmt = struct.pack("<HHIIHH", 1, 1, 16_000, byte_rate, block_align, 16)
+    riff_size = 4 + (8 + len(fmt)) + (8 + data_size)
+    return (
+        b"RIFF"
+        + struct.pack("<I", riff_size)
+        + b"WAVEfmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + b"data"
+        + struct.pack("<I", data_size)
+        + (b"\0" * data_size)
+    )
+
+
 def _job(
     store: JobStore,
     root: Path,
@@ -45,7 +63,7 @@ def _job(
     )
     paths.english_srt_path_mac.write_bytes(_srt(bad=bad))
     if audio:
-        paths.audio_path_mac.write_bytes(b"synthetic-audio")
+        paths.audio_path_mac.write_bytes(_wav())
     with store.connection() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, claimed_by = ?, audio_path_mac = ?, "
@@ -118,6 +136,48 @@ def test_plan_is_read_only_bounded_counts_full_allowlist_and_has_stable_digest(
     assert _database_snapshot(sqlite_path) == before_db
     assert _tree_snapshot(mac_jobs_root) == before_files
     assert "Cannot translate" not in repr(first)
+
+
+def test_sparse_tens_of_gigabytes_audio_uses_bounded_wav_probe(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    with paths.audio_path_mac.open("r+b") as audio_file:
+        audio_file.truncate(32 * 1024**3)
+    audio_inode = paths.audio_path_mac.stat().st_ino
+    bytes_requested = 0
+    real_read = historical_batch.os.read
+    real_pread = historical_batch.os.pread
+
+    def bounded_read(fd, size):
+        nonlocal bytes_requested
+        if os.fstat(fd).st_ino == audio_inode:
+            bytes_requested += size
+            assert bytes_requested <= historical_batch.MAX_AUDIO_PROBE_BYTES
+        return real_read(fd, size)
+
+    def bounded_pread(fd, size, offset):
+        nonlocal bytes_requested
+        if os.fstat(fd).st_ino == audio_inode:
+            bytes_requested += size
+            assert bytes_requested <= historical_batch.MAX_AUDIO_PROBE_BYTES
+        return real_pread(fd, size, offset)
+
+    monkeypatch.setattr(historical_batch.os, "read", bounded_read)
+    monkeypatch.setattr(historical_batch.os, "pread", bounded_pread)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+
+    assert len(plan.items) == 1
+    item = plan.items[0]
+    assert len(item.audio_snapshot_sha256) == 64
+    assert not hasattr(item, "audio_sha256")
+    assert 0 < bytes_requested <= historical_batch.MAX_AUDIO_PROBE_BYTES
 
 
 @pytest.mark.parametrize("limit", [0, 21, -1, True])
@@ -287,6 +347,46 @@ def test_private_plan_parent_swap_after_link_is_detected_and_cleaned(
     assert not list(moved.glob("*.tmp"))
 
 
+def test_private_plan_parent_swap_after_second_check_is_detected_and_cleaned(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    parent = tmp_path / "reports"
+    parent.mkdir()
+    moved = tmp_path / "reports-moved"
+    calls = 0
+    real_require = historical_batch._require_parent_path_bound
+
+    def swap_after_second_success(path, expected_stat):
+        nonlocal calls
+        calls += 1
+        result = real_require(path, expected_stat)
+        if calls == 2:
+            parent.rename(moved)
+            parent.mkdir()
+        return result
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_require_parent_path_bound",
+        swap_after_second_success,
+    )
+
+    with pytest.raises(ValueError, match="plan_output_unsafe"):
+        historical_batch.write_private_plan(parent / "plan.json", plan)
+
+    assert calls == 3
+    assert not (parent / "plan.json").exists()
+    assert not (moved / "plan.json").exists()
+    assert not list(moved.glob("*.tmp"))
+
+
 def test_private_plan_is_0600_even_under_restrictive_umask(
     sqlite_path, mac_jobs_root, tmp_path
 ):
@@ -434,6 +534,236 @@ def test_idempotent_replay_ignores_current_job_allowlist_and_files(
     assert (rejected / "old-English.srt").exists()
 
 
+def test_enqueue_prescan_does_not_hold_sqlite_write_lock(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    unrelated, _ = _job(store, mac_jobs_root, "abc-002")
+    assert unrelated is not None
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    prescan_complete = threading.Event()
+    release_prescan = threading.Event()
+    real_scan = historical_batch._scan_filesystem
+
+    def paused_scan(*args, **kwargs):
+        snapshot = real_scan(*args, **kwargs)
+        prescan_complete.set()
+        assert release_prescan.wait(2)
+        return snapshot
+
+    monkeypatch.setattr(historical_batch, "_scan_filesystem", paused_scan)
+    outcome: list[object] = []
+
+    def enqueue():
+        try:
+            outcome.extend(
+                historical_batch.enqueue_historical_batch(
+                    store,
+                    plan,
+                    allowlist,
+                    confirm_plan_sha256=plan.plan_sha256,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            outcome.append(exc)
+
+    thread = threading.Thread(target=enqueue)
+    thread.start()
+    assert prescan_complete.wait(2)
+    started = threading.Event()
+
+    def unrelated_sqlite_writer():
+        with store.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            started.set()
+            conn.execute(
+                "UPDATE jobs SET updated_at = 'concurrent-write' WHERE id = ?",
+                (unrelated.id,),
+            )
+
+    writer = threading.Thread(target=unrelated_sqlite_writer)
+    writer.start()
+    assert started.wait(1)
+    writer.join(timeout=1)
+    assert not writer.is_alive()
+    release_prescan.set()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert not isinstance(outcome[0], Exception)
+
+
+def test_plan_and_enqueue_read_database_only_inside_explicit_transactions(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    transaction_modes: list[str] = []
+    real_read = historical_batch._read_database_snapshot
+
+    def checked_read(conn):
+        assert conn.in_transaction
+        transaction_modes.append("transaction")
+        return real_read(conn)
+
+    monkeypatch.setattr(historical_batch, "_read_database_snapshot", checked_read)
+
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    records = historical_batch.enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+
+    assert len(records) == 1
+    assert transaction_modes == ["transaction", "transaction"]
+
+
+def test_plan_jobs_and_repairs_share_one_sqlite_snapshot(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _job(store, mac_jobs_root, "abc-001")
+    assert job is not None
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    real_open = historical_batch._read_only_connection
+    inserted = False
+
+    def interleaving_connection(db_path):
+        conn = real_open(db_path)
+
+        def trace(statement):
+            nonlocal inserted
+            if (
+                not inserted
+                and statement.startswith(
+                    "SELECT * FROM historical_translation_repairs"
+                )
+            ):
+                inserted = True
+                with store.connection() as writer:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute(
+                        """
+                        INSERT INTO historical_translation_repairs (
+                          id, batch_id, job_id, movie_code, allowlist_sha256,
+                          state, japanese_sha256, audio_snapshot_sha256,
+                          source_english_sha256, english_sha256,
+                          created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        """,
+                        (
+                            "repair_interleaved",
+                            "batch_interleaved",
+                            job.id,
+                            "abc-001",
+                            "a" * 64,
+                            "pending",
+                            "j" * 64,
+                            "f" * 64,
+                            "e" * 64,
+                            "2026-07-01T00:00:00+00:00",
+                            "2026-07-01T00:00:00+00:00",
+                        ),
+                    )
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_read_only_connection",
+        interleaving_connection,
+    )
+
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+
+    assert inserted is True
+    assert plan.eligible_total == 1
+    assert plan.already_repaired == 0
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs "
+            "WHERE id = 'repair_interleaved'"
+        ).fetchone()[0] == 1
+
+
+def test_enqueue_performs_no_filesystem_scan_inside_sqlite_write_transaction(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    base_store = _store(sqlite_path, mac_jobs_root)
+    _job(base_store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(
+        base_store,
+        allowlist,
+        limit=1,
+    )
+    write_transaction_active = [False]
+
+    class TransactionTrackingStore(JobStore):
+        def connect(self):
+            conn = super().connect()
+
+            def trace(statement):
+                normalized = statement.strip().upper()
+                if normalized == "BEGIN IMMEDIATE":
+                    write_transaction_active[0] = True
+                elif normalized in {"COMMIT", "ROLLBACK"}:
+                    write_transaction_active[0] = False
+
+            conn.set_trace_callback(trace)
+            return conn
+
+    store = TransactionTrackingStore(sqlite_path, mac_jobs_root, "M:\\")
+    real_scan = historical_batch._scan_filesystem
+    real_quality = historical_batch.validate_translation_quality_snapshots
+
+    def checked_scan(*args, **kwargs):
+        assert write_transaction_active[0] is False
+        result = real_scan(*args, **kwargs)
+        assert write_transaction_active[0] is False
+        return result
+
+    def checked_quality(*args, **kwargs):
+        assert write_transaction_active[0] is False
+        return real_quality(*args, **kwargs)
+
+    monkeypatch.setattr(historical_batch, "_scan_filesystem", checked_scan)
+    monkeypatch.setattr(
+        historical_batch,
+        "validate_translation_quality_snapshots",
+        checked_quality,
+    )
+
+    records = historical_batch.enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+
+    assert len(records) == 1
+    assert write_transaction_active[0] is False
+
+
 @pytest.mark.parametrize(
     ("terminal_state", "reason_code"),
     [
@@ -508,6 +838,7 @@ def test_terminal_replay_uses_immutable_source_hash_and_performs_zero_writes(
         ("job_id", "use_second_job"),
         ("movie_code", "tampered-999"),
         ("allowlist_sha256", "0" * 64),
+        ("audio_snapshot_sha256", "0" * 64),
         ("source_english_sha256", "0" * 64),
     ],
 )
@@ -560,6 +891,7 @@ def test_enqueue_uses_bounded_descriptors_under_low_rlimit(
     from orchestrator.historical_batch import (
         enqueue_historical_batch,
         plan_historical_batch,
+        render_historical_batch_report,
     )
 
     store = _store(sqlite_path, mac_jobs_root)
@@ -569,6 +901,9 @@ def test_enqueue_uses_bounded_descriptors_under_low_rlimit(
     allowlist = tmp_path / "allowlist.txt"
     allowlist.write_text("".join(f"{movie}\n" for movie in movies))
     plan = plan_historical_batch(store, allowlist, limit=20)
+    report = render_historical_batch_report(plan)
+    assert "scan_entries=340" in report
+    assert "audio_probe_max_bytes=4096" in report
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(64, hard)
     if target < 48:
@@ -647,6 +982,9 @@ def test_safe_report_names_exact_jobs_and_actions_without_paths_or_subtitle_text
         in report
     )
     assert "eligible_total=1" in report
+    assert "scan_entries=1" in report
+    assert "audio_probe_max_bytes=4096" in report
+    assert "elapsed" not in report
     assert plan.plan_sha256 in report
     assert str(allowlist) not in report
     assert "Cannot translate" not in report

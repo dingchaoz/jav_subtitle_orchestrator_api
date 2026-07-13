@@ -229,7 +229,7 @@ def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
                 job.id,
                 "abc-001",
                 "a" * 64,
-                "succeeded",
+                "pending",
                 "j" * 64,
                 "b" * 64,
                 legacy_english_sha256,
@@ -239,23 +239,202 @@ def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
         )
 
     store.initialize()
-    store.initialize()
 
     with store.connection() as conn:
         columns = {
-            row["name"]
+            row["name"]: row
             for row in conn.execute(
                 "PRAGMA table_info(historical_translation_repairs)"
             ).fetchall()
         }
         repair = conn.execute(
-            "SELECT source_english_sha256, english_sha256 "
+            "SELECT state, reason_code, source_english_sha256, "
+            "audio_snapshot_sha256, english_sha256 "
             "FROM historical_translation_repairs WHERE id = 'repair_legacy'"
         ).fetchone()
+        first_schema = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE tbl_name = 'historical_translation_repairs' "
+            "ORDER BY type, name"
+        ).fetchall()
+        foreign_key_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+
+    store.initialize()
+
+    with store.connection() as conn:
+        remigrated = conn.execute(
+            "SELECT * FROM historical_translation_repairs "
+            "WHERE id = 'repair_legacy'"
+        ).fetchone()
+        second_schema = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE tbl_name = 'historical_translation_repairs' "
+            "ORDER BY type, name"
+        ).fetchall()
 
     assert "source_english_sha256" in columns
+    assert columns["source_english_sha256"]["notnull"] == 1
+    assert columns["audio_snapshot_sha256"]["notnull"] == 1
+    assert "audio_sha256" not in columns
     assert repair["source_english_sha256"] == legacy_english_sha256
+    assert repair["audio_snapshot_sha256"] == "0" * 64
     assert repair["english_sha256"] == legacy_english_sha256
+    assert repair["state"] == "permanent_failed"
+    assert repair["reason_code"] == "migration_audio_snapshot_unavailable"
+    assert remigrated["source_english_sha256"] == legacy_english_sha256
+    assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
+    assert foreign_key_violations == []
+
+
+def test_initialize_safely_fails_runnable_legacy_repairs_missing_identity(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    source_job = store.submit_job("ABC-001", priority=100, force=False).job
+    missing_job = store.submit_job("ABC-002", priority=100, force=False).job
+    assert source_job is not None and missing_job is not None
+    with store.connection() as conn:
+        conn.execute("DROP TABLE historical_translation_repairs")
+        conn.execute(
+            """
+            CREATE TABLE historical_translation_repairs (
+              id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+              movie_code TEXT NOT NULL,
+              allowlist_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT,
+              reason_code TEXT,
+              japanese_sha256 TEXT NOT NULL,
+              audio_snapshot_sha256 TEXT NOT NULL,
+              source_english_sha256 TEXT,
+              english_sha256 TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        for repair_id, job, movie, state, english in (
+            ("repair_source", source_job, "abc-001", "pending", "e" * 64),
+            ("repair_missing", missing_job, "abc-002", "running", None),
+        ):
+            conn.execute(
+                """
+                INSERT INTO historical_translation_repairs (
+                  id, batch_id, job_id, movie_code, allowlist_sha256, state,
+                  japanese_sha256, audio_snapshot_sha256,
+                  source_english_sha256, english_sha256, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    repair_id,
+                    f"batch_{movie}",
+                    job.id,
+                    movie,
+                    "a" * 64,
+                    state,
+                    "j" * 64,
+                    "f" * 64,
+                    english,
+                    "2026-07-01T00:00:00+00:00",
+                    "2026-07-01T00:00:00+00:00",
+                ),
+            )
+
+    store.initialize()
+
+    with store.connection() as conn:
+        columns = {
+            row["name"]: row
+            for row in conn.execute(
+                "PRAGMA table_info(historical_translation_repairs)"
+            ).fetchall()
+        }
+        repairs = {
+            row["id"]: row
+            for row in conn.execute(
+                "SELECT * FROM historical_translation_repairs ORDER BY id"
+            ).fetchall()
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA index_list(historical_translation_repairs)"
+            ).fetchall()
+        }
+        foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(historical_translation_repairs)"
+        ).fetchall()
+
+    assert columns["source_english_sha256"]["notnull"] == 1
+    assert repairs["repair_source"]["state"] == "pending"
+    assert repairs["repair_source"]["source_english_sha256"] == "e" * 64
+    assert repairs["repair_source"]["reason_code"] is None
+    assert repairs["repair_missing"]["state"] == "permanent_failed"
+    assert repairs["repair_missing"]["source_english_sha256"] == "0" * 64
+    assert repairs["repair_missing"]["reason_code"] == (
+        "migration_source_english_unavailable"
+    )
+    assert "idx_historical_translation_repairs_state_created_at" in indexes
+    assert any(
+        row["table"] == "jobs" and row["from"] == "job_id" and row["to"] == "id"
+        for row in foreign_keys
+    )
+
+
+def test_legacy_repair_rebuild_rolls_back_atomically_on_failure(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    with store.connection() as conn:
+        conn.execute("DROP TABLE historical_translation_repairs")
+        conn.execute(
+            """
+            CREATE TABLE historical_translation_repairs (
+              id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+              movie_code TEXT NOT NULL,
+              allowlist_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT,
+              reason_code TEXT,
+              japanese_sha256 TEXT NOT NULL,
+              audio_sha256 TEXT,
+              english_sha256 TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def fail_after_legacy_rename(conn):
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(
+        store_module,
+        "_create_historical_translation_repairs_table",
+        fail_after_legacy_rename,
+    )
+
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        store.initialize()
+
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+
+    assert "historical_translation_repairs" in tables
+    assert "historical_translation_repairs_legacy_migration" not in tables
 
 
 def test_submit_job_closes_connection_after_write(sqlite_path, mac_jobs_root):
