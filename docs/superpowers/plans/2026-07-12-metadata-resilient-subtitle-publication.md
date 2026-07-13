@@ -1405,4 +1405,3 @@ Report the canary outcome and request separate approval for any batch. Never inf
 - Retry consistency: translation failures affect `translation_attempt_count`; publication failures affect only `publish_attempt_count`.
 - Security consistency: the `SECURITY DEFINER` RPC has an empty search path and execute is revoked from `public`, `anon`, and `authenticated`.
 - No plan step authorizes bulk requeue, historical overwrite, audio deletion, or `force=True`.
-
