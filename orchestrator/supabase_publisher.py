@@ -15,7 +15,10 @@ from orchestrator.movie_catalog import (
     MovieCatalogResult,
 )
 from orchestrator.movie_code import canonical_movie_code
-from orchestrator.subtitle_quality import validate_translation_quality
+from orchestrator.subtitle_quality import (
+    SubtitleQualityGateError,
+    validate_translation_quality,
+)
 
 
 AI_ENGLISH_LANGUAGE = "English_AI"
@@ -108,18 +111,14 @@ class SupabaseSubtitlePublisher:
         english_before = english_srt_path.read_bytes()
         report = validate_translation_quality(japanese_srt_path, english_srt_path)
         if not report.passed:
-            raise RuntimeError(
-                "quality_gate_failed:" + ",".join(report.reason_codes)
-            )
+            raise SubtitleQualityGateError(report.reason_codes)
         japanese_snapshot = japanese_srt_path.read_bytes()
         english_snapshot = english_srt_path.read_bytes()
         if (
             japanese_snapshot != japanese_before
             or english_snapshot != english_before
         ):
-            raise RuntimeError(
-                "quality_gate_failed:subtitle_changed_during_validation"
-            )
+            raise SubtitleQualityGateError(["subtitle_changed_during_validation"])
 
         catalog = self.catalog_ensurer.ensure_movie(
             canonical,
@@ -129,9 +128,7 @@ class SupabaseSubtitlePublisher:
             japanese_srt_path.read_bytes() != japanese_snapshot
             or english_srt_path.read_bytes() != english_snapshot
         ):
-            raise RuntimeError(
-                "quality_gate_failed:subtitle_changed_after_validation"
-            )
+            raise SubtitleQualityGateError(["subtitle_changed_after_validation"])
         content_sha256 = hashlib.sha256(english_snapshot).hexdigest()
         storage_path = build_ai_subtitle_storage_path(canonical)
         self._upload_storage_object(storage_path, english_snapshot)

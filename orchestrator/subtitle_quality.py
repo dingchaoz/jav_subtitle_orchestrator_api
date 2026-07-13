@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import statistics
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -34,6 +35,12 @@ SHORT_INTERJECTIONS = {
     "mm",
 }
 MOJIBAKE_MARKERS = ("Ã", "Â", "â€", "ðŸ", "ï¿½", "ã\x80", "ã\x81", "ã\x82")
+
+
+class SubtitleQualityGateError(RuntimeError):
+    def __init__(self, reason_codes: Iterable[str]) -> None:
+        self.reason_codes = tuple(reason_codes)
+        super().__init__("quality_gate_failed:" + ",".join(self.reason_codes))
 
 
 @dataclass(frozen=True)

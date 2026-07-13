@@ -9,7 +9,11 @@ from orchestrator.job_snapshot import write_job_snapshot
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobRecord, JobStore
-from orchestrator.subtitle_quality import QualityReport, validate_translation_quality
+from orchestrator.subtitle_quality import (
+    QualityReport,
+    SubtitleQualityGateError,
+    validate_translation_quality,
+)
 
 
 def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
@@ -338,9 +342,19 @@ class MacTranslationWorker:
             self._process_publication(job)
         except Exception as exc:
             error = "publishing: publication failed"
-            permanent = isinstance(exc, MacPublicationQualityError)
+            publisher_quality_failure = isinstance(exc, SubtitleQualityGateError)
+            permanent = publisher_quality_failure or isinstance(
+                exc, MacPublicationQualityError
+            )
             if permanent:
                 self.consecutive_quality_failures += 1
+            if publisher_quality_failure:
+                paths = build_job_paths(
+                    job.normalized_movie_number,
+                    self.store.jobs_root_mac,
+                    self.store.jobs_root_windows,
+                )
+                self._quarantine(paths.english_srt_path_mac, "quality")
             updated = self.store.fail_publication(
                 job.id,
                 self.worker_id,

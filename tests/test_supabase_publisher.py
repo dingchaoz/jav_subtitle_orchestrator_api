@@ -6,6 +6,7 @@ import pytest
 import orchestrator.supabase_publisher as publisher_module
 from orchestrator.movie_catalog import MovieCatalogResult
 from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
+from orchestrator.subtitle_quality import SubtitleQualityGateError
 
 
 CATALOG_MOVIE_UUID = "catalog-movie-uuid"
@@ -323,9 +324,13 @@ def test_subtitle_changed_during_catalog_ensure_cannot_be_uploaded(tmp_path):
     with pytest.raises(
         RuntimeError,
         match=r"^quality_gate_failed:subtitle_changed_after_validation$",
-    ):
+    ) as exc_info:
         publisher.publish_english_ai("ktb-112", english)
 
+    assert isinstance(exc_info.value, SubtitleQualityGateError)
+    assert exc_info.value.reason_codes == (
+        "subtitle_changed_after_validation",
+    )
     assert session.calls == []
 
 

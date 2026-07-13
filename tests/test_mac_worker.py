@@ -10,6 +10,7 @@ from orchestrator.mac_worker import (
 )
 from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
+from orchestrator.subtitle_quality import SubtitleQualityGateError
 from orchestrator.translation_smoke import (
     TranslationRuntimeUnhealthyError,
     run_translation_startup_smoke_test,
@@ -398,12 +399,56 @@ def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root
     assert refreshed.claimed_by is None
     assert audio.read_bytes() == b"keep-audio"
     assert english.exists()
+    assert worker.consecutive_quality_failures == 0
 
     assert worker.process_one() is True
     refreshed = store.get_job(job.id)
     assert refreshed.status is JobStatus.ENGLISH_SRT_READY
     assert [event[0] for event in events].count("translate") == 1
     assert [event[0] for event in events].count("publish") == 2
+
+
+def test_publisher_quality_failure_is_permanent_and_quarantines_english(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_publish_attempts=3,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(
+            events,
+            errors=[SubtitleQualityGateError(["subtitle_changed_after_validation"])],
+        ),
+    )
+    assert worker.process_one() is True
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    rejected = english.parent / "rejected"
+    assert refreshed.status is JobStatus.FAILED
+    assert refreshed.error == (
+        "publishing: quality_gate_failed:subtitle_changed_after_validation"
+    )
+    assert refreshed.publish_attempt_count == 1
+    assert refreshed.translation_attempt_count == 0
+    assert refreshed.next_publish_attempt_at is None
+    assert [event[0] for event in events] == ["publish"]
+    assert not english.exists()
+    assert len(list(rejected.glob("*.srt"))) == 1
+    assert audio.read_bytes() == b"keep-audio"
+    assert worker.consecutive_quality_failures == 1
 
 
 def test_final_publish_attempt_fails_but_preserves_validated_files(
