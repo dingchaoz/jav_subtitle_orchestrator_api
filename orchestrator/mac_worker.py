@@ -591,6 +591,8 @@ class MacTranslationWorker:
             os.mkdir("rejected", mode=0o755, dir_fd=files_lock.job_fd)
         except FileExistsError:
             pass
+        else:
+            os.fsync(files_lock.job_fd)
         rejected_fd = os.open(
             "rejected",
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
