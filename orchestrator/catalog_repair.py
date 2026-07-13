@@ -75,6 +75,24 @@ def _require_regular_nonempty_subtitle(path: Path, label: str) -> None:
         raise ValueError(f"quality_gate_failed:{label}_srt_empty")
 
 
+def _require_direct_job_directory(job_directory: Path, jobs_root: Path) -> None:
+    try:
+        directory_stat = job_directory.lstat()
+    except OSError as exc:
+        raise ValueError("quality_gate_failed:job_directory_missing") from exc
+    if stat.S_ISLNK(directory_stat.st_mode):
+        raise ValueError("quality_gate_failed:job_directory_symlink")
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise ValueError("quality_gate_failed:job_directory_not_directory")
+    try:
+        configured_root = jobs_root.resolve(strict=True)
+        canonical_job_directory = job_directory.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("quality_gate_failed:job_directory_missing") from exc
+    if canonical_job_directory.parent != configured_root:
+        raise ValueError("quality_gate_failed:job_directory_not_direct_child")
+
+
 def prepare_catalog_publication_canary(
     store: JobStore,
     allowlist_path: Path,
@@ -112,6 +130,12 @@ def prepare_catalog_publication_canary(
         store.jobs_root_mac,
         store.jobs_root_windows,
     )
+    _require_direct_job_directory(paths.job_dir_mac, store.jobs_root_mac)
+    if (
+        paths.japanese_srt_path_mac.parent != paths.job_dir_mac
+        or paths.english_srt_path_mac.parent != paths.job_dir_mac
+    ):
+        raise ValueError("quality_gate_failed:subtitle_not_direct_child")
     _require_regular_nonempty_subtitle(
         paths.japanese_srt_path_mac,
         "japanese",
@@ -136,6 +160,7 @@ def prepare_catalog_publication_canary(
         raise ValueError(
             "quality_gate_failed:subtitle_changed_during_validation"
         )
+    japanese_sha256 = hashlib.sha256(japanese_snapshot).hexdigest()
     english_sha256 = hashlib.sha256(english_snapshot).hexdigest()
 
     allowlist_after_validation = load_repair_allowlist(allowlist_path)
@@ -159,6 +184,8 @@ def prepare_catalog_publication_canary(
         prior.id,
         expected_status=prior.status,
         expected_movie=requested,
+        expected_japanese_sha256=japanese_sha256,
+        expected_english_sha256=english_sha256,
     )
     return CatalogPublicationCanaryReceipt(
         job_id=prepared.id,

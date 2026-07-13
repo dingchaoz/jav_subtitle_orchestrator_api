@@ -1,3 +1,5 @@
+import hashlib
+import os
 import sqlite3
 import stat
 from collections.abc import Iterator
@@ -17,6 +19,86 @@ _VERIFIED_METADATA_STATUSES = frozenset({"complete", "partial", "placeholder"})
 _VERIFIED_METADATA_SOURCES = frozenset(
     {"public", "missav", "local", "placeholder"}
 )
+_LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _validate_expected_sha256(value: str, label: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in _LOWERCASE_HEX_DIGITS for character in value)
+    ):
+        raise ValueError(f"{label} must be 64 lowercase hexadecimal characters")
+
+
+def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+
+
+def _sha256_regular_nonempty_file_at(
+    directory_fd: int,
+    basename: str,
+    label: str,
+) -> str:
+    try:
+        path_stat = os.stat(
+            basename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"final {label} file unavailable before prepare"
+        ) from exc
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise FileNotFoundError(
+            f"final {label} file is not regular before prepare"
+        )
+    if path_stat.st_size <= 0:
+        raise FileNotFoundError(f"final {label} file empty before prepare")
+    try:
+        file_fd = os.open(
+            basename,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"final {label} file unavailable before prepare"
+        ) from exc
+    try:
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise FileNotFoundError(
+                f"final {label} file is not regular before prepare"
+            )
+        if before.st_size <= 0:
+            raise FileNotFoundError(
+                f"final {label} file empty before prepare"
+            )
+        digest = hashlib.sha256()
+        while chunk := os.read(file_fd, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(file_fd)
+        if not _same_file_snapshot(before, after):
+            raise RuntimeError("subtitle_snapshot_changed_before_prepare")
+        return digest.hexdigest()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare") from exc
+    finally:
+        os.close(file_fd)
 
 
 def utc_now_iso() -> str:
@@ -857,12 +939,22 @@ class JobStore:
         *,
         expected_status: JobStatus,
         expected_movie: str,
+        expected_japanese_sha256: str,
+        expected_english_sha256: str,
     ) -> JobRecord:
         if expected_status not in {
             JobStatus.FAILED,
             JobStatus.ENGLISH_SRT_READY,
         }:
             raise ValueError("catalog publication status is not eligible")
+        _validate_expected_sha256(
+            expected_japanese_sha256,
+            "expected_japanese_sha256",
+        )
+        _validate_expected_sha256(
+            expected_english_sha256,
+            "expected_english_sha256",
+        )
         expected_canonical = canonical_movie_code(expected_movie)
         now = utc_now_iso()
         with self.connection() as conn:
@@ -887,19 +979,92 @@ class JobStore:
                 self.jobs_root_windows,
             )
             try:
-                english_stat = paths.english_srt_path_mac.lstat()
+                job_directory_stat = paths.job_dir_mac.lstat()
             except OSError as exc:
-                raise FileNotFoundError(
-                    f"final file unavailable: {paths.english_srt_path_mac}"
+                raise ValueError(
+                    "catalog_publication_job_directory_unavailable"
                 ) from exc
-            if not stat.S_ISREG(english_stat.st_mode):
-                raise FileNotFoundError(
-                    f"final file is not regular: {paths.english_srt_path_mac}"
+            if stat.S_ISLNK(job_directory_stat.st_mode):
+                raise ValueError("catalog_publication_job_directory_symlink")
+            if not stat.S_ISDIR(job_directory_stat.st_mode):
+                raise ValueError("catalog_publication_job_directory_not_directory")
+            try:
+                configured_root = self.jobs_root_mac.resolve(strict=True)
+                canonical_job_directory = paths.job_dir_mac.resolve(strict=True)
+            except OSError as exc:
+                raise ValueError(
+                    "catalog_publication_job_directory_unavailable"
+                ) from exc
+            if canonical_job_directory.parent != configured_root:
+                raise ValueError(
+                    "catalog_publication_job_directory_not_direct_child"
                 )
-            if english_stat.st_size <= 0:
-                raise FileNotFoundError(
-                    f"final file empty: {paths.english_srt_path_mac}"
+            if (
+                paths.japanese_srt_path_mac.parent != paths.job_dir_mac
+                or paths.english_srt_path_mac.parent != paths.job_dir_mac
+            ):
+                raise ValueError(
+                    "catalog_publication_subtitle_not_direct_child"
                 )
+            try:
+                directory_fd = os.open(
+                    paths.job_dir_mac,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "catalog_publication_job_directory_unavailable"
+                ) from exc
+            try:
+                opened_directory_stat = os.fstat(directory_fd)
+                if not stat.S_ISDIR(opened_directory_stat.st_mode) or (
+                    opened_directory_stat.st_dev,
+                    opened_directory_stat.st_ino,
+                ) != (
+                    job_directory_stat.st_dev,
+                    job_directory_stat.st_ino,
+                ):
+                    raise RuntimeError(
+                        "subtitle_snapshot_changed_before_prepare"
+                    )
+                japanese_sha256 = _sha256_regular_nonempty_file_at(
+                    directory_fd,
+                    paths.japanese_srt_path_mac.name,
+                    "japanese",
+                )
+                english_sha256 = _sha256_regular_nonempty_file_at(
+                    directory_fd,
+                    paths.english_srt_path_mac.name,
+                    "english",
+                )
+                try:
+                    final_directory_stat = paths.job_dir_mac.lstat()
+                except OSError as exc:
+                    raise RuntimeError(
+                        "subtitle_snapshot_changed_before_prepare"
+                    ) from exc
+                if (
+                    stat.S_ISLNK(final_directory_stat.st_mode)
+                    or not stat.S_ISDIR(final_directory_stat.st_mode)
+                    or (
+                        final_directory_stat.st_dev,
+                        final_directory_stat.st_ino,
+                    )
+                    != (
+                        opened_directory_stat.st_dev,
+                        opened_directory_stat.st_ino,
+                    )
+                ):
+                    raise RuntimeError(
+                        "subtitle_snapshot_changed_before_prepare"
+                    )
+            finally:
+                os.close(directory_fd)
+            if (
+                japanese_sha256 != expected_japanese_sha256
+                or english_sha256 != expected_english_sha256
+            ):
+                raise RuntimeError("subtitle_snapshot_changed_before_prepare")
             cursor = conn.execute(
                 """
                 UPDATE jobs

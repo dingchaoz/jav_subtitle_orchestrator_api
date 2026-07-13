@@ -1021,3 +1021,80 @@ def test_prepare_catalog_publication_canary_rejects_subtitle_changed_before_tran
     assert store.get_job(job.id) == row_before
     expected_files = {**files_before, changed_language: changed_bytes}
     assert _canary_files_snapshot(paths) == expected_files
+
+
+def test_prepare_catalog_publication_canary_binds_snapshot_at_store_boundary(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-042")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-042")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+    replacement = b"replacement after service validation\n"
+    real_prepare = store.prepare_catalog_publication_repair
+
+    def replace_then_prepare(*args, **kwargs):
+        paths.english_srt_path_mac.write_bytes(replacement)
+        return real_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "prepare_catalog_publication_repair",
+        replace_then_prepare,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-042",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    assert store.get_job(job.id) == row_before
+    expected_files = {**files_before, "english": replacement}
+    assert _canary_files_snapshot(paths) == expected_files
+
+
+def test_prepare_catalog_publication_canary_rejects_symlinked_job_directory(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job = store.submit_job("abc-043", priority=100, force=False).job
+    external_paths = _write_subtitles(tmp_path / "outside-jobs", "abc-043")
+    external_paths.audio_path_mac.write_bytes(b"canary-audio")
+    rejected = external_paths.job_dir_mac / "rejected"
+    rejected.mkdir()
+    (rejected / "existing.srt").write_bytes(b"existing-rejected")
+    paths = build_job_paths("abc-043", mac_jobs_root, "M:\\")
+    mac_jobs_root.mkdir(parents=True, exist_ok=True)
+    paths.job_dir_mac.symlink_to(
+        external_paths.job_dir_mac,
+        target_is_directory=True,
+    )
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = ?, translation_attempt_count = 3, "
+            "publish_attempt_count = 4, error = ? WHERE id = ?",
+            (JobStatus.FAILED.value, "stale publication error", job.id),
+        )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-043")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="job_directory"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-043",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    assert store.get_job(job.id) == row_before
+    assert _canary_files_snapshot(paths) == files_before

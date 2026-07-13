@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -160,6 +161,7 @@ def test_prepare_catalog_publication_preserves_translation_and_artifacts(
         job.id,
         expected_status=JobStatus.FAILED,
         expected_movie="abc-021",
+        **_catalog_subtitle_hashes(paths),
     )
 
     assert prepared.status is JobStatus.PUBLISH_PENDING
@@ -256,6 +258,17 @@ def _catalog_artifact_snapshot(paths):
     }
 
 
+def _catalog_subtitle_hashes(paths):
+    return {
+        "expected_japanese_sha256": hashlib.sha256(
+            paths.japanese_srt_path_mac.read_bytes()
+        ).hexdigest(),
+        "expected_english_sha256": hashlib.sha256(
+            paths.english_srt_path_mac.read_bytes()
+        ).hexdigest(),
+    }
+
+
 def test_prepare_catalog_publication_rejects_expected_movie_mismatch_atomically(
     sqlite_path, mac_jobs_root
 ):
@@ -272,6 +285,7 @@ def test_prepare_catalog_publication_rejects_expected_movie_mismatch_atomically(
             job_id,
             expected_status=JobStatus.FAILED,
             expected_movie="abc-023",
+            **_catalog_subtitle_hashes(paths),
         )
 
     assert store.get_job(job_id) == row_before
@@ -297,6 +311,7 @@ def test_prepare_catalog_publication_rejects_claimed_row_atomically(
             job_id,
             expected_status=JobStatus.FAILED,
             expected_movie="abc-024",
+            **_catalog_subtitle_hashes(paths),
         )
 
     assert store.get_job(job_id) == row_before
@@ -328,6 +343,7 @@ def test_prepare_catalog_publication_rejects_ineligible_status_atomically(
             job_id,
             expected_status=status,
             expected_movie="abc-025",
+            **_catalog_subtitle_hashes(paths),
         )
 
     assert store.get_job(job_id) == row_before
@@ -368,6 +384,7 @@ def test_prepare_catalog_publication_rejects_verified_ready_atomically(
             job_id,
             expected_status=JobStatus.ENGLISH_SRT_READY,
             expected_movie="abc-026",
+            **_catalog_subtitle_hashes(paths),
         )
 
     assert store.get_job(job_id) == row_before
@@ -394,6 +411,8 @@ def test_prepare_catalog_publication_rejects_invalid_canonical_english_atomicall
             job_id,
             expected_status=JobStatus.FAILED,
             expected_movie="abc-027",
+            expected_japanese_sha256="0" * 64,
+            expected_english_sha256="0" * 64,
         )
 
     assert store.get_job(job_id) == row_before
@@ -425,6 +444,8 @@ def test_prepare_catalog_publication_rejects_symlinked_canonical_english_atomica
             job_id,
             expected_status=JobStatus.FAILED,
             expected_movie="abc-028",
+            expected_japanese_sha256="0" * 64,
+            expected_english_sha256="0" * 64,
         )
 
     assert store.get_job(job_id) == row_before
@@ -433,6 +454,103 @@ def test_prepare_catalog_publication_rejects_symlinked_canonical_english_atomica
     assert paths.english_srt_path_mac.lstat() == link_stat_before
     assert paths.english_srt_path_mac.readlink() == link_target_before
     assert external_english.read_bytes() == external_before
+
+
+@pytest.mark.parametrize("changed_language", ["japanese", "english"])
+def test_prepare_catalog_publication_rejects_subtitle_snapshot_mismatch_atomically(
+    sqlite_path, mac_jobs_root, changed_language
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-030"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    expected_hashes[f"expected_{changed_language}_sha256"] = "0" * 64
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-030",
+            **expected_hashes,
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+@pytest.mark.parametrize("invalid_hash", ["0" * 63, "A" * 64, "g" * 64])
+def test_prepare_catalog_publication_rejects_invalid_snapshot_hash_atomically(
+    sqlite_path, mac_jobs_root, invalid_hash
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-032"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    expected_hashes["expected_english_sha256"] = invalid_hash
+
+    with pytest.raises(ValueError, match="expected_english_sha256"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-032",
+            **expected_hashes,
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+def test_prepare_catalog_publication_rejects_symlinked_job_directory_atomically(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-031", priority=100, force=False).job
+    external_root = tmp_path / "outside-jobs"
+    external_store = JobStore(tmp_path / "external.sqlite3", external_root, "M:\\")
+    external_store.initialize()
+    _, external_paths = _prepare_catalog_publication_candidate(
+        external_store,
+        external_root,
+        "abc-031",
+    )
+    canonical_paths = build_job_paths("abc-031", mac_jobs_root, "M:\\")
+    mac_jobs_root.mkdir(parents=True, exist_ok=True)
+    canonical_paths.job_dir_mac.symlink_to(
+        external_paths.job_dir_mac,
+        target_is_directory=True,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_attempt_count = 3, "
+            "publish_attempt_count = 4, error = ? WHERE id = ?",
+            (JobStatus.FAILED.value, "stale repair error", job.id),
+        )
+    row_before = store.get_job(job.id)
+    files_before = _catalog_artifact_snapshot(canonical_paths)
+    expected_hashes = _catalog_subtitle_hashes(canonical_paths)
+
+    with pytest.raises(ValueError, match="job_directory"):
+        store.prepare_catalog_publication_repair(
+            job.id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-031",
+            **expected_hashes,
+        )
+
+    assert store.get_job(job.id) == row_before
+    assert _catalog_artifact_snapshot(canonical_paths) == files_before
 
 
 def test_prepare_catalog_publication_accepts_unverified_legacy_ready(
@@ -456,6 +574,7 @@ def test_prepare_catalog_publication_accepts_unverified_legacy_ready(
         job_id,
         expected_status=JobStatus.ENGLISH_SRT_READY,
         expected_movie="abc-029",
+        **_catalog_subtitle_hashes(paths),
     )
 
     assert prepared.status is JobStatus.PUBLISH_PENDING
