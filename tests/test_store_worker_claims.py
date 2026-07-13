@@ -670,6 +670,79 @@ def test_prepare_catalog_publication_rolls_back_if_english_replaced_after_update
     assert _catalog_artifact_snapshot(paths) == expected_files
 
 
+def test_prepare_catalog_publication_rolls_back_if_job_directory_replaced_after_update(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-037"
+    )
+    row_before = store.get_job(job_id)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    replacement_directory = tmp_path / "replacement-job"
+    replacement_directory.mkdir()
+    replacement_files = {
+        paths.audio_path_mac.name: b"replacement-audio",
+        paths.japanese_srt_path_mac.name: b"replacement-japanese\n",
+        paths.english_srt_path_mac.name: b"replacement-english\n",
+        "rejected/existing.srt": b"replacement-rejected",
+    }
+    for relative_name, contents in replacement_files.items():
+        replacement_path = replacement_directory / relative_name
+        replacement_path.parent.mkdir(parents=True, exist_ok=True)
+        replacement_path.write_bytes(contents)
+    original_backup = tmp_path / "original-job-backup"
+    replaced = False
+
+    class ReplaceDirectoryAfterUpdateConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal replaced
+            cursor = super().execute(sql, parameters)
+            if (
+                not replaced
+                and "UPDATE jobs" in sql
+                and parameters
+                and parameters[0] == JobStatus.PUBLISH_PENDING.value
+            ):
+                paths.job_dir_mac.rename(original_backup)
+                replacement_directory.rename(paths.job_dir_mac)
+                replaced = True
+            return cursor
+
+    def connect_with_directory_replacement():
+        connection = sqlite3.connect(
+            sqlite_path,
+            factory=ReplaceDirectoryAfterUpdateConnection,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    monkeypatch.setattr(store, "connect", connect_with_directory_replacement)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-037",
+            **expected_hashes,
+        )
+
+    assert replaced is True
+    assert store.get_job(job_id) == row_before
+    assert {
+        str(path.relative_to(paths.job_dir_mac)): path.read_bytes()
+        for path in paths.job_dir_mac.rglob("*")
+        if path.is_file()
+    } == replacement_files
+
+
 def test_prepare_catalog_publication_rejects_oversized_sparse_subtitle_atomically(
     sqlite_path, mac_jobs_root
 ):

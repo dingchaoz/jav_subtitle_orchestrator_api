@@ -149,6 +149,28 @@ def _require_basename_matches_open_file(
         raise RuntimeError("subtitle_snapshot_changed_before_prepare")
 
 
+def _require_path_matches_open_directory(
+    job_directory: Path,
+    configured_root: Path,
+    directory_fd: int,
+) -> None:
+    try:
+        path_stat = job_directory.lstat()
+        opened_stat = os.fstat(directory_fd)
+        canonical_job_directory = job_directory.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare") from exc
+    if (
+        stat.S_ISLNK(path_stat.st_mode)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or not stat.S_ISDIR(opened_stat.st_mode)
+        or canonical_job_directory.parent != configured_root
+        or (path_stat.st_dev, path_stat.st_ino)
+        != (opened_stat.st_dev, opened_stat.st_ino)
+    ):
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare")
+
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -1103,27 +1125,11 @@ class JobStore:
                     raise RuntimeError(
                         "subtitle_snapshot_changed_before_prepare"
                     )
-                try:
-                    final_directory_stat = paths.job_dir_mac.lstat()
-                except OSError as exc:
-                    raise RuntimeError(
-                        "subtitle_snapshot_changed_before_prepare"
-                    ) from exc
-                if (
-                    stat.S_ISLNK(final_directory_stat.st_mode)
-                    or not stat.S_ISDIR(final_directory_stat.st_mode)
-                    or (
-                        final_directory_stat.st_dev,
-                        final_directory_stat.st_ino,
-                    )
-                    != (
-                        opened_directory_stat.st_dev,
-                        opened_directory_stat.st_ino,
-                    )
-                ):
-                    raise RuntimeError(
-                        "subtitle_snapshot_changed_before_prepare"
-                    )
+                _require_path_matches_open_directory(
+                    paths.job_dir_mac,
+                    configured_root,
+                    directory_fd,
+                )
                 _require_basename_matches_open_file(
                     directory_fd,
                     paths.japanese_srt_path_mac.name,
@@ -1161,6 +1167,11 @@ class JobStore:
                     )
                 prepared = self.get_job(job_id, conn=conn)
                 assert prepared is not None
+                _require_path_matches_open_directory(
+                    paths.job_dir_mac,
+                    configured_root,
+                    directory_fd,
+                )
                 _require_basename_matches_open_file(
                     directory_fd,
                     paths.japanese_srt_path_mac.name,
