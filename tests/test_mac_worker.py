@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -622,6 +623,354 @@ def test_bad_historical_candidate_is_permanent_rejected_and_never_published(
     rejected = list((paths.job_dir_mac / "rejected").glob("*.srt"))
     assert len(rejected) == 2
     assert not paths.english_srt_path_mac.exists()
+
+
+def test_historical_local_quality_quarantine_is_durable_before_terminal(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-106")
+    worker = MacTranslationWorker(
+        store,
+        CollapsedMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    original = store.fail_historical_translation_permanent
+
+    def assert_quarantined_before_terminal(*args, **kwargs):
+        repair = store.get_historical_repair(job.id)
+        markers = list(
+            (paths.job_dir_mac / "rejected").glob(
+                f".quality-rejected-{repair.id}-*.json"
+            )
+        )
+        assert not paths.english_srt_path_mac.exists()
+        assert len(markers) == 1
+        marker = json.loads(markers[0].read_text(encoding="utf-8"))
+        assert marker["reason_code"].startswith("quality_gate_failed:")
+        assert marker["candidate_sha256"] == kwargs["english_sha256"]
+        assert "日本語" not in markers[0].read_text(encoding="utf-8")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "fail_historical_translation_permanent",
+        assert_quarantined_before_terminal,
+    )
+
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert (
+        store.get_historical_repair(job.id).state
+        is HistoricalRepairState.PERMANENT_FAILED
+    )
+
+
+def test_historical_local_quality_crash_after_quarantine_resumes_without_retranslation(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-107")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-crash-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    worker.translator = CollapsedMacTranslator()
+    claimed = store.claim_next_historical_repair(worker.worker_id, 60)
+    assert claimed is not None
+    original = store.fail_historical_translation_permanent
+
+    def crash_before_database(*args, **kwargs):
+        assert not paths.english_srt_path_mac.exists()
+        raise KeyboardInterrupt("simulated crash after durable quarantine")
+
+    monkeypatch.setattr(
+        store,
+        "fail_historical_translation_permanent",
+        crash_before_database,
+    )
+    with pytest.raises(KeyboardInterrupt, match="durable quarantine"):
+        worker._process_historical_translation(claimed)
+
+    assert store.get_job(job.id).status is JobStatus.TRANSLATING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert list(
+        (paths.job_dir_mac / "rejected").glob(".quality-rejected-*.json")
+    )
+    monkeypatch.setattr(
+        store,
+        "fail_historical_translation_permanent",
+        original,
+    )
+    expired = (datetime.now(UTC) - timedelta(seconds=1)).replace(
+        microsecond=0
+    ).isoformat()
+    store.force_lease_expiry_for_test(job.id, expired)
+    recovery_events = []
+    recovering = MacTranslationWorker(
+        store,
+        RecordingTranslator(recovery_events),
+        max_translation_attempts=3,
+        worker_id="mac-crash-2",
+        lease_seconds=60,
+        publisher=RecordingPublisher(recovery_events),
+        catalog_sync_client=RecordingCatalogSync(recovery_events),
+    )
+
+    assert recovering.process_one() is True
+
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert (
+        store.get_historical_repair(job.id).state
+        is HistoricalRepairState.PERMANENT_FAILED
+    )
+    assert recovery_events == []
+    assert not paths.english_srt_path_mac.exists()
+
+
+def test_historical_local_quality_crash_before_quarantine_keeps_canonical_nonterminal(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-117")
+    worker = MacTranslationWorker(
+        store,
+        CollapsedMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-before-quarantine",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    claimed = store.claim_next_historical_repair(worker.worker_id, 60)
+    assert claimed is not None
+    original = worker._historical_quarantine_locked
+
+    def crash_before_quality_quarantine(*args, **kwargs):
+        if kwargs.get("quality_marker") is not None:
+            raise KeyboardInterrupt("simulated crash before quarantine")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker,
+        "_historical_quarantine_locked",
+        crash_before_quality_quarantine,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="before quarantine"):
+        worker._process_historical_translation(claimed)
+
+    assert store.get_job(job.id).status is JobStatus.TRANSLATING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert store.historical_lane_state().consecutive_quality_failures == 0
+    assert paths.english_srt_path_mac.exists()
+    assert not list(
+        (paths.job_dir_mac / "rejected").glob(".quality-rejected-*.json")
+    )
+
+
+def test_historical_publisher_quality_crash_resumes_without_reupload(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-108")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-publish-crash-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            events,
+            errors=[
+                SubtitleQualityGateError(
+                    ["subtitle_changed_after_validation"]
+                )
+            ],
+        ),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert worker.process_one() is True
+    original = store.fail_historical_publication
+
+    def crash_before_database(*args, **kwargs):
+        assert not paths.english_srt_path_mac.exists()
+        assert list(
+            (paths.job_dir_mac / "rejected").glob(
+                ".quality-rejected-*.json"
+            )
+        )
+        raise KeyboardInterrupt("simulated publisher crash before database")
+
+    monkeypatch.setattr(
+        store, "fail_historical_publication", crash_before_database
+    )
+    with pytest.raises(KeyboardInterrupt, match="publisher crash"):
+        worker.process_one()
+
+    assert [event[0] for event in events] == ["publish"]
+    assert store.get_job(job.id).status is JobStatus.PUBLISHING
+    monkeypatch.setattr(store, "fail_historical_publication", original)
+    expired = (datetime.now(UTC) - timedelta(seconds=1)).replace(
+        microsecond=0
+    ).isoformat()
+    store.force_lease_expiry_for_test(job.id, expired)
+    recovery_events = []
+    recovering = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-publish-crash-2",
+        lease_seconds=60,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(
+            recovery_events,
+            errors=[AssertionError("quality marker must prevent reupload")],
+        ),
+        catalog_sync_client=RecordingCatalogSync(recovery_events),
+    )
+
+    assert recovering.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert (
+        store.get_historical_repair(job.id).state
+        is HistoricalRepairState.PERMANENT_FAILED
+    )
+    assert recovery_events == []
+
+
+def test_historical_publisher_quarantine_symlink_failure_pauses_without_terminal(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-109")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-symlink-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            errors=[
+                SubtitleQualityGateError(
+                    ["subtitle_changed_after_validation"]
+                )
+            ],
+        ),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert worker.process_one() is True
+    outside = paths.job_dir_mac.parent / "outside-bad.srt"
+    outside.write_bytes(b"outside must stay untouched")
+    paths.english_srt_path_mac.unlink()
+    paths.english_srt_path_mac.symlink_to(outside)
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert current.status is JobStatus.PUBLISH_PENDING
+    assert current.error == "publishing: quarantine_failed"
+    assert repair.state is HistoricalRepairState.RUNNING
+    assert repair.reason_code == "quarantine_failed"
+    assert lane.paused is True
+    assert lane.reason_code == "quarantine_failed"
+    assert lane.consecutive_quality_failures == 0
+    assert paths.english_srt_path_mac.is_symlink()
+    assert outside.read_bytes() == b"outside must stay untouched"
+
+
+def test_historical_local_quarantine_io_failure_pauses_without_terminal(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-110")
+    worker = MacTranslationWorker(
+        store,
+        CollapsedMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-io-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    original = worker._historical_quarantine_locked
+
+    def fail_quality_quarantine(*args, **kwargs):
+        if kwargs.get("quality_marker") is not None:
+            raise OSError("simulated rejected directory I/O failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker, "_historical_quarantine_locked", fail_quality_quarantine
+    )
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert current.status is JobStatus.FAILED
+    assert current.error == "historical_repair: quarantine_failed"
+    assert repair.state is HistoricalRepairState.RETRY_WAIT
+    assert repair.reason_code == "quarantine_failed"
+    assert lane.paused is True
+    assert lane.reason_code == "quarantine_failed"
+    assert lane.consecutive_quality_failures == 0
+    assert paths.english_srt_path_mac.exists()
+
+
+def test_historical_publication_local_gate_quarantines_before_permanent(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-116")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-publication-local-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert worker.process_one() is True
+    CollapsedMacTranslator().translate_to_english(
+        paths.japanese_srt_path_mac,
+        paths.english_srt_path_mac,
+    )
+
+    assert worker.process_one() is True
+
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    repair = store.get_historical_repair(job.id)
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code.startswith("quality_gate_failed:")
+    assert not paths.english_srt_path_mac.exists()
+    assert list(
+        (paths.job_dir_mac / "rejected").glob(".quality-rejected-*.json")
+    )
+    assert events == []
 
 
 def test_three_historical_quality_failures_pause_history_but_normal_still_runs(

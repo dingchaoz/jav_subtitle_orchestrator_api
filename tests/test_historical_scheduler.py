@@ -479,7 +479,7 @@ def test_quality_terminal_and_counter_rollback_together_on_injected_failure(
     assert store.historical_lane_state().consecutive_quality_failures == 0
 
 
-def test_reconciler_unblocks_legacy_running_failed_repair(
+def test_reconciler_fails_closed_for_unknown_running_failed_repair(
     sqlite_path, mac_jobs_root
 ):
     store = _store(sqlite_path, mac_jobs_root)
@@ -502,9 +502,169 @@ def test_reconciler_unblocks_legacy_running_failed_repair(
 
     assert store.reconcile_orphaned_historical_repairs() == 1
     repair = store.get_historical_repair(job.id)
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "historical_orphaned_terminal_state"
+    assert store.claim_next_historical_repair("mac-1", 60) is None
+
+
+def test_reconciler_preserves_receipts_for_exhausted_publication_orphan(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-211")
+    receipt = {
+        "published_subtitle_id": "subtitle-existing",
+        "published_storage_path": "subtitles/old-211/English_AI.srt",
+        "published_content_sha256": "c" * 64,
+        "published_file_size": 123,
+        "catalog_movie_uuid": "movie-existing",
+    }
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ?, "
+            "publish_attempt_count = 3, published_subtitle_id = ?, "
+            "published_storage_path = ?, published_content_sha256 = ?, "
+            "published_file_size = ?, catalog_movie_uuid = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "publishing: publication_failed",
+                receipt["published_subtitle_id"],
+                receipt["published_storage_path"],
+                receipt["published_content_sha256"],
+                receipt["published_file_size"],
+                receipt["catalog_movie_uuid"],
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs(
+        max_publish_attempts=3
+    ) == 1
+
+    repair = store.get_historical_repair(job.id)
+    refreshed = store.get_job(job.id)
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "publication_attempts_exhausted"
+    assert refreshed.status is JobStatus.FAILED
+    for field, expected in receipt.items():
+        assert getattr(refreshed, field) == expected
+    assert store.claim_next_historical_repair("mac-1", 60) is None
+
+
+def test_reconciler_counts_legacy_quality_failure_exactly_once(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-212")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "historical_repair: quality_gate_failed:dominant_text_collapse",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs(
+        quality_failure_limit=1
+    ) == 1
+    assert store.reconcile_orphaned_historical_repairs(
+        quality_failure_limit=1
+    ) == 0
+
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == (
+        "quality_gate_failed:dominant_text_collapse"
+    )
+    assert lane.consecutive_quality_failures == 1
+    assert lane.paused is True
+    assert lane.reason_code == "quality_failure_limit"
+
+
+def test_reconciler_quality_terminal_and_counter_rollback_together(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-214")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "historical_repair: quality_gate_failed:collapsed_output",
+                job.id,
+            ),
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER reject_reconciled_quality_counter
+            BEFORE UPDATE OF consecutive_quality_failures
+            ON historical_repair_control
+            BEGIN
+              SELECT RAISE(ABORT, 'injected reconciler counter failure');
+            END
+            """
+        )
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="injected reconciler counter failure",
+    ):
+        store.reconcile_orphaned_historical_repairs()
+
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert store.historical_lane_state().consecutive_quality_failures == 0
+
+
+def test_reconciler_retries_only_explicit_unexhausted_lease_orphan(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-213")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ?, "
+            "attempt_count = 1 WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "historical_repair: translation_lease_expired",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs(
+        max_translation_attempts=3
+    ) == 1
+    repair = store.get_historical_repair(job.id)
     assert repair.state is HistoricalRepairState.RETRY_WAIT
-    assert repair.reason_code == "orphaned_running_reconciled"
-    assert store.claim_next_historical_repair("mac-1", 60) is not None
+    assert repair.reason_code == "historical_orphaned_transient_retry"
 
 
 def test_paused_lane_blocks_inflight_historical_claim(

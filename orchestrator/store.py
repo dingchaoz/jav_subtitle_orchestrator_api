@@ -1610,14 +1610,29 @@ class JobStore:
             ).fetchone()
             return row is not None
 
-    def reconcile_orphaned_historical_repairs(self) -> int:
+    def reconcile_orphaned_historical_repairs(
+        self,
+        *,
+        max_translation_attempts: int = 3,
+        max_publish_attempts: int = 10,
+        max_catalog_sync_attempts: int = 10,
+        quality_failure_limit: int = 3,
+    ) -> int:
+        if min(
+            max_translation_attempts,
+            max_publish_attempts,
+            max_catalog_sync_attempts,
+            quality_failure_limit,
+        ) < 1:
+            raise ValueError("historical reconciliation limits must be positive")
         now = utc_now_iso()
         reconciled = 0
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT r.job_id, j.error
+                SELECT r.job_id, r.attempt_count, j.error,
+                       j.publish_attempt_count, j.catalog_sync_attempt_count
                 FROM historical_translation_repairs AS r
                 JOIN jobs AS j ON j.id = r.job_id
                 WHERE r.state = ? AND j.status = ? AND j.claimed_by IS NULL
@@ -1631,24 +1646,50 @@ class JobStore:
             ).fetchall()
             for row in rows:
                 error = row["error"] or ""
-                known_permanent = (
-                    "quality_gate_failed:" in error
-                    or "preservation_hash_changed" in error
+                translation_retry = (
+                    "translation_lease_expired" in error
+                    and row["attempt_count"] < max_translation_attempts
                 )
-                if known_permanent:
-                    state = HistoricalRepairState.PERMANENT_FAILED
-                    next_attempt_at = None
-                    reason_code = (
-                        "preservation_hash_changed"
-                        if "preservation_hash_changed" in error
-                        else error.split("quality_gate_failed:", 1)[1]
-                    )
-                    if not reason_code.startswith("quality_gate_failed:"):
-                        reason_code = "quality_gate_failed:" + reason_code
-                else:
+                publication_retry = (
+                    "publication lease expired" in error
+                    and row["publish_attempt_count"] < max_publish_attempts
+                )
+                catalog_retry = (
+                    "catalog_sync_lease_expired" in error
+                    and row["catalog_sync_attempt_count"]
+                    < max_catalog_sync_attempts
+                )
+                transient_retry = (
+                    translation_retry or publication_retry or catalog_retry
+                )
+                quality_failure = "quality_gate_failed:" in error
+                if transient_retry:
                     state = HistoricalRepairState.RETRY_WAIT
                     next_attempt_at = now
-                    reason_code = "orphaned_running_reconciled"
+                    reason_code = "historical_orphaned_transient_retry"
+                else:
+                    state = HistoricalRepairState.PERMANENT_FAILED
+                    next_attempt_at = None
+                    if quality_failure:
+                        reason_code = "quality_gate_failed:" + error.split(
+                            "quality_gate_failed:", 1
+                        )[1]
+                    elif "preservation_hash_changed" in error:
+                        reason_code = "preservation_hash_changed"
+                    elif (
+                        row["publish_attempt_count"]
+                        >= max_publish_attempts
+                        or "publication_attempts_exhausted" in error
+                    ):
+                        reason_code = "publication_attempts_exhausted"
+                    elif (
+                        row["catalog_sync_attempt_count"]
+                        >= max_catalog_sync_attempts
+                        or "catalog_sync_attempts_exhausted" in error
+                    ):
+                        reason_code = "catalog_sync_attempts_exhausted"
+                    else:
+                        reason_code = "historical_orphaned_terminal_state"
                 cursor = conn.execute(
                     """
                     UPDATE historical_translation_repairs
@@ -1666,6 +1707,14 @@ class JobStore:
                     ),
                 )
                 reconciled += cursor.rowcount
+                if (
+                    cursor.rowcount == 1
+                    and quality_failure
+                    and not transient_retry
+                ):
+                    self._increment_historical_quality_failure_conn(
+                        conn, quality_failure_limit, now
+                    )
         return reconciled
 
     def claim_next_historical_repair(
@@ -2269,6 +2318,86 @@ class JobStore:
                 )
             return self._historical_failure_outcome_conn(
                 conn, job_id, terminal=True
+            )
+
+    def fail_historical_translation_quarantine(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        lease_token: str,
+        retry_seconds: int,
+    ) -> HistoricalStageFailureOutcome:
+        if retry_seconds < 0:
+            raise ValueError("historical quarantine retry must be non-negative")
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        next_attempt_at = (
+            now_dt + timedelta(seconds=retry_seconds)
+        ).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            repair = self.get_historical_repair(job_id, conn=conn)
+            if job is None or repair is None:
+                raise KeyError(job_id)
+            if (
+                job.status is not JobStatus.TRANSLATING
+                or job.translation_origin != HISTORICAL_TRANSLATION_ORIGIN
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+                or repair.state is not HistoricalRepairState.RUNNING
+            ):
+                raise StageLeaseLostError("historical translation lease is lost")
+            job_cursor = conn.execute(
+                """
+                UPDATE jobs SET status = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    catalog_lease_token = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND stage_lease_token = ? AND lease_expires_at > ?
+                  AND translation_origin = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    "historical_repair: quarantine_failed",
+                    job_id,
+                    JobStatus.TRANSLATING.value,
+                    worker_id,
+                    lease_token,
+                    now,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            repair_cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = ?, reason_code = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    HistoricalRepairState.RETRY_WAIT.value,
+                    next_attempt_at,
+                    "quarantine_failed",
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                raise StageLeaseLostError("historical translation lease is lost")
+            conn.execute(
+                "UPDATE historical_repair_control SET paused = 1, "
+                "reason_code = 'quarantine_failed', updated_at = ? "
+                "WHERE singleton = 1",
+                (now,),
+            )
+            return self._historical_failure_outcome_conn(
+                conn, job_id, terminal=False
             )
 
     def mark_historical_success(
@@ -2967,6 +3096,84 @@ class JobStore:
                     )
             return self._historical_failure_outcome_conn(
                 conn, job_id, terminal=terminal
+            )
+
+    def fail_historical_publication_quarantine(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        lease_token: str,
+        retry_seconds: int,
+    ) -> HistoricalStageFailureOutcome:
+        if retry_seconds < 0:
+            raise ValueError("historical quarantine retry must be non-negative")
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        next_attempt_at = (
+            now_dt + timedelta(seconds=retry_seconds)
+        ).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            repair = self.get_historical_repair(job_id, conn=conn)
+            if job is None or repair is None:
+                raise KeyError(job_id)
+            if (
+                job.status is not JobStatus.PUBLISHING
+                or job.translation_origin != HISTORICAL_TRANSLATION_ORIGIN
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+                or repair.state is not HistoricalRepairState.RUNNING
+            ):
+                raise StageLeaseLostError("historical publication lease is lost")
+            job_cursor = conn.execute(
+                """
+                UPDATE jobs SET status = ?, next_publish_attempt_at = ?,
+                    claimed_by = NULL, lease_expires_at = NULL,
+                    stage_lease_token = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND stage_lease_token = ? AND lease_expires_at > ?
+                  AND translation_origin = ?
+                """,
+                (
+                    JobStatus.PUBLISH_PENDING.value,
+                    next_attempt_at,
+                    now,
+                    "publishing: quarantine_failed",
+                    job_id,
+                    JobStatus.PUBLISHING.value,
+                    worker_id,
+                    lease_token,
+                    now,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            repair_cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET reason_code = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    "quarantine_failed",
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                raise StageLeaseLostError("historical publication lease is lost")
+            conn.execute(
+                "UPDATE historical_repair_control SET paused = 1, "
+                "reason_code = 'quarantine_failed', updated_at = ? "
+                "WHERE singleton = 1",
+                (now,),
+            )
+            return self._historical_failure_outcome_conn(
+                conn, job_id, terminal=False
             )
 
     def complete_supabase_publication(
