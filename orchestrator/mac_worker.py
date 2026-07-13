@@ -25,6 +25,13 @@ def _append_job_log_safely(job_dir: Path, filename: str, message: str) -> None:
         return
 
 
+def _write_job_snapshot_safely(job: JobRecord) -> None:
+    try:
+        write_job_snapshot(job)
+    except Exception:
+        return
+
+
 class MacDownloadWorker:
     def __init__(
         self,
@@ -81,7 +88,7 @@ class MacDownloadWorker:
             self.store.jobs_root_windows,
         )
         Path(paths.job_dir_mac).mkdir(parents=True, exist_ok=True)
-        write_job_snapshot(job)
+        _write_job_snapshot_safely(job)
 
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -94,7 +101,7 @@ class MacDownloadWorker:
             JobStatus.DOWNLOADING_AUDIO,
             metadata_path_mac=str(paths.metadata_path_mac),
         )
-        write_job_snapshot(updated)
+        _write_job_snapshot_safely(updated)
 
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -117,7 +124,7 @@ class MacDownloadWorker:
                 audio_path_mac=str(paths.audio_path_mac),
                 audio_path_windows=paths.audio_path_windows,
             )
-        write_job_snapshot(updated)
+        _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
             "mac-download.log",
@@ -137,7 +144,7 @@ class MacDownloadWorker:
             next_attempts,
             error,
         )
-        write_job_snapshot(updated)
+        _write_job_snapshot_safely(updated)
 
 
 class MacTranslationQualityError(RuntimeError):
@@ -316,7 +323,7 @@ class MacTranslationWorker:
                 self.max_translation_attempts,
                 permanent=isinstance(exc, MacTranslationQualityError),
             )
-            write_job_snapshot(updated)
+            _write_job_snapshot_safely(updated)
             _append_job_log_safely(
                 Path(job.job_dir_mac),
                 "mac-translation.log",
@@ -368,7 +375,7 @@ class MacTranslationWorker:
                 lambda path: Path(path).exists(),
             )
             ready_message = f"publish_pending {job.id}"
-        write_job_snapshot(updated)
+        _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
             "mac-translation.log",
@@ -412,7 +419,7 @@ class MacTranslationWorker:
                 retry_seconds=self.publish_retry_seconds,
                 permanent=permanent,
             )
-            write_job_snapshot(updated)
+            _write_job_snapshot_safely(updated)
             _append_job_log_safely(
                 Path(job.job_dir_mac),
                 "mac-translation.log",
@@ -457,7 +464,7 @@ class MacTranslationWorker:
             file_size=published.file_size,
         )
         self.consecutive_quality_failures = 0
-        write_job_snapshot(updated)
+        _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
             "mac-translation.log",
@@ -481,12 +488,13 @@ class MacTranslationWorker:
             updated = self.store.complete_catalog_sync(
                 job.id,
                 self.worker_id,
+                lease_token=job.catalog_lease_token,
                 canonical_code=result.canonical_code,
                 d1_rows_updated=result.d1_rows_updated,
                 subtitle_count=result.subtitle_count,
                 kv_keys_deleted=result.kv_keys_deleted,
             )
-            write_job_snapshot(updated)
+            _write_job_snapshot_safely(updated)
             _append_job_log_safely(
                 Path(job.job_dir_mac),
                 "mac-translation.log",
@@ -510,10 +518,11 @@ class MacTranslationWorker:
                 job.id,
                 self.worker_id,
                 reason_code,
+                lease_token=job.catalog_lease_token,
                 max_catalog_sync_attempts=self.max_catalog_sync_attempts,
                 retry_seconds=self.catalog_sync_retry_seconds,
             )
-            write_job_snapshot(updated)
+            _write_job_snapshot_safely(updated)
             _append_job_log_safely(
                 Path(job.job_dir_mac),
                 "mac-translation.log",

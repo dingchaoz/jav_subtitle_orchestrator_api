@@ -1012,6 +1012,77 @@ def test_worker_restart_resumes_only_catalog_stage(sqlite_path, mac_jobs_root):
     assert [event[0] for event in events] == ["translate", "publish", "catalog"]
 
 
+def test_publication_snapshot_failure_cannot_undo_committed_receipt(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert worker.process_one() is True
+    monkeypatch.setattr(
+        "orchestrator.mac_worker.write_job_snapshot",
+        lambda job: (_ for _ in ()).throw(OSError("snapshot secret body")),
+    )
+
+    assert worker.process_one() is True
+
+    committed = store.get_job(job.id)
+    assert committed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert committed.publish_attempt_count == 0
+    assert committed.error is None
+    assert "snapshot secret body" not in (
+        mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
+    ).read_text(encoding="utf-8")
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_catalog_snapshot_failure_keeps_ready_and_worker_continues(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-030")
+    second = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-031")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert store.get_job(first.id).status is JobStatus.CATALOG_SYNC_PENDING
+    monkeypatch.setattr(
+        "orchestrator.mac_worker.write_job_snapshot",
+        lambda job: (_ for _ in ()).throw(OSError("snapshot secret body")),
+    )
+
+    assert worker.process_one() is True
+
+    ready = store.get_job(first.id)
+    assert ready.status is JobStatus.ENGLISH_SRT_READY
+    assert ready.catalog_sync_attempt_count == 0
+    assert ready.error is None
+    assert "snapshot secret body" not in (
+        mac_jobs_root / "abc-030" / "logs" / "mac-translation.log"
+    ).read_text(encoding="utf-8")
+    assert worker.process_one() is True
+    assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
+
+
 def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
     sqlite_path, mac_jobs_root
 ):

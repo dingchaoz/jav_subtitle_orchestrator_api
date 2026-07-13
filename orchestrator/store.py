@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.models import JobStatus
@@ -43,6 +43,50 @@ def _validate_expected_sha256(value: str, label: str) -> None:
         or any(character not in _LOWERCASE_HEX_DIGITS for character in value)
     ):
         raise ValueError(f"{label} must be 64 lowercase hexadecimal characters")
+
+
+def _validate_verified_supabase_receipt(
+    *,
+    movie_code: str,
+    movie_uuid: object,
+    metadata_status: object,
+    metadata_source: object,
+    subtitle_id: object,
+    storage_path: object,
+    content_sha256: object,
+    file_size: object,
+) -> None:
+    try:
+        canonical = canonical_movie_code(movie_code)
+        movie_uuid_valid = (
+            isinstance(movie_uuid, str) and str(UUID(movie_uuid)) == movie_uuid
+        )
+        subtitle_id_valid = (
+            isinstance(subtitle_id, str) and str(UUID(subtitle_id)) == subtitle_id
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("verified Supabase receipt is invalid") from None
+    expected_storage_path = (
+        f"{canonical.split('-', 1)[0]}/{canonical}/{canonical}-English_AI.srt"
+    )
+    valid_sha256 = (
+        isinstance(content_sha256, str)
+        and len(content_sha256) == 64
+        and all(character in _LOWERCASE_HEX_DIGITS for character in content_sha256)
+    )
+    if not (
+        movie_uuid_valid
+        and subtitle_id_valid
+        and metadata_status in _VERIFIED_METADATA_STATUSES
+        and metadata_source in _VERIFIED_METADATA_SOURCES
+        and isinstance(storage_path, str)
+        and storage_path == expected_storage_path
+        and valid_sha256
+        and isinstance(file_size, int)
+        and not isinstance(file_size, bool)
+        and file_size > 0
+    ):
+        raise ValueError("verified Supabase receipt is invalid")
 
 
 def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
@@ -235,6 +279,7 @@ class JobRecord:
     published_file_size: int | None
     catalog_sync_attempt_count: int
     next_catalog_sync_attempt_at: str | None
+    catalog_lease_token: str | None
     catalog_movie_uuid: str | None
     metadata_status: str | None
     metadata_source: str | None
@@ -326,6 +371,7 @@ class JobStore:
                   published_file_size INTEGER,
                   catalog_sync_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_catalog_sync_attempt_at TEXT,
+                  catalog_lease_token TEXT,
                   catalog_movie_uuid TEXT,
                   metadata_status TEXT,
                   metadata_source TEXT,
@@ -375,6 +421,7 @@ class JobStore:
                 "published_file_size": "INTEGER",
                 "catalog_sync_attempt_count": "INTEGER NOT NULL DEFAULT 0",
                 "next_catalog_sync_attempt_at": "TEXT",
+                "catalog_lease_token": "TEXT",
             }
             for column, definition in durable_state_columns.items():
                 if column not in columns:
@@ -1292,6 +1339,7 @@ class JobStore:
                     UPDATE jobs
                     SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
                         publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                        catalog_lease_token = NULL,
                         catalog_movie_uuid = NULL, metadata_status = NULL,
                         metadata_source = NULL, updated_at = ?, error = NULL,
                         english_srt_path_mac = ?, english_srt_path_windows = ?
@@ -1356,7 +1404,7 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                    updated_at = ?, error = NULL,
+                    catalog_lease_token = NULL, updated_at = ?, error = NULL,
                     english_srt_path_mac = ?, english_srt_path_windows = ?
                 WHERE id = ? AND claimed_by = ?
                 """,
@@ -1535,31 +1583,6 @@ class JobStore:
         content_sha256: str,
         file_size: int,
     ) -> JobRecord:
-        if metadata_status not in _VERIFIED_METADATA_STATUSES:
-            raise ValueError(f"invalid metadata status: {metadata_status}")
-        if metadata_source not in _VERIFIED_METADATA_SOURCES:
-            raise ValueError(f"invalid metadata source: {metadata_source}")
-        for value, label in ((movie_uuid, "movie"), (subtitle_id, "subtitle")):
-            try:
-                parsed = UUID(value)
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise ValueError(f"invalid {label} UUID") from exc
-            if str(parsed) != value:
-                raise ValueError(f"invalid {label} UUID")
-        _validate_expected_sha256(content_sha256, "published content SHA-256")
-        if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 1:
-            raise ValueError("published file size must be a positive integer")
-        if (
-            not isinstance(storage_path, str)
-            or not storage_path
-            or len(storage_path) > 1024
-            or storage_path != storage_path.strip()
-            or storage_path.startswith("/")
-            or "\\" in storage_path
-            or any(part in {"", ".", ".."} for part in storage_path.split("/"))
-        ):
-            raise ValueError("invalid published storage path")
-
         now = utc_now_iso()
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1568,13 +1591,16 @@ class JobStore:
                 raise KeyError(job_id)
             if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
-            canonical = canonical_movie_code(job.normalized_movie_number)
-            expected_storage_path = (
-                f"{canonical.split('-', 1)[0]}/{canonical}/"
-                f"{canonical}-English_AI.srt"
+            _validate_verified_supabase_receipt(
+                movie_code=job.normalized_movie_number,
+                movie_uuid=movie_uuid,
+                metadata_status=metadata_status,
+                metadata_source=metadata_source,
+                subtitle_id=subtitle_id,
+                storage_path=storage_path,
+                content_sha256=content_sha256,
+                file_size=file_size,
             )
-            if storage_path != expected_storage_path:
-                raise ValueError("published storage path does not match job")
             cursor = conn.execute(
                 """
                 UPDATE jobs
@@ -1583,7 +1609,7 @@ class JobStore:
                     published_storage_path = ?, published_content_sha256 = ?,
                     published_file_size = ?, next_publish_attempt_at = NULL,
                     catalog_sync_attempt_count = 0,
-                    next_catalog_sync_attempt_at = NULL,
+                    next_catalog_sync_attempt_at = NULL, catalog_lease_token = NULL,
                     claimed_by = NULL, lease_expires_at = NULL,
                     updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
@@ -1626,9 +1652,9 @@ class JobStore:
             if job_id is not None:
                 job_filter = " AND id = ?"
                 parameters.append(job_id)
-            row = conn.execute(
+            rows = conn.execute(
                 f"""
-                SELECT id FROM jobs
+                SELECT * FROM jobs
                 WHERE status = ? AND claimed_by IS NULL
                   AND (next_catalog_sync_attempt_at IS NULL
                        OR next_catalog_sync_attempt_at <= ?)
@@ -1641,16 +1667,35 @@ class JobStore:
                   AND published_file_size > 0
                   {job_filter}
                 ORDER BY priority ASC, created_at ASC
-                LIMIT 1
                 """,
                 parameters,
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            candidate = None
+            for row in rows:
+                job = self._row_to_job(row)
+                try:
+                    _validate_verified_supabase_receipt(
+                        movie_code=job.normalized_movie_number,
+                        movie_uuid=job.catalog_movie_uuid,
+                        metadata_status=job.metadata_status,
+                        metadata_source=job.metadata_source,
+                        subtitle_id=job.published_subtitle_id,
+                        storage_path=job.published_storage_path,
+                        content_sha256=job.published_content_sha256,
+                        file_size=job.published_file_size,
+                    )
+                except ValueError:
+                    continue
+                candidate = job
+                break
+            if candidate is None:
                 return None
+            lease_token = uuid4().hex
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                SET status = ?, claimed_by = ?, lease_expires_at = ?,
+                    catalog_lease_token = ?, updated_at = ?
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
                   AND (next_catalog_sync_attempt_at IS NULL
                        OR next_catalog_sync_attempt_at <= ?)
@@ -1666,15 +1711,16 @@ class JobStore:
                     JobStatus.CATALOG_SYNCING.value,
                     worker_id,
                     lease,
+                    lease_token,
                     now,
-                    row["id"],
+                    candidate.id,
                     JobStatus.CATALOG_SYNC_PENDING.value,
                     now,
                 ),
             )
             if cursor.rowcount != 1:
                 return None
-            return self.get_job(row["id"], conn=conn)
+            return self.get_job(candidate.id, conn=conn)
 
     def fail_catalog_sync(
         self,
@@ -1682,6 +1728,7 @@ class JobStore:
         worker_id: str,
         reason_code: str,
         *,
+        lease_token: str,
         max_catalog_sync_attempts: int,
         retry_seconds: int,
     ) -> JobRecord:
@@ -1694,7 +1741,13 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.status is not JobStatus.CATALOG_SYNCING or job.claimed_by != worker_id:
+            if (
+                job.status is not JobStatus.CATALOG_SYNCING
+                or job.claimed_by != worker_id
+                or job.catalog_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
             attempts = job.catalog_sync_attempt_count + 1
             exhausted = attempts >= max_catalog_sync_attempts
@@ -1709,8 +1762,11 @@ class JobStore:
                 UPDATE jobs
                 SET status = ?, catalog_sync_attempt_count = ?,
                     next_catalog_sync_attempt_at = ?, claimed_by = NULL,
-                    lease_expires_at = NULL, updated_at = ?, error = ?
+                    lease_expires_at = NULL, catalog_lease_token = NULL,
+                    updated_at = ?, error = ?
                 WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND catalog_lease_token = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     next_status.value,
@@ -1721,6 +1777,8 @@ class JobStore:
                     job_id,
                     JobStatus.CATALOG_SYNCING.value,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1734,6 +1792,7 @@ class JobStore:
         job_id: str,
         worker_id: str,
         *,
+        lease_token: str,
         canonical_code: str,
         d1_rows_updated: int,
         subtitle_count: int,
@@ -1764,27 +1823,35 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.status is not JobStatus.CATALOG_SYNCING or job.claimed_by != worker_id:
+            if (
+                job.status is not JobStatus.CATALOG_SYNCING
+                or job.claimed_by != worker_id
+                or job.catalog_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
             if canonical_movie_code(job.normalized_movie_number) != canonical:
                 raise ValueError("catalog canonical code does not match job")
-            if not all(
-                (
-                    job.catalog_movie_uuid,
-                    job.published_subtitle_id,
-                    job.published_storage_path,
-                    job.published_content_sha256,
-                    job.published_file_size,
-                )
-            ):
-                raise ValueError("verified Supabase receipt is incomplete")
+            _validate_verified_supabase_receipt(
+                movie_code=job.normalized_movie_number,
+                movie_uuid=job.catalog_movie_uuid,
+                metadata_status=job.metadata_status,
+                metadata_source=job.metadata_source,
+                subtitle_id=job.published_subtitle_id,
+                storage_path=job.published_storage_path,
+                content_sha256=job.published_content_sha256,
+                file_size=job.published_file_size,
+            )
             cursor = conn.execute(
                 """
                 UPDATE jobs
                 SET status = ?, next_catalog_sync_attempt_at = NULL,
                     claimed_by = NULL, lease_expires_at = NULL,
-                    updated_at = ?, error = NULL
+                    catalog_lease_token = NULL, updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND catalog_lease_token = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     JobStatus.ENGLISH_SRT_READY.value,
@@ -1792,6 +1859,8 @@ class JobStore:
                     job_id,
                     JobStatus.CATALOG_SYNCING.value,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1812,7 +1881,8 @@ class JobStore:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT id, claimed_by, catalog_sync_attempt_count FROM jobs
+                SELECT id, claimed_by, catalog_lease_token,
+                       catalog_sync_attempt_count FROM jobs
                 WHERE status = ? AND lease_expires_at IS NOT NULL
                   AND lease_expires_at < ?
                 """,
@@ -1836,8 +1906,10 @@ class JobStore:
                     UPDATE jobs
                     SET status = ?, catalog_sync_attempt_count = ?,
                         next_catalog_sync_attempt_at = ?, claimed_by = NULL,
-                        lease_expires_at = NULL, updated_at = ?, error = ?
+                        lease_expires_at = NULL, catalog_lease_token = NULL,
+                        updated_at = ?, error = ?
                     WHERE id = ? AND status = ? AND claimed_by = ?
+                      AND catalog_lease_token = ?
                     """,
                     (
                         next_status.value,
@@ -1848,6 +1920,7 @@ class JobStore:
                         row["id"],
                         JobStatus.CATALOG_SYNCING.value,
                         row["claimed_by"],
+                        row["catalog_lease_token"],
                     ),
                 )
                 recovered += cursor.rowcount
@@ -2148,7 +2221,7 @@ class JobStore:
                 translation_origin = ?, published_subtitle_id = NULL,
                 published_storage_path = NULL, published_content_sha256 = NULL,
                 published_file_size = NULL, catalog_sync_attempt_count = 0,
-                next_catalog_sync_attempt_at = NULL,
+                next_catalog_sync_attempt_at = NULL, catalog_lease_token = NULL,
                 catalog_movie_uuid = NULL, metadata_status = NULL,
                 metadata_source = NULL,
                 metadata_path_mac = NULL, audio_path_mac = NULL,
@@ -2191,6 +2264,7 @@ class JobStore:
             published_file_size=row["published_file_size"],
             catalog_sync_attempt_count=row["catalog_sync_attempt_count"],
             next_catalog_sync_attempt_at=row["next_catalog_sync_attempt_at"],
+            catalog_lease_token=row["catalog_lease_token"],
             catalog_movie_uuid=row["catalog_movie_uuid"],
             metadata_status=row["metadata_status"],
             metadata_source=row["metadata_source"],

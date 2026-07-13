@@ -180,6 +180,7 @@ def test_initialize_migrates_legacy_row_idempotently(
     assert migrated["published_file_size"] is None
     assert migrated["catalog_sync_attempt_count"] == 0
     assert migrated["next_catalog_sync_attempt_at"] is None
+    assert migrated["catalog_lease_token"] is None
     assert any(row["type"] == "table" for row in first_schema)
     assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
     assert foreign_key_violations == []
@@ -256,6 +257,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
         published_file_size=1234,
         catalog_sync_attempt_count=3,
         next_catalog_sync_attempt_at="2026-07-12T13:00:00+00:00",
+        catalog_lease_token="stale-catalog-lease-token",
         claimed_by="worker-1",
         lease_expires_at="2026-07-04T12:00:00+00:00",
         error="transcription failed",
@@ -289,6 +291,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
     assert result.job.published_file_size is None
     assert result.job.catalog_sync_attempt_count == 0
     assert result.job.next_catalog_sync_attempt_at is None
+    assert result.job.catalog_lease_token is None
     assert result.job.metadata_path_mac is None
     assert result.job.audio_path_mac is None
     assert result.job.audio_path_windows is None
