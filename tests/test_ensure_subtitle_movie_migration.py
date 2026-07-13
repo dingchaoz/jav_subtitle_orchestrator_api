@@ -65,10 +65,10 @@ def test_migration_contains_numeric_alias_normalization_before_lookups():
     sql = compact_sql()
     normalization = re.search(
         r"v_movie_number\s*:=\s*v_movie_number_bigint::integer\s*;"
-        r"(?P<body>.*?)select\s+p\.id",
+        r"(?P<body>.*?)select\s+true\s*,",
         sql,
     )
-    assert normalization, "canonical normalization must precede the public lookup"
+    assert normalization, "canonical normalization must precede the MissAV lookup"
     assert re.search(
         r"v_code\s*:=\s*v_series\s*\|\|\s*'-'\s*\|\|\s*case\s+when\s+"
         r"v_movie_number\s*<\s*100\s+then\s+pg_catalog\.lpad\(\s*"
@@ -76,8 +76,8 @@ def test_migration_contains_numeric_alias_normalization_before_lookups():
         r"v_movie_number::text\s+end\s*;",
         normalization.group("body"),
     )
-    assert sql.index("v_code :=") < sql.index("from public.movies")
     assert sql.index("v_code :=") < sql.index("from missav.movies")
+    assert sql.index("v_code :=") < sql.index("insert into public.movies")
     assert "coalesce(v_missav_title, v_local_title, v_code)" in sql
     assert "= v_code" in sql
     assert re.search(
@@ -86,30 +86,30 @@ def test_migration_contains_numeric_alias_normalization_before_lookups():
     )
 
 
-def test_migration_contains_existing_public_provenance_without_dead_variables():
+def test_migration_static_guard_derives_public_provenance_from_final_upsert_row():
     sql = compact_sql()
+    before_upsert = sql.split("insert into public.movies", 1)[0]
+    assert "v_existing" not in sql
+    assert "from public.movies" not in before_upsert
+
     provenance = re.search(
         r"if\s+v_missav_found\s+then(?P<body>.*?)"
         r"return\s+pg_catalog\.jsonb_build_object",
         sql,
     )
     assert provenance
-    assert re.search(
-        r"elsif\s+v_existing_id\s+is\s+not\s+null.*?"
-        r"v_source\s*:=\s*'public'\s*;.*?"
+    public_branch = re.search(
+        r"elsif\s+v_final_title\s+is\s+not\s+null(?P<guards>.*?)then\s+"
+        r"v_source\s*:=\s*'public'\s*;\s+"
         r"v_status\s*:=\s*'complete'\s*;",
         provenance.group("body"),
     )
-    assert re.search(
-        r"select\s+p\.id\s+into\s+v_existing_id\s+from\s+public\.movies",
-        sql,
-    )
-    for dead_variable in (
-        "v_existing_title",
-        "v_existing_movie_code",
-        "v_existing_standard_code",
-    ):
-        assert dead_variable not in sql
+    assert public_branch
+    guards = public_branch.group("guards")
+    assert "pg_catalog.lower(pg_catalog.btrim(v_final_title)) <> v_code" in guards
+    assert "is distinct from v_final_movie_code" in guards
+    assert "is distinct from v_final_standard_code" in guards
+    # The real A/B transaction interleaving remains a Task 10 approved-target check.
 
 
 def test_migration_contains_ranked_missav_and_local_metadata_allowlist():

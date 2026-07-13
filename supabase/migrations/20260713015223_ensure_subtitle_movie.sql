@@ -25,7 +25,6 @@ declare
   v_missav_title text;
   v_missav_release_date date;
   v_missav_studio text;
-  v_existing_id uuid;
   v_title text;
   v_studio text;
   v_release_year integer;
@@ -70,13 +69,6 @@ begin
       then pg_catalog.lpad(v_movie_number::text, 3, '0')
     else v_movie_number::text
   end;
-
-  select p.id
-    into v_existing_id
-  from public.movies as p
-  where p.standard_movie_id = v_code or p.movie_id = v_code
-  order by case when p.standard_movie_id = v_code then 0 else 1 end
-  limit 1;
 
   select
     true,
@@ -201,8 +193,7 @@ begin
      or v_local_duration is not null then
     v_source := 'local';
     v_status := 'partial';
-  elsif v_existing_id is not null
-     and v_final_title is not null
+  elsif v_final_title is not null
      and pg_catalog.lower(pg_catalog.btrim(v_final_title)) <> v_code
      and pg_catalog.lower(pg_catalog.btrim(v_final_title))
        is distinct from v_final_movie_code
