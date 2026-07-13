@@ -8,6 +8,7 @@ from orchestrator.audio_lock import exclusive_audio_job_lock
 from orchestrator.catalog_sync import CatalogSyncError
 from orchestrator.job_logs import append_job_log
 from orchestrator.job_snapshot import write_job_snapshot
+from orchestrator.job_files_lock import exclusive_job_files_lock
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import CatalogLeaseLostError, JobRecord, JobStore
@@ -566,16 +567,21 @@ class MacTranslationWorker:
         )
 
     def _quarantine(self, english_srt: Path, reason: str) -> Path | None:
-        if not english_srt.exists():
-            return None
-        rejected_dir = english_srt.parent / "rejected"
-        rejected_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-        rejected = rejected_dir / (
-            f"{english_srt.stem}.rejected-{reason}-{timestamp}.srt"
-        )
-        english_srt.replace(rejected)
-        return rejected
+        with exclusive_job_files_lock(
+            english_srt.parent.parent,
+            english_srt.parent.name,
+            blocking=True,
+        ):
+            if not english_srt.exists():
+                return None
+            rejected_dir = english_srt.parent / "rejected"
+            rejected_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+            rejected = rejected_dir / (
+                f"{english_srt.stem}.rejected-{reason}-{timestamp}.srt"
+            )
+            english_srt.replace(rejected)
+            return rejected
 
 def run_forever(worker: MacDownloadWorker, poll_interval_seconds: int = 10) -> None:
     while True:

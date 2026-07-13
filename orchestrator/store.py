@@ -1209,19 +1209,30 @@ class JobStore:
         from orchestrator.historical_batch import (
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
+            _prehold_plan_job_files,
         )
 
         if not isinstance(plan, HistoricalBatchPlan):
             raise ValueError("historical_plan_changed")
-        with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            return _enqueue_historical_repairs_transaction(
+        with ExitStack() as descriptor_stack:
+            preheld_jobs = _prehold_plan_job_files(
                 self,
-                conn,
                 plan,
                 Path(allowlist_path),
                 confirm_plan_sha256=confirm_plan_sha256,
+                descriptor_stack=descriptor_stack,
             )
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                return _enqueue_historical_repairs_transaction(
+                    self,
+                    conn,
+                    plan,
+                    Path(allowlist_path),
+                    confirm_plan_sha256=confirm_plan_sha256,
+                    descriptor_stack=descriptor_stack,
+                    preheld_jobs=preheld_jobs,
+                )
 
     def prepare_catalog_publication_repair(
         self,

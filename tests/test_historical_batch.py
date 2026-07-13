@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -225,6 +227,66 @@ def test_private_plan_write_is_0600_atomic_and_rejects_any_overwrite_or_symlink(
     assert target.read_text() == "do not replace"
 
 
+def test_private_plan_rejects_ancestor_symlink_and_leaves_no_artifact(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import plan_historical_batch, write_private_plan
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="plan_output_unsafe"):
+        write_private_plan(linked / "nested" / "plan.json", plan)
+
+    assert not (real / "nested" / "plan.json").exists()
+    assert not list(real.rglob("*.tmp"))
+
+
+def test_private_plan_parent_swap_after_link_is_detected_and_cleaned(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    parent = tmp_path / "reports"
+    parent.mkdir()
+    moved = tmp_path / "reports-moved"
+    calls = 0
+    real_require = historical_batch._require_parent_path_bound
+
+    def swap_after_link(path, expected_stat):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            parent.rename(moved)
+            parent.mkdir()
+        return real_require(path, expected_stat)
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_require_parent_path_bound",
+        swap_after_link,
+    )
+
+    with pytest.raises(ValueError, match="plan_output_unsafe"):
+        historical_batch.write_private_plan(parent / "plan.json", plan)
+
+    assert not (parent / "plan.json").exists()
+    assert not (moved / "plan.json").exists()
+    assert not list(moved.glob("*.tmp"))
+
+
 def test_plan_json_parser_rejects_extra_missing_bool_counts_and_tampering(
     sqlite_path, mac_jobs_root, tmp_path
 ):
@@ -367,6 +429,173 @@ def test_enqueue_revalidates_everything_and_rolls_back_atomically(
         ).fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("replace_after", ["Japanese.srt", "English.srt"])
+def test_enqueue_detects_path_replacement_after_individual_file_hash(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, replace_after
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    real_snapshot = historical_batch._snapshot_held_regular_file
+    replaced = False
+
+    def replace_path_after_hash(directory_fd, basename, fd, **kwargs):
+        nonlocal replaced
+        snapshot = real_snapshot(directory_fd, basename, fd, **kwargs)
+        if not replaced and basename.endswith(replace_after):
+            replacement = paths.job_dir_mac / f".{basename}.replacement"
+            replacement.write_bytes(
+                _srt(bad=False)
+                if replace_after == "English.srt"
+                else _srt(bad=False).replace(
+                    b"Distinct translation", "変更".encode()
+                )
+            )
+            os.replace(replacement, paths.job_dir_mac / basename)
+            replaced = True
+        return snapshot
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_snapshot_held_regular_file",
+        replace_path_after_hash,
+    )
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+
+    assert replaced is True
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_cooperating_writer_is_blocked_from_final_validation_through_commit(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+    from orchestrator.job_files_lock import exclusive_job_files_lock
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    attempted = threading.Event()
+    acquired = threading.Event()
+    writer: threading.Thread | None = None
+    real_now = historical_batch.utc_now_iso
+
+    def write_after_validation():
+        attempted.set()
+        with exclusive_job_files_lock(
+            mac_jobs_root,
+            "abc-001",
+            blocking=True,
+        ):
+            acquired.set()
+            replacement = paths.job_dir_mac / ".replacement.English.srt"
+            replacement.write_bytes(_srt(bad=False))
+            os.replace(replacement, paths.english_srt_path_mac)
+
+    def start_writer_at_insert_boundary():
+        nonlocal writer
+        writer = threading.Thread(target=write_after_validation)
+        writer.start()
+        assert attempted.wait(1)
+        assert not acquired.wait(0.05)
+        return real_now()
+
+    monkeypatch.setattr(
+        historical_batch,
+        "utc_now_iso",
+        start_writer_at_insert_boundary,
+    )
+
+    records = historical_batch.enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+
+    assert len(records) == 1
+    assert acquired.wait(2)
+    assert writer is not None
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+
+
+def test_audio_exclusive_lock_can_commit_before_enqueue_takes_database_lock(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.audio_lock import exclusive_audio_job_lock
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _job(store, mac_jobs_root, "abc-001")
+    assert job is not None
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    outcome: list[object] = []
+
+    def enqueue_while_audio_is_locked():
+        try:
+            outcome.extend(
+                enqueue_historical_batch(
+                    store,
+                    plan,
+                    allowlist,
+                    confirm_plan_sha256=plan.plan_sha256,
+                )
+            )
+        except ValueError as exc:
+            outcome.append(exc)
+
+    with exclusive_audio_job_lock(
+        mac_jobs_root,
+        "abc-001",
+        blocking=True,
+    ):
+        thread = threading.Thread(target=enqueue_while_audio_is_locked)
+        thread.start()
+        threading.Event().wait(0.05)
+        conn = sqlite3.connect(sqlite_path, timeout=0.2)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE jobs SET updated_at = 'snapshot-raced' WHERE id = ?",
+                (job.id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ValueError)
+    assert str(outcome[0]) == "historical_plan_changed"
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
 def test_enqueue_rejects_tampered_item_and_never_selects_outside_allowlist_or_limit(
     sqlite_path, mac_jobs_root, tmp_path
 ):
@@ -398,6 +627,40 @@ def test_enqueue_rejects_tampered_item_and_never_selects_outside_allowlist_or_li
     assert {record.movie_code for record in records} <= {
         f"abc-{index:03d}" for index in range(1, 8)
     }
+
+
+def test_enqueue_rejects_unselected_classification_swap_even_when_counts_match(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001", bad=True)
+    _, second_paths = _job(store, mac_jobs_root, "abc-002", bad=True)
+    _, third_paths = _job(store, mac_jobs_root, "abc-003", bad=False)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\nabc-002\nabc-003\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    assert plan.eligible_total == 2
+    assert plan.ineligible == 1
+    second_paths.english_srt_path_mac.write_bytes(_srt(bad=False))
+    third_paths.english_srt_path_mac.write_bytes(_srt(bad=True))
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
 
 
 def test_cli_has_only_explicit_bounded_plan_and_confirmed_enqueue_arguments(tmp_path):

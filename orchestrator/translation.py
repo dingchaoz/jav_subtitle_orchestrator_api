@@ -6,6 +6,8 @@ import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from orchestrator.job_files_lock import exclusive_job_files_lock
+
 
 class SubtitleTranslator:
     def __init__(self, translate_script_path: str) -> None:
@@ -59,7 +61,12 @@ class SubtitleTranslator:
                     )
                     try:
                         shutil.copyfile(candidate, temporary_final)
-                        os.replace(temporary_final, output_srt)
+                        with exclusive_job_files_lock(
+                            output_srt.parent.parent,
+                            output_srt.parent.name,
+                            blocking=True,
+                        ):
+                            os.replace(temporary_final, output_srt)
                         return
                     finally:
                         temporary_final.unlink(missing_ok=True)

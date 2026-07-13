@@ -6,12 +6,18 @@ import os
 import re
 import sqlite3
 import stat
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 from orchestrator.historical_repair import ELIGIBLE_STATUSES
+from orchestrator.job_files_lock import (
+    JobFilesLock,
+    JobFilesLockError,
+    shared_job_files_lock,
+)
 from orchestrator.models import JobStatus
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.paths import normalize_movie_number
@@ -75,6 +81,7 @@ class HistoricalBatchPlan:
     already_repaired: int
     ineligible: int
     blocked: int
+    scan_sha256: str
     items: tuple[HistoricalBatchItem, ...]
     plan_sha256: str
 
@@ -93,6 +100,7 @@ class HistoricalBatchPlan:
             "already_repaired": self.already_repaired,
             "ineligible": self.ineligible,
             "blocked": self.blocked,
+            "scan_sha256": self.scan_sha256,
             "items": [item.to_payload() for item in self.items],
         }
 
@@ -117,6 +125,7 @@ class HistoricalBatchPlan:
         already_repaired: int,
         ineligible: int,
         blocked: int,
+        scan_sha256: str,
         items: tuple[HistoricalBatchItem, ...],
     ) -> HistoricalBatchPlan:
         plan = cls(
@@ -129,6 +138,7 @@ class HistoricalBatchPlan:
             already_repaired=already_repaired,
             ineligible=ineligible,
             blocked=blocked,
+            scan_sha256=scan_sha256,
             items=items,
             plan_sha256="",
         )
@@ -150,6 +160,74 @@ class _FileSnapshot:
     size: int
     mtime_ns: int
     content: bytes | None
+    basename: str | None = None
+    fd: int | None = None
+
+    def require_unchanged(self, directory_fd: int) -> None:
+        if self.basename is None or self.fd is None:
+            raise OSError("snapshot descriptor unavailable")
+        opened = os.fstat(self.fd)
+        current = os.stat(
+            self.basename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        expected = (self.size, self.mtime_ns)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+            or (opened.st_size, opened.st_mtime_ns) != expected
+            or (current.st_size, current.st_mtime_ns) != expected
+        ):
+            raise OSError("snapshot path changed")
+
+
+@dataclass(frozen=True, slots=True)
+class _HeldJobSnapshot:
+    lock: JobFilesLock
+    files: tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]
+
+    def require_unchanged(self) -> None:
+        self.lock.require_bound()
+        for snapshot in self.files:
+            snapshot.require_unchanged(self.lock.job_fd)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreheldJobFiles:
+    lock: JobFilesLock
+    descriptors: tuple[tuple[str, int], tuple[str, int], tuple[str, int]]
+
+    def snapshots(
+        self,
+    ) -> tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]:
+        japanese_name, japanese_fd = self.descriptors[0]
+        english_name, english_fd = self.descriptors[1]
+        audio_name, audio_fd = self.descriptors[2]
+        return (
+            _snapshot_held_regular_file(
+                self.lock.job_fd,
+                japanese_name,
+                japanese_fd,
+                keep_content=True,
+                max_bytes=MAX_SUBTITLE_BYTES,
+            ),
+            _snapshot_held_regular_file(
+                self.lock.job_fd,
+                english_name,
+                english_fd,
+                keep_content=True,
+                max_bytes=MAX_SUBTITLE_BYTES,
+            ),
+            _snapshot_held_regular_file(
+                self.lock.job_fd,
+                audio_name,
+                audio_fd,
+                keep_content=False,
+            ),
+        )
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -190,6 +268,7 @@ _PLAN_KEYS = frozenset(
         "already_repaired",
         "ineligible",
         "blocked",
+        "scan_sha256",
         "items",
         "plan_sha256",
     }
@@ -302,6 +381,7 @@ def _plan_from_payload(value: object) -> HistoricalBatchPlan:
         already_repaired=already_repaired,
         ineligible=ineligible,
         blocked=blocked,
+        scan_sha256=_require_digest(payload["scan_sha256"]),
         items=items,
         plan_sha256=_require_digest(payload["plan_sha256"]),
     )
@@ -369,6 +449,7 @@ def _open_stable_regular_file_at(
     *,
     keep_content: bool,
     max_bytes: int | None = None,
+    descriptor_stack: ExitStack | None = None,
 ) -> _FileSnapshot:
     before_path = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
     if not stat.S_ISREG(before_path.st_mode) or before_path.st_size <= 0:
@@ -380,6 +461,7 @@ def _open_stable_regular_file_at(
         os.O_RDONLY | os.O_NOFOLLOW,
         dir_fd=directory_fd,
     )
+    close_descriptor = True
     try:
         before = os.fstat(fd)
         if (
@@ -410,90 +492,202 @@ def _open_stable_regular_file_at(
             != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         ):
             raise OSError("file changed")
-        return _FileSnapshot(
+        result = _FileSnapshot(
             sha256=digest.hexdigest(),
             size=before.st_size,
             mtime_ns=before.st_mtime_ns,
             content=bytes(content) if content is not None else None,
+            basename=basename,
+            fd=fd if descriptor_stack is not None else None,
         )
+        if descriptor_stack is not None:
+            descriptor_stack.callback(os.close, fd)
+            close_descriptor = False
+        return result
     finally:
+        if close_descriptor:
+            os.close(fd)
+
+
+def _open_regular_descriptor_at(
+    directory_fd: int,
+    basename: str,
+    descriptor_stack: ExitStack,
+) -> int:
+    path_stat = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size <= 0:
+        raise OSError("not a nonempty regular file")
+    fd = os.open(
+        basename,
+        os.O_RDONLY | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    opened = os.fstat(fd)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_size <= 0
+        or (opened.st_dev, opened.st_ino) != (path_stat.st_dev, path_stat.st_ino)
+    ):
         os.close(fd)
+        raise OSError("file changed")
+    descriptor_stack.callback(os.close, fd)
+    return fd
+
+
+def _snapshot_held_regular_file(
+    directory_fd: int,
+    basename: str,
+    fd: int,
+    *,
+    keep_content: bool,
+    max_bytes: int | None = None,
+) -> _FileSnapshot:
+    before = os.fstat(fd)
+    path_before = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or (before.st_dev, before.st_ino)
+        != (path_before.st_dev, path_before.st_ino)
+        or (max_bytes is not None and before.st_size > max_bytes)
+    ):
+        raise OSError("held file changed")
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    content = bytearray() if keep_content else None
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            raise OSError("held file changed")
+        digest.update(chunk)
+        if content is not None:
+            content.extend(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise OSError("held file changed")
+    after = os.fstat(fd)
+    path_after = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
+    expected = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if (
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != expected
+        or (
+            path_after.st_dev,
+            path_after.st_ino,
+            path_after.st_size,
+            path_after.st_mtime_ns,
+        )
+        != expected
+    ):
+        raise OSError("held file changed")
+    return _FileSnapshot(
+        sha256=digest.hexdigest(),
+        size=before.st_size,
+        mtime_ns=before.st_mtime_ns,
+        content=bytes(content) if content is not None else None,
+        basename=basename,
+        fd=fd,
+    )
+
+
+def _prehold_plan_job_files(
+    store: JobStore,
+    plan: HistoricalBatchPlan,
+    allowlist_path: Path,
+    *,
+    confirm_plan_sha256: str,
+    descriptor_stack: ExitStack,
+) -> dict[str, _PreheldJobFiles]:
+    try:
+        if (
+            _LOWER_HEX_RE.fullmatch(confirm_plan_sha256) is None
+            or confirm_plan_sha256 != plan.plan_sha256
+            or plan.recalculate_sha256() != plan.plan_sha256
+            or str(Path(allowlist_path).absolute()) != plan.allowlist_path
+        ):
+            raise ValueError
+        result: dict[str, _PreheldJobFiles] = {}
+        for item in sorted(plan.items, key=lambda candidate: candidate.path_movie_number):
+            held = descriptor_stack.enter_context(
+                shared_job_files_lock(
+                    store.jobs_root_mac,
+                    item.path_movie_number,
+                    blocking=True,
+                )
+            )
+            names = (
+                f"{item.path_movie_number}.Japanese.srt",
+                f"{item.path_movie_number}.English.srt",
+                "audio.wav",
+            )
+            descriptors = tuple(
+                (name, _open_regular_descriptor_at(held.job_fd, name, descriptor_stack))
+                for name in names
+            )
+            result[item.path_movie_number] = _PreheldJobFiles(
+                held,
+                descriptors,  # type: ignore[arg-type]
+            )
+        return result
+    except (JobFilesLockError, OSError, TypeError, ValueError):
+        raise ValueError("historical_plan_changed") from None
 
 
 def _snapshot_job_files(
     root: Path,
     path_movie_number: str,
+    *,
+    descriptor_stack: ExitStack | None = None,
+    held_snapshots: list[_HeldJobSnapshot] | None = None,
+    preheld: _PreheldJobFiles | None = None,
+    lock_blocking: bool = True,
 ) -> tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]:
     if (
         normalize_movie_number(path_movie_number) is None
         or Path(path_movie_number).name != path_movie_number
     ):
         raise OSError("unsafe job directory")
-    root_path_stat = Path(root).lstat()
-    if not stat.S_ISDIR(root_path_stat.st_mode) or stat.S_ISLNK(root_path_stat.st_mode):
-        raise OSError("unsafe jobs root")
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    job_fd: int | None = None
-    try:
-        root_before = os.fstat(root_fd)
-        if (root_before.st_dev, root_before.st_ino) != (
-            root_path_stat.st_dev,
-            root_path_stat.st_ino,
-        ):
-            raise OSError("jobs root changed")
-        job_path_stat = os.stat(
-            path_movie_number,
-            dir_fd=root_fd,
-            follow_symlinks=False,
+    if preheld is not None:
+        snapshots = preheld.snapshots()
+        held_snapshot = _HeldJobSnapshot(preheld.lock, snapshots)
+        held_snapshot.require_unchanged()
+        if held_snapshots is not None:
+            held_snapshots.append(held_snapshot)
+        return snapshots
+    with ExitStack() as local_stack:
+        stack = descriptor_stack if descriptor_stack is not None else local_stack
+        held = stack.enter_context(
+            shared_job_files_lock(
+                root,
+                path_movie_number,
+                blocking=lock_blocking,
+            )
         )
-        if not stat.S_ISDIR(job_path_stat.st_mode) or stat.S_ISLNK(job_path_stat.st_mode):
-            raise OSError("unsafe job directory")
-        job_fd = os.open(
-            path_movie_number,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
-        job_before = os.fstat(job_fd)
-        if (job_before.st_dev, job_before.st_ino) != (
-            job_path_stat.st_dev,
-            job_path_stat.st_ino,
-        ):
-            raise OSError("job directory changed")
         japanese = _open_stable_regular_file_at(
-            job_fd,
+            held.job_fd,
             f"{path_movie_number}.Japanese.srt",
             keep_content=True,
             max_bytes=MAX_SUBTITLE_BYTES,
+            descriptor_stack=stack,
         )
         english = _open_stable_regular_file_at(
-            job_fd,
+            held.job_fd,
             f"{path_movie_number}.English.srt",
             keep_content=True,
             max_bytes=MAX_SUBTITLE_BYTES,
+            descriptor_stack=stack,
         )
         audio = _open_stable_regular_file_at(
-            job_fd,
+            held.job_fd,
             "audio.wav",
             keep_content=False,
+            descriptor_stack=stack,
         )
-        job_after_path = os.stat(
-            path_movie_number,
-            dir_fd=root_fd,
-            follow_symlinks=False,
-        )
-        root_after_path = Path(root).lstat()
-        if (
-            (job_after_path.st_dev, job_after_path.st_ino)
-            != (job_before.st_dev, job_before.st_ino)
-            or (root_after_path.st_dev, root_after_path.st_ino)
-            != (root_before.st_dev, root_before.st_ino)
-        ):
-            raise OSError("job directory changed")
+        snapshot = _HeldJobSnapshot(held, (japanese, english, audio))
+        snapshot.require_unchanged()
+        if held_snapshots is not None:
+            held_snapshots.append(snapshot)
         return japanese, english, audio
-    finally:
-        if job_fd is not None:
-            os.close(job_fd)
-        os.close(root_fd)
 
 
 def _read_allowlist(path: Path) -> tuple[tuple[str, ...], str, str]:
@@ -536,6 +730,42 @@ def _read_only_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _scan_snapshot_entry(
+    *,
+    movie: str,
+    classification: str,
+    row: sqlite3.Row,
+    japanese: _FileSnapshot,
+    english: _FileSnapshot,
+    audio: _FileSnapshot,
+    reason_codes: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "movie_code": movie,
+        "classification": classification,
+        "job_id": row["id"],
+        "path_movie_number": row["normalized_movie_number"],
+        "status": row["status"],
+        "updated_at": row["updated_at"],
+        "reason_codes": list(reason_codes),
+        "japanese": {
+            "sha256": japanese.sha256,
+            "size": japanese.size,
+            "mtime_ns": japanese.mtime_ns,
+        },
+        "english": {
+            "sha256": english.sha256,
+            "size": english.size,
+            "mtime_ns": english.mtime_ns,
+        },
+        "audio": {
+            "sha256": audio.sha256,
+            "size": audio.size,
+            "mtime_ns": audio.mtime_ns,
+        },
+    }
+
+
 def _build_plan(
     store: JobStore,
     allowlist_path: Path,
@@ -543,6 +773,10 @@ def _build_plan(
     limit: int,
     conn: sqlite3.Connection,
     ignore_batch_id: str | None = None,
+    descriptor_stack: ExitStack | None = None,
+    held_snapshots: list[_HeldJobSnapshot] | None = None,
+    preheld_jobs: dict[str, _PreheldJobFiles] | None = None,
+    missing_lock_blocking: bool = True,
 ) -> HistoricalBatchPlan:
     movies, allowlist_sha256, absolute_allowlist_path = _read_allowlist(allowlist_path)
     jobs_by_movie: dict[str, list[Any]] = {}
@@ -555,12 +789,16 @@ def _build_plan(
     repair_rows = conn.execute(
         "SELECT job_id, batch_id FROM historical_translation_repairs"
     ).fetchall()
-    repair_jobs = {
-        row["job_id"]
+    repair_by_job = {
+        row["job_id"]: row["batch_id"]
         for row in repair_rows
         if ignore_batch_id is None or row["batch_id"] != ignore_batch_id
     }
+    repair_jobs = {
+        job_id for job_id in repair_by_job
+    }
     eligible: list[HistoricalBatchItem] = []
+    scan_entries: list[dict[str, object]] = []
     already_repaired = 0
     ineligible = 0
     blocked = 0
@@ -568,27 +806,78 @@ def _build_plan(
         matching = jobs_by_movie.get(movie, [])
         if len(matching) != 1:
             blocked += 1
+            scan_entries.append(
+                {
+                    "movie_code": movie,
+                    "classification": "blocked",
+                    "reason": "job_missing" if not matching else "job_ambiguous",
+                    "job_ids": sorted(row["id"] for row in matching),
+                }
+            )
             continue
         row = matching[0]
         if row["id"] in repair_jobs:
             already_repaired += 1
+            scan_entries.append(
+                {
+                    "movie_code": movie,
+                    "classification": "already_repaired",
+                    "job_id": row["id"],
+                    "batch_id": repair_by_job[row["id"]],
+                    "updated_at": row["updated_at"],
+                }
+            )
             continue
         try:
             status_value = JobStatus(row["status"])
         except ValueError:
             blocked += 1
+            scan_entries.append(
+                {
+                    "movie_code": movie,
+                    "classification": "blocked",
+                    "reason": "job_status_invalid",
+                    "job_id": row["id"],
+                    "updated_at": row["updated_at"],
+                }
+            )
             continue
         if status_value not in ELIGIBLE_STATUSES or row["claimed_by"] is not None:
             blocked += 1
+            scan_entries.append(
+                {
+                    "movie_code": movie,
+                    "classification": "blocked",
+                    "reason": "job_not_idle_eligible",
+                    "job_id": row["id"],
+                    "status": status_value.value,
+                    "updated_at": row["updated_at"],
+                    "claimed": row["claimed_by"] is not None,
+                }
+            )
             continue
         path_movie_number = row["normalized_movie_number"]
         try:
             japanese, english, audio = _snapshot_job_files(
                 store.jobs_root_mac,
                 path_movie_number,
+                descriptor_stack=descriptor_stack,
+                held_snapshots=held_snapshots,
+                preheld=(preheld_jobs or {}).get(path_movie_number),
+                lock_blocking=missing_lock_blocking,
             )
-        except OSError:
+        except (JobFilesLockError, OSError):
             blocked += 1
+            scan_entries.append(
+                {
+                    "movie_code": movie,
+                    "classification": "blocked",
+                    "reason": "snapshot_unavailable",
+                    "job_id": row["id"],
+                    "status": status_value.value,
+                    "updated_at": row["updated_at"],
+                }
+            )
             continue
         assert japanese.content is not None and english.content is not None
         report = validate_translation_quality_snapshots(
@@ -597,7 +886,29 @@ def _build_plan(
         )
         if report.passed:
             ineligible += 1
+            scan_entries.append(
+                _scan_snapshot_entry(
+                    movie=movie,
+                    classification="ineligible",
+                    row=row,
+                    japanese=japanese,
+                    english=english,
+                    audio=audio,
+                    reason_codes=(),
+                )
+            )
             continue
+        scan_entries.append(
+            _scan_snapshot_entry(
+                movie=movie,
+                classification="eligible",
+                row=row,
+                japanese=japanese,
+                english=english,
+                audio=audio,
+                reason_codes=tuple(report.reason_codes),
+            )
+        )
         eligible.append(
             HistoricalBatchItem(
                 job_id=row["id"],
@@ -627,6 +938,9 @@ def _build_plan(
         already_repaired=already_repaired,
         ineligible=ineligible,
         blocked=blocked,
+        scan_sha256=hashlib.sha256(
+            canonical_plan_bytes({"entries": scan_entries})
+        ).hexdigest(),
         items=tuple(eligible[:limit]),
     )
 
@@ -659,6 +973,7 @@ def render_historical_batch_report(plan: HistoricalBatchPlan) -> str:
     lines = [
         f"planned=true batch_id={plan.batch_id} plan_sha256={plan.plan_sha256} "
         f"allowlist_sha256={plan.allowlist_sha256} "
+        f"scan_sha256={plan.scan_sha256} "
         f"allowlist_entries={plan.allowlist_entry_count} "
         f"eligible_total={plan.eligible_total} selected={len(plan.items)} "
         f"already_repaired={plan.already_repaired} "
@@ -672,51 +987,145 @@ def render_historical_batch_report(plan: HistoricalBatchPlan) -> str:
     return "\n".join(lines)
 
 
-def write_private_plan(path: Path, plan: HistoricalBatchPlan) -> None:
-    path = Path(path)
-    parent = path.parent
+def _open_directory_chain(path: Path, *, create: bool) -> int:
+    absolute = Path(path).absolute()
+    if not absolute.is_absolute():
+        raise OSError("directory path is not absolute")
+    components = absolute.parts[1:]
+    if any(component in {"", ".", ".."} for component in components):
+        raise OSError("unsafe directory component")
+    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        parent.mkdir(parents=True, exist_ok=True)
-        parent_stat = parent.lstat()
-        if not stat.S_ISDIR(parent_stat.st_mode) or stat.S_ISLNK(parent_stat.st_mode):
-            raise OSError
-        path.lstat()
-    except FileNotFoundError:
-        pass
+        for component in components:
+            try:
+                entry = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                entry = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            if not stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
+                raise OSError("unsafe directory component")
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            opened = os.fstat(next_fd)
+            if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
+                os.close(next_fd)
+                raise OSError("directory component changed")
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _require_parent_path_bound(parent: Path, expected_stat: os.stat_result) -> None:
+    reopened_fd = _open_directory_chain(parent, create=False)
+    try:
+        reopened = os.fstat(reopened_fd)
+        if (reopened.st_dev, reopened.st_ino) != (
+            expected_stat.st_dev,
+            expected_stat.st_ino,
+        ):
+            raise OSError("plan parent changed")
+    finally:
+        os.close(reopened_fd)
+
+
+def _unlink_if_same_inode(
+    parent_fd: int,
+    basename: str,
+    expected_inode: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
-        raise ValueError("plan_output_unsafe") from None
-    else:
+        return
+    if (current.st_dev, current.st_ino) == expected_inode:
+        try:
+            os.unlink(basename, dir_fd=parent_fd)
+        except OSError:
+            pass
+
+
+def write_private_plan(path: Path, plan: HistoricalBatchPlan) -> None:
+    absolute = Path(path).absolute()
+    parent = absolute.parent
+    basename = absolute.name
+    if not basename or basename in {".", ".."}:
         raise ValueError("plan_output_unsafe")
-    temporary = parent / f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
-    fd: int | None = None
+    parent_fd: int | None = None
+    temporary_fd: int | None = None
+    temporary_name = f".{basename}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+    temporary_inode: tuple[int, int] | None = None
+    final_inode: tuple[int, int] | None = None
     try:
-        fd = os.open(
-            temporary,
+        parent_fd = _open_directory_chain(parent, create=True)
+        parent_stat = os.fstat(parent_fd)
+        try:
+            os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError("plan output exists")
+        temporary_fd = os.open(
+            temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
+            dir_fd=parent_fd,
         )
+        temporary_stat = os.fstat(temporary_fd)
+        temporary_inode = (temporary_stat.st_dev, temporary_stat.st_ino)
         snapshot = plan.to_json_bytes()
         written = 0
         while written < len(snapshot):
-            written += os.write(fd, snapshot[written:])
-        os.fsync(fd)
-        os.close(fd)
-        fd = None
-        os.link(temporary, path, follow_symlinks=False)
-        directory_fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            written += os.write(temporary_fd, snapshot[written:])
+        os.fsync(temporary_fd)
+        _require_parent_path_bound(parent, parent_stat)
+        os.link(
+            temporary_name,
+            basename,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        final_inode = temporary_inode
+        _require_parent_path_bound(parent, parent_stat)
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_inode = None
+        os.fsync(parent_fd)
+        final_inode = None
     except OSError:
         raise ValueError("plan_output_unsafe") from None
     finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if parent_fd is not None:
+            if final_inode is not None:
+                _unlink_if_same_inode(parent_fd, basename, final_inode)
+            if temporary_inode is not None:
+                _unlink_if_same_inode(
+                    parent_fd,
+                    temporary_name,
+                    temporary_inode,
+                )
+            try:
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+            os.close(parent_fd)
 
 
 def read_private_plan(path: Path) -> HistoricalBatchPlan:
@@ -761,6 +1170,8 @@ def _enqueue_historical_repairs_transaction(
     allowlist_path: Path,
     *,
     confirm_plan_sha256: str,
+    descriptor_stack: ExitStack,
+    preheld_jobs: dict[str, _PreheldJobFiles],
 ) -> list[HistoricalRepairRecord]:
     try:
         if (
@@ -777,12 +1188,17 @@ def _enqueue_historical_repairs_transaction(
         ).fetchall()
         if existing and len(existing) != len(plan.items):
             raise ValueError
+        held_snapshots: list[_HeldJobSnapshot] = []
         recalculated = _build_plan(
             store,
             Path(allowlist_path),
             limit=plan.limit,
             conn=conn,
             ignore_batch_id=plan.batch_id,
+            descriptor_stack=descriptor_stack,
+            held_snapshots=held_snapshots,
+            preheld_jobs=preheld_jobs,
+            missing_lock_blocking=False,
         )
         if recalculated != plan:
             raise ValueError
@@ -800,7 +1216,11 @@ def _enqueue_historical_repairs_transaction(
                     or row["english_sha256"] != item.english_sha256
                 ):
                     raise ValueError
+            for snapshot in held_snapshots:
+                snapshot.require_unchanged()
             return [_row_to_repair(row) for row in existing]
+        for snapshot in held_snapshots:
+            snapshot.require_unchanged()
         now = utc_now_iso()
         for item in plan.items:
             repair_id = "repair_" + hashlib.sha256(
