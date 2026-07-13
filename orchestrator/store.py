@@ -24,6 +24,16 @@ _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
 MAX_PUBLICATION_CANARY_SRT_BYTES = 32 * 1024 * 1024
 NORMAL_TRANSLATION_ORIGIN = "normal"
 HISTORICAL_TRANSLATION_ORIGIN = "historical"
+_CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
+    {
+        "catalog_fetch_failed",
+        "catalog_redirect_rejected",
+        "catalog_auth_failed",
+        "catalog_sync_failed",
+        "catalog_response_invalid",
+        "catalog_response_mismatch",
+    }
+)
 
 
 def _validate_expected_sha256(value: str, label: str) -> None:
@@ -1512,7 +1522,7 @@ class JobStore:
             assert failed is not None
             return failed
 
-    def complete_publication(
+    def complete_supabase_publication(
         self,
         job_id: str,
         worker_id: str,
@@ -1520,17 +1530,35 @@ class JobStore:
         movie_uuid: str,
         metadata_status: str,
         metadata_source: str,
+        subtitle_id: str,
+        storage_path: str,
+        content_sha256: str,
+        file_size: int,
     ) -> JobRecord:
-        if metadata_status not in {"complete", "partial", "placeholder"}:
+        if metadata_status not in _VERIFIED_METADATA_STATUSES:
             raise ValueError(f"invalid metadata status: {metadata_status}")
-        if metadata_source not in {"public", "missav", "local", "placeholder"}:
+        if metadata_source not in _VERIFIED_METADATA_SOURCES:
             raise ValueError(f"invalid metadata source: {metadata_source}")
-        if not movie_uuid:
-            raise ValueError("movie UUID must not be empty")
-        try:
-            UUID(movie_uuid)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"invalid movie UUID: {movie_uuid}") from exc
+        for value, label in ((movie_uuid, "movie"), (subtitle_id, "subtitle")):
+            try:
+                parsed = UUID(value)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid {label} UUID") from exc
+            if str(parsed) != value:
+                raise ValueError(f"invalid {label} UUID")
+        _validate_expected_sha256(content_sha256, "published content SHA-256")
+        if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size < 1:
+            raise ValueError("published file size must be a positive integer")
+        if (
+            not isinstance(storage_path, str)
+            or not storage_path
+            or len(storage_path) > 1024
+            or storage_path != storage_path.strip()
+            or storage_path.startswith("/")
+            or "\\" in storage_path
+            or any(part in {"", ".", ".."} for part in storage_path.split("/"))
+        ):
+            raise ValueError("invalid published storage path")
 
         now = utc_now_iso()
         with self.connection() as conn:
@@ -1540,20 +1568,35 @@ class JobStore:
                 raise KeyError(job_id)
             if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            canonical = canonical_movie_code(job.normalized_movie_number)
+            expected_storage_path = (
+                f"{canonical.split('-', 1)[0]}/{canonical}/"
+                f"{canonical}-English_AI.srt"
+            )
+            if storage_path != expected_storage_path:
+                raise ValueError("published storage path does not match job")
             cursor = conn.execute(
                 """
                 UPDATE jobs
                 SET status = ?, catalog_movie_uuid = ?, metadata_status = ?,
-                    metadata_source = ?, next_publish_attempt_at = NULL,
+                    metadata_source = ?, published_subtitle_id = ?,
+                    published_storage_path = ?, published_content_sha256 = ?,
+                    published_file_size = ?, next_publish_attempt_at = NULL,
+                    catalog_sync_attempt_count = 0,
+                    next_catalog_sync_attempt_at = NULL,
                     claimed_by = NULL, lease_expires_at = NULL,
                     updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
                 """,
                 (
-                    JobStatus.ENGLISH_SRT_READY.value,
+                    JobStatus.CATALOG_SYNC_PENDING.value,
                     movie_uuid,
                     metadata_status,
                     metadata_source,
+                    subtitle_id,
+                    storage_path,
+                    content_sha256,
+                    file_size,
                     now,
                     job_id,
                     JobStatus.PUBLISHING.value,
@@ -1565,6 +1608,250 @@ class JobStore:
             completed = self.get_job(job_id, conn=conn)
             assert completed is not None
             return completed
+
+    def claim_catalog_sync_job(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        job_id: str | None = None,
+    ) -> JobRecord | None:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            parameters: list[str] = [JobStatus.CATALOG_SYNC_PENDING.value, now]
+            job_filter = ""
+            if job_id is not None:
+                job_filter = " AND id = ?"
+                parameters.append(job_id)
+            row = conn.execute(
+                f"""
+                SELECT id FROM jobs
+                WHERE status = ? AND claimed_by IS NULL
+                  AND (next_catalog_sync_attempt_at IS NULL
+                       OR next_catalog_sync_attempt_at <= ?)
+                  AND catalog_movie_uuid IS NOT NULL
+                  AND metadata_status IS NOT NULL
+                  AND metadata_source IS NOT NULL
+                  AND published_subtitle_id IS NOT NULL
+                  AND published_storage_path IS NOT NULL
+                  AND published_content_sha256 IS NOT NULL
+                  AND published_file_size > 0
+                  {job_filter}
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                  AND (next_catalog_sync_attempt_at IS NULL
+                       OR next_catalog_sync_attempt_at <= ?)
+                  AND catalog_movie_uuid IS NOT NULL
+                  AND metadata_status IS NOT NULL
+                  AND metadata_source IS NOT NULL
+                  AND published_subtitle_id IS NOT NULL
+                  AND published_storage_path IS NOT NULL
+                  AND published_content_sha256 IS NOT NULL
+                  AND published_file_size > 0
+                """,
+                (
+                    JobStatus.CATALOG_SYNCING.value,
+                    worker_id,
+                    lease,
+                    now,
+                    row["id"],
+                    JobStatus.CATALOG_SYNC_PENDING.value,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self.get_job(row["id"], conn=conn)
+
+    def fail_catalog_sync(
+        self,
+        job_id: str,
+        worker_id: str,
+        reason_code: str,
+        *,
+        max_catalog_sync_attempts: int,
+        retry_seconds: int,
+    ) -> JobRecord:
+        if reason_code not in _CATALOG_SYNC_FAILURE_REASON_CODES:
+            reason_code = "catalog_sync_failed"
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status is not JobStatus.CATALOG_SYNCING or job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            attempts = job.catalog_sync_attempt_count + 1
+            exhausted = attempts >= max_catalog_sync_attempts
+            next_status = JobStatus.FAILED if exhausted else JobStatus.CATALOG_SYNC_PENDING
+            next_attempt_at = (
+                None
+                if exhausted
+                else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+            )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, catalog_sync_attempt_count = ?,
+                    next_catalog_sync_attempt_at = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                """,
+                (
+                    next_status.value,
+                    attempts,
+                    next_attempt_at,
+                    now,
+                    f"catalog_sync: {reason_code}",
+                    job_id,
+                    JobStatus.CATALOG_SYNCING.value,
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            failed = self.get_job(job_id, conn=conn)
+            assert failed is not None
+            return failed
+
+    def complete_catalog_sync(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        canonical_code: str,
+        d1_rows_updated: int,
+        subtitle_count: int,
+        kv_keys_deleted: tuple[str, ...],
+    ) -> JobRecord:
+        canonical = canonical_movie_code(canonical_code)
+        if canonical != canonical_code:
+            raise ValueError("catalog canonical code is not canonical")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (d1_rows_updated, subtitle_count)
+        ):
+            raise ValueError("catalog result counts must be positive integers")
+        expected_keys = {
+            f"movie:full:{canonical}",
+            f"movie:light:{canonical}",
+        }
+        if (
+            not isinstance(kv_keys_deleted, tuple)
+            or len(kv_keys_deleted) != 2
+            or set(kv_keys_deleted) != expected_keys
+        ):
+            raise ValueError("catalog result cache keys do not match")
+
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status is not JobStatus.CATALOG_SYNCING or job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if canonical_movie_code(job.normalized_movie_number) != canonical:
+                raise ValueError("catalog canonical code does not match job")
+            if not all(
+                (
+                    job.catalog_movie_uuid,
+                    job.published_subtitle_id,
+                    job.published_storage_path,
+                    job.published_content_sha256,
+                    job.published_file_size,
+                )
+            ):
+                raise ValueError("verified Supabase receipt is incomplete")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, next_catalog_sync_attempt_at = NULL,
+                    claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    now,
+                    job_id,
+                    JobStatus.CATALOG_SYNCING.value,
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def recover_expired_catalog_sync_leases(
+        self,
+        max_catalog_sync_attempts: int,
+        retry_seconds: int,
+    ) -> int:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        recovered = 0
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, claimed_by, catalog_sync_attempt_count FROM jobs
+                WHERE status = ? AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (JobStatus.CATALOG_SYNCING.value, now),
+            ).fetchall()
+            for row in rows:
+                attempts = row["catalog_sync_attempt_count"] + 1
+                exhausted = attempts >= max_catalog_sync_attempts
+                next_status = (
+                    JobStatus.FAILED
+                    if exhausted
+                    else JobStatus.CATALOG_SYNC_PENDING
+                )
+                next_attempt_at = (
+                    None
+                    if exhausted
+                    else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, catalog_sync_attempt_count = ?,
+                        next_catalog_sync_attempt_at = ?, claimed_by = NULL,
+                        lease_expires_at = NULL, updated_at = ?, error = ?
+                    WHERE id = ? AND status = ? AND claimed_by = ?
+                    """,
+                    (
+                        next_status.value,
+                        attempts,
+                        next_attempt_at,
+                        now,
+                        "catalog_sync: catalog_sync_lease_expired",
+                        row["id"],
+                        JobStatus.CATALOG_SYNCING.value,
+                        row["claimed_by"],
+                    ),
+                )
+                recovered += cursor.rowcount
+        return recovered
 
     def recover_expired_publication_leases(
         self,

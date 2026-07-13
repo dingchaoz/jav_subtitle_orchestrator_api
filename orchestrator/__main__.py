@@ -62,6 +62,22 @@ def build_supabase_publisher(settings):
     )
 
 
+def build_catalog_sync_client(settings):
+    if not settings.mac_translation_publish_enabled:
+        return None
+    if not settings.javsubtitle_api_base or not settings.javsubtitle_admin_api_token:
+        raise RuntimeError(
+            "Supabase publication and catalog sync is enabled but website API base "
+            "or admin token is missing"
+        )
+    from orchestrator.catalog_sync import CatalogSyncClient
+
+    return CatalogSyncClient(
+        settings.javsubtitle_api_base,
+        settings.javsubtitle_admin_api_token,
+    )
+
+
 def run_api() -> None:
     import uvicorn
 
@@ -197,6 +213,7 @@ def run_mac_translation_worker() -> None:
 
     settings = MacSettings()
     publisher = build_supabase_publisher(settings)
+    catalog_sync_client = build_catalog_sync_client(settings)
     _export_mac_translation_runtime_env(settings)
     translator = SubtitleTranslator(settings.mac_translate_script_path)
     _run_mac_translation_smoke(settings, translator)
@@ -212,6 +229,9 @@ def run_mac_translation_worker() -> None:
         publisher=publisher,
         max_publish_attempts=settings.max_publish_attempts,
         publish_retry_seconds=settings.mac_publish_retry_seconds,
+        catalog_sync_client=catalog_sync_client,
+        max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
+        catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
     )
     run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
 
@@ -225,6 +245,7 @@ def run_mac_translation_worker_once(job_id: str) -> None:
 
     settings = MacSettings()
     publisher = build_supabase_publisher(settings)
+    catalog_sync_client = build_catalog_sync_client(settings)
     _export_mac_translation_runtime_env(settings)
     translator = SubtitleTranslator(settings.mac_translate_script_path)
     _run_mac_translation_smoke(settings, translator)
@@ -240,6 +261,9 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         publisher=publisher,
         max_publish_attempts=settings.max_publish_attempts,
         publish_retry_seconds=settings.mac_publish_retry_seconds,
+        catalog_sync_client=catalog_sync_client,
+        max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
+        catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)

@@ -300,11 +300,34 @@ class RecordingPublisher:
             raise error
         return SimpleNamespace(
             movie_uuid="00000000-0000-0000-0000-000000000001",
+            subtitle_id="00000000-0000-0000-0000-000000000002",
+            storage_path=f"{movie.split('-', 1)[0]}/{movie}/{movie}-English_AI.srt",
             content_sha256="a" * 64,
             file_size=path.stat().st_size,
             verified=self.verified,
             metadata_status=self.metadata_status,
             metadata_source=self.metadata_source,
+        )
+
+
+class RecordingCatalogSync:
+    def __init__(self, events=None, *, errors=None):
+        self.events = events if events is not None else []
+        self.errors = iter(errors or [])
+
+    def sync(self, movie):
+        self.events.append(("catalog", movie))
+        error = next(self.errors, None)
+        if error is not None:
+            raise error
+        return SimpleNamespace(
+            canonical_code=movie,
+            d1_rows_updated=1,
+            subtitle_count=1,
+            kv_keys_deleted=(
+                f"movie:full:{movie}",
+                f"movie:light:{movie}",
+            ),
         )
 
 
@@ -375,6 +398,7 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     store.initialize()
     job = prepare_transcription_done_job(store, mac_jobs_root)
     events = []
+    catalog = RecordingCatalogSync(events)
     worker = MacTranslationWorker(
         store,
         RecordingTranslator(events),
@@ -382,6 +406,7 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=RecordingPublisher(events),
+        catalog_sync_client=catalog,
     )
 
     assert worker.process_one() is True
@@ -390,6 +415,13 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
 
     assert worker.process_one() is True
     assert [event[0] for event in events] == ["translate", "publish"]
+    published = store.get_job(job.id)
+    assert published.status is JobStatus.CATALOG_SYNC_PENDING
+    assert published.published_subtitle_id == "00000000-0000-0000-0000-000000000002"
+    assert published.published_storage_path == "ktb/ktb-096/ktb-096-English_AI.srt"
+
+    assert worker.process_one() is True
+    assert [event[0] for event in events] == ["translate", "publish", "catalog"]
     assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
     log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
     assert "publish_verified" in log.read_text(encoding="utf-8")
@@ -410,10 +442,13 @@ def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
             metadata_status="placeholder",
             metadata_source="placeholder",
         ),
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_one() is True
     assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
     assert worker.process_one() is True
 
     refreshed = store.get_job(job.id)
@@ -421,6 +456,79 @@ def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
     assert refreshed.catalog_movie_uuid == "00000000-0000-0000-0000-000000000001"
     assert refreshed.metadata_status == "placeholder"
     assert refreshed.metadata_source == "placeholder"
+
+
+def test_catalog_failure_retries_without_retranslation_or_reupload(
+    sqlite_path, mac_jobs_root
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=[CatalogSyncError("catalog_fetch_failed"), None],
+        ),
+        catalog_sync_retry_seconds=0,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert worker.process_one() is True
+
+    failed = store.get_job(job.id)
+    assert failed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert failed.catalog_sync_attempt_count == 1
+    assert failed.next_catalog_sync_attempt_at is not None
+    assert failed.error == "catalog_sync: catalog_fetch_failed"
+    assert [event[0] for event in events].count("translate") == 1
+    assert [event[0] for event in events].count("publish") == 1
+
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert [event[0] for event in events] == [
+        "translate",
+        "publish",
+        "catalog",
+        "catalog",
+    ]
+
+
+def test_due_catalog_sync_has_priority_over_unrelated_translation(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-021")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    second = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-022")
+
+    assert worker.process_one() is True
+
+    assert store.get_job(first.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_job(second.id).status is JobStatus.TRANSCRIPTION_DONE
+    assert [event[0] for event in events] == ["translate", "publish", "catalog"]
 
 
 def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root):
@@ -442,6 +550,7 @@ def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root
             events,
             errors=[RuntimeError("publish unavailable"), None],
         ),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
 
     assert worker.process_one() is True
@@ -457,6 +566,10 @@ def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root
     assert audio.read_bytes() == b"keep-audio"
     assert english.exists()
     assert worker.consecutive_quality_failures == 0
+
+    assert worker.process_one() is True
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.CATALOG_SYNC_PENDING
 
     assert worker.process_one() is True
     refreshed = store.get_job(job.id)
@@ -486,6 +599,7 @@ def test_publisher_quality_failure_is_permanent_and_quarantines_english(
             events,
             errors=[SubtitleQualityGateError(["subtitle_changed_after_validation"])],
         ),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
     assert worker.process_one() is True
     english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
@@ -528,6 +642,7 @@ def test_three_publisher_quality_failures_stop_before_claiming_fourth_pending_jo
                 for _ in range(3)
             ],
         ),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
     pending_jobs = []
     for movie in ("abc-031", "abc-032", "abc-033", "abc-034"):
@@ -572,6 +687,7 @@ def test_final_publish_attempt_fails_but_preserves_validated_files(
         max_publish_attempts=1,
         publish_retry_seconds=0,
         publisher=RecordingPublisher(errors=[RuntimeError("publish unavailable")]),
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_one() is True
@@ -580,7 +696,7 @@ def test_final_publish_attempt_fails_but_preserves_validated_files(
 
     refreshed = store.get_job(job.id)
     assert refreshed.status is JobStatus.FAILED
-    assert refreshed.error == "publishing: publish unavailable"
+    assert refreshed.error == "publishing: publication_failed"
     assert refreshed.translation_attempt_count == 0
     assert refreshed.publish_attempt_count == 1
     assert english.exists()
@@ -599,13 +715,14 @@ def test_due_publication_has_priority_over_new_translation(sqlite_path, mac_jobs
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
     assert worker.process_one() is True
     new_job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-002")
 
     assert worker.process_one() is True
 
-    assert store.get_job(pending.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_job(pending.id).status is JobStatus.CATALOG_SYNC_PENDING
     assert store.get_job(new_job.id).status is JobStatus.TRANSCRIPTION_DONE
     assert [event[0] for event in events] == ["translate", "publish"]
 
@@ -628,6 +745,7 @@ def test_future_publication_retry_does_not_block_new_translation(
             events,
             errors=[RuntimeError("publish unavailable")],
         ),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
     assert worker.process_one() is True
     assert worker.process_one() is True
@@ -654,6 +772,7 @@ def test_exact_job_worker_does_not_claim_other_translation(
         worker_id="mac-canary",
         lease_seconds=60,
         publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_job_id(second.id) is True
@@ -676,6 +795,7 @@ def test_exact_pending_job_publishes_without_claiming_other_pending(
         worker_id="mac-setup",
         lease_seconds=60,
         publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
     )
     assert setup_worker.process_job_id(first.id) is True
     first_ready = store.get_job(first.id)
@@ -697,13 +817,14 @@ def test_exact_pending_job_publishes_without_claiming_other_pending(
         worker_id="mac-canary",
         lease_seconds=60,
         publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
 
     assert worker.process_job_id(third.id) is True
 
     assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
     assert store.get_job(third.id).status is JobStatus.ENGLISH_SRT_READY
-    assert [event[0] for event in events] == ["publish"]
+    assert [event[0] for event in events] == ["publish", "catalog"]
 
 
 def test_prepared_catalog_canary_publication_only_exact_job_preserves_other_job(
@@ -757,6 +878,7 @@ def test_prepared_catalog_canary_publication_only_exact_job_preserves_other_job(
         worker_id="mac-catalog-canary",
         lease_seconds=60,
         publisher=RecordingPublisher(publication_calls, verified=True),
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert receipt.new_status is JobStatus.PUBLISH_PENDING
@@ -789,6 +911,7 @@ def test_publisher_receives_metadata_json_path(sqlite_path, mac_jobs_root):
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
     )
 
     assert worker.process_one() is True
@@ -811,6 +934,7 @@ def test_unverified_publication_never_becomes_ready(sqlite_path, mac_jobs_root):
         lease_seconds=60,
         publish_retry_seconds=0,
         publisher=RecordingPublisher(verified=False),
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_one() is True
@@ -818,7 +942,74 @@ def test_unverified_publication_never_becomes_ready(sqlite_path, mac_jobs_root):
 
     refreshed = store.get_job(job.id)
     assert refreshed.status is JobStatus.PUBLISH_PENDING
-    assert refreshed.error == "publishing: Supabase publication was not verified"
+    assert refreshed.error == "publishing: publication_failed"
+
+
+def test_publication_exception_does_not_persist_token_or_response_body(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    secret = "admin-token-and-adult-subtitle-response-body"
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(errors=[RuntimeError(secret)]),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    log = (mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log").read_text(
+        encoding="utf-8"
+    )
+    assert refreshed.error == "publishing: publication_failed"
+    assert secret not in refreshed.error
+    assert secret not in log
+
+
+def test_worker_restart_resumes_only_catalog_stage(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    events = []
+    first_worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert first_worker.process_one() is True
+    assert first_worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+
+    class MustNotRun:
+        def __getattr__(self, name):
+            raise AssertionError(f"unexpected restart call: {name}")
+
+    restarted_worker = MacTranslationWorker(
+        store,
+        MustNotRun(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-2",
+        lease_seconds=60,
+        publisher=MustNotRun(),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+
+    assert restarted_worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert [event[0] for event in events] == ["translate", "publish", "catalog"]
 
 
 def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
@@ -829,7 +1020,8 @@ def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
     job = prepare_transcription_done_job(store, mac_jobs_root)
     audio = mac_jobs_root / "ktb-096" / "audio.wav"
     audio.write_bytes(b"keep-audio")
-    publisher = RecordingPublisher()
+    downstream_events = []
+    publisher = RecordingPublisher(downstream_events)
     worker = MacTranslationWorker(
         store,
         DiverseMacTranslator(),
@@ -837,6 +1029,7 @@ def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(downstream_events),
     )
     assert worker.process_one() is True
     english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
@@ -849,6 +1042,7 @@ def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
 
     refreshed = store.get_job(job.id)
     assert publisher.events == []
+    assert downstream_events == []
     assert refreshed.status is JobStatus.FAILED
     assert refreshed.error.startswith("publishing: quality_gate_failed:")
     assert "known_bad_collapse" in refreshed.error
@@ -880,6 +1074,7 @@ def test_missing_pending_english_fails_quality_without_creating_rejected_dir(
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(),
     )
     assert worker.process_one() is True
     english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
@@ -914,6 +1109,7 @@ def test_three_changed_pending_subtitles_stop_worker_before_next_claim(
         lease_seconds=60,
         quality_failure_limit=3,
         publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(),
     )
     pending_jobs = []
     for movie in ("abc-021", "abc-022", "abc-023"):
@@ -955,6 +1151,7 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_one() is True
@@ -990,6 +1187,7 @@ def test_translator_no_output_fails_quality_without_creating_rejected_dir(
         worker_id="mac-translation-1",
         lease_seconds=60,
         publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(),
     )
 
     assert worker.process_one() is True

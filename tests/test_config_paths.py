@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.__main__ import (
+    build_catalog_sync_client,
     _build_windows_transcriber,
     build_supabase_publisher,
     run_mac_translation_worker,
@@ -296,6 +297,25 @@ def test_supabase_publisher_factory_requires_credentials_when_enabled():
         build_supabase_publisher(enabled)
 
 
+def test_catalog_sync_factory_is_disabled_with_local_publication():
+    settings = SimpleNamespace(mac_translation_publish_enabled=False)
+
+    assert build_catalog_sync_client(settings) is None
+
+
+@pytest.mark.parametrize("missing", ["javsubtitle_api_base", "javsubtitle_admin_api_token"])
+def test_catalog_sync_factory_fails_closed_when_publication_enabled(missing):
+    values = {
+        "mac_translation_publish_enabled": True,
+        "javsubtitle_api_base": "https://javsubtitle.example",
+        "javsubtitle_admin_api_token": "admin-token",
+    }
+    values[missing] = None
+
+    with pytest.raises(RuntimeError, match="catalog sync is enabled"):
+        build_catalog_sync_client(SimpleNamespace(**values))
+
+
 def test_supabase_publisher_factory_shares_session_with_catalog_ensurer():
     settings = SimpleNamespace(
         mac_translation_publish_enabled=True,
@@ -325,6 +345,9 @@ def test_mac_translation_entrypoints_wire_publication_retry_settings(entrypoint)
 
     assert "max_publish_attempts=settings.max_publish_attempts" in source
     assert "publish_retry_seconds=settings.mac_publish_retry_seconds" in source
+    assert "catalog_sync_client=catalog_sync_client" in source
+    assert "max_catalog_sync_attempts=settings.max_catalog_sync_attempts" in source
+    assert "catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds" in source
 
 
 def test_windows_settings_defaults_match_design_spec(monkeypatch):

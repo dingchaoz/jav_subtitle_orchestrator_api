@@ -1283,7 +1283,7 @@ def test_permanent_publication_failure_fails_immediately_without_translation_att
     assert failed.english_srt_path_windows == pending.english_srt_path_windows
 
 
-def test_publication_success_is_only_from_claim_and_records_catalog_metadata(
+def test_supabase_success_is_only_from_claim_and_records_verified_receipt(
     sqlite_path, mac_jobs_root
 ):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
@@ -1292,26 +1292,38 @@ def test_publication_success_is_only_from_claim_and_records_catalog_metadata(
     movie_uuid = "f1bd9932-5697-4f16-865a-c56edc73d491"
 
     with pytest.raises(PermissionError):
-        store.complete_publication(
+        store.complete_supabase_publication(
             pending.id,
             "publisher",
             movie_uuid=movie_uuid,
             metadata_status="placeholder",
             metadata_source="placeholder",
+            subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+            storage_path="abc/abc-016/abc-016-English_AI.srt",
+            content_sha256="a" * 64,
+            file_size=123,
         )
     claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
-    completed = store.complete_publication(
+    completed = store.complete_supabase_publication(
         claimed.id,
         "publisher",
         movie_uuid=movie_uuid,
         metadata_status="placeholder",
         metadata_source="placeholder",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-016/abc-016-English_AI.srt",
+        content_sha256="a" * 64,
+        file_size=123,
     )
 
-    assert completed.status is JobStatus.ENGLISH_SRT_READY
+    assert completed.status is JobStatus.CATALOG_SYNC_PENDING
     assert completed.catalog_movie_uuid == movie_uuid
     assert completed.metadata_status == "placeholder"
     assert completed.metadata_source == "placeholder"
+    assert completed.published_subtitle_id == "f1bd9932-5697-4f16-865a-c56edc73d492"
+    assert completed.published_storage_path == "abc/abc-016/abc-016-English_AI.srt"
+    assert completed.published_content_sha256 == "a" * 64
+    assert completed.published_file_size == 123
     assert completed.next_publish_attempt_at is None
     assert completed.error is None
     assert completed.claimed_by is None
@@ -1326,7 +1338,7 @@ def test_publication_success_is_only_from_claim_and_records_catalog_metadata(
         ("f1bd9932-5697-4f16-865a-c56edc73d491", "complete", "unknown"),
     ],
 )
-def test_publication_success_rejects_invalid_catalog_values_atomically(
+def test_supabase_success_rejects_invalid_receipt_values_atomically(
     sqlite_path,
     mac_jobs_root,
     movie_uuid,
@@ -1339,18 +1351,166 @@ def test_publication_success_rejects_invalid_catalog_values_atomically(
     claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
 
     with pytest.raises(ValueError):
-        store.complete_publication(
+        store.complete_supabase_publication(
             claimed.id,
             "publisher",
             movie_uuid=movie_uuid,
             metadata_status=metadata_status,
             metadata_source=metadata_source,
+            subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+            storage_path="abc/abc-017/abc-017-English_AI.srt",
+            content_sha256="a" * 64,
+            file_size=123,
         )
 
     unchanged = store.get_job(claimed.id)
     assert unchanged.status is JobStatus.PUBLISHING
     assert unchanged.claimed_by == "publisher"
     assert unchanged.catalog_movie_uuid is None
+
+
+def test_catalog_sync_claim_failure_retry_and_exact_success(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-023")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        claimed.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-023/abc-023-English_AI.srt",
+        content_sha256="b" * 64,
+        file_size=456,
+    )
+
+    with pytest.raises(PermissionError):
+        store.complete_catalog_sync(
+            receipt.id,
+            "catalog-worker",
+            canonical_code="abc-023",
+            d1_rows_updated=1,
+            subtitle_count=1,
+            kv_keys_deleted=("movie:full:abc-023", "movie:light:abc-023"),
+        )
+    syncing = store.claim_catalog_sync_job(
+        "catalog-worker", 60, job_id=receipt.id
+    )
+    assert syncing.status is JobStatus.CATALOG_SYNCING
+    failed = store.fail_catalog_sync(
+        syncing.id,
+        "catalog-worker",
+        "catalog_fetch_failed",
+        max_catalog_sync_attempts=3,
+        retry_seconds=0,
+    )
+    assert failed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert failed.catalog_sync_attempt_count == 1
+    assert failed.publish_attempt_count == 0
+    assert failed.next_catalog_sync_attempt_at is not None
+    assert failed.published_subtitle_id == receipt.published_subtitle_id
+    assert failed.error == "catalog_sync: catalog_fetch_failed"
+
+    syncing = store.claim_catalog_sync_job(
+        "catalog-worker", 60, job_id=receipt.id
+    )
+    ready = store.complete_catalog_sync(
+        syncing.id,
+        "catalog-worker",
+        canonical_code="abc-023",
+        d1_rows_updated=1,
+        subtitle_count=1,
+        kv_keys_deleted=("movie:full:abc-023", "movie:light:abc-023"),
+    )
+    assert ready.status is JobStatus.ENGLISH_SRT_READY
+    assert ready.claimed_by is None
+    assert ready.lease_expires_at is None
+    assert ready.error is None
+
+
+def test_expired_catalog_sync_lease_uses_only_catalog_counter(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-024")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-024/abc-024-English_AI.srt",
+        content_sha256="c" * 64,
+        file_size=789,
+    )
+    syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
+    expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    store.force_lease_expiry_for_test(syncing.id, expired)
+
+    assert store.recover_expired_catalog_sync_leases(3, 0) == 1
+
+    recovered = store.get_job(receipt.id)
+    assert recovered.status is JobStatus.CATALOG_SYNC_PENDING
+    assert recovered.catalog_sync_attempt_count == 1
+    assert recovered.publish_attempt_count == 0
+    assert recovered.translation_attempt_count == 0
+    assert recovered.error == "catalog_sync: catalog_sync_lease_expired"
+
+
+def test_catalog_sync_claim_refuses_pending_row_without_verified_receipt(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-025", priority=100, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.CATALOG_SYNC_PENDING.value, job.id),
+        )
+
+    assert store.claim_catalog_sync_job("catalog-worker", 60) is None
+    unchanged = store.get_job(job.id)
+    assert unchanged.status is JobStatus.CATALOG_SYNC_PENDING
+    assert unchanged.claimed_by is None
+
+
+def test_catalog_sync_failure_rejects_unrecognized_reason_text(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-026")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-026/abc-026-English_AI.srt",
+        content_sha256="d" * 64,
+        file_size=321,
+    )
+    syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
+
+    failed = store.fail_catalog_sync(
+        syncing.id,
+        "catalog-worker",
+        "admin_token_secret",
+        max_catalog_sync_attempts=3,
+        retry_seconds=0,
+    )
+
+    assert failed.error == "catalog_sync: catalog_sync_failed"
 
 
 def test_expired_publication_lease_uses_publication_counter(
