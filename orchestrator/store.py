@@ -991,6 +991,7 @@ class JobStore:
         *,
         max_publish_attempts: int,
         retry_seconds: int,
+        permanent: bool = False,
     ) -> JobRecord:
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
@@ -1002,7 +1003,7 @@ class JobStore:
             if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
                 raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
             attempts = job.publish_attempt_count + 1
-            exhausted = attempts >= max_publish_attempts
+            exhausted = permanent or attempts >= max_publish_attempts
             next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
             next_attempt_at = (
                 None

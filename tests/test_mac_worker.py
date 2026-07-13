@@ -596,6 +596,87 @@ def test_unverified_publication_never_becomes_ready(sqlite_path, mac_jobs_root):
     assert refreshed.error == "publishing: Supabase publication was not verified"
 
 
+def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    publisher = RecordingPublisher()
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=publisher,
+    )
+    assert worker.process_one() is True
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+    japanese = mac_jobs_root / "ktb-096" / "ktb-096.Japanese.srt"
+    rejected = english.parent / "rejected"
+    rejected_before = len(list(rejected.glob("*.srt")))
+    CollapsedMacTranslator().translate_to_english(japanese, english)
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert publisher.events == []
+    assert refreshed.status is JobStatus.FAILED
+    assert refreshed.error.startswith("publishing: quality_gate_failed:")
+    assert "known_bad_collapse" in refreshed.error
+    assert refreshed.publish_attempt_count == 1
+    assert refreshed.translation_attempt_count == 0
+    assert refreshed.next_publish_attempt_at is None
+    assert not english.exists()
+    assert len(list(rejected.glob("*.srt"))) == rejected_before + 1
+    assert audio.read_bytes() == b"keep-audio"
+    assert '"passed": false' in (
+        english.parent / "logs" / "quality.log"
+    ).read_text(encoding="utf-8")
+    assert worker.consecutive_quality_failures == 1
+
+
+def test_three_changed_pending_subtitles_stop_worker_before_next_claim(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    publisher = RecordingPublisher()
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        quality_failure_limit=3,
+        publisher=publisher,
+    )
+    pending_jobs = []
+    for movie in ("abc-021", "abc-022", "abc-023"):
+        job = prepare_transcription_done_job(store, mac_jobs_root, movie=movie)
+        claimed = store.claim_translation_job(job.id, worker.worker_id, 60)
+        assert claimed is not None
+        assert worker._process_claimed_translation(claimed) is True
+        english = mac_jobs_root / movie / f"{movie}.English.srt"
+        japanese = mac_jobs_root / movie / f"{movie}.Japanese.srt"
+        CollapsedMacTranslator().translate_to_english(japanese, english)
+        pending_jobs.append(job)
+    next_job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-024")
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    with pytest.raises(MacTranslationUnhealthyError, match="3 consecutive"):
+        worker.process_one()
+
+    assert publisher.events == []
+    assert all(store.get_job(job.id).status is JobStatus.FAILED for job in pending_jobs)
+    assert store.get_job(next_job.id).status is JobStatus.TRANSCRIPTION_DONE
+
+
 def test_mac_translation_worker_permanently_rejects_collapsed_output(
     sqlite_path,
     mac_jobs_root,

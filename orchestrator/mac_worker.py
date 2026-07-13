@@ -130,6 +130,10 @@ class MacTranslationQualityError(RuntimeError):
     pass
 
 
+class MacPublicationQualityError(RuntimeError):
+    pass
+
+
 class MacTranslationUnhealthyError(RuntimeError):
     pass
 
@@ -334,12 +338,16 @@ class MacTranslationWorker:
             self._process_publication(job)
         except Exception as exc:
             error = "publishing: publication failed"
+            permanent = isinstance(exc, MacPublicationQualityError)
+            if permanent:
+                self.consecutive_quality_failures += 1
             updated = self.store.fail_publication(
                 job.id,
                 self.worker_id,
                 str(exc),
                 max_publish_attempts=self.max_publish_attempts,
                 retry_seconds=self.publish_retry_seconds,
+                permanent=permanent,
             )
             write_job_snapshot(updated)
             _append_job_log_safely(
@@ -357,6 +365,17 @@ class MacTranslationWorker:
             self.store.jobs_root_mac,
             self.store.jobs_root_windows,
         )
+        report = validate_translation_quality(
+            paths.japanese_srt_path_mac,
+            paths.english_srt_path_mac,
+        )
+        self._write_quality_log(paths.job_dir_mac, report)
+        if not report.passed:
+            self._quarantine(paths.english_srt_path_mac, "quality")
+            raise MacPublicationQualityError(
+                "quality_gate_failed:" + ",".join(report.reason_codes)
+            )
+        self.consecutive_quality_failures = 0
         published = self.publisher.publish_english_ai(
             job.normalized_movie_number,
             paths.english_srt_path_mac,

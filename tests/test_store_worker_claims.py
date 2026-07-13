@@ -353,6 +353,32 @@ def test_publication_final_attempt_fails_job(sqlite_path, mac_jobs_root):
     assert failed.next_publish_attempt_at is None
 
 
+def test_permanent_publication_failure_fails_immediately_without_translation_attempt(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-020")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+
+    failed = store.fail_publication(
+        claimed.id,
+        "publisher",
+        "quality_gate_failed:known_bad_collapse",
+        max_publish_attempts=10,
+        retry_seconds=120,
+        permanent=True,
+    )
+
+    assert failed.status is JobStatus.FAILED
+    assert failed.publish_attempt_count == 1
+    assert failed.translation_attempt_count == 0
+    assert failed.next_publish_attempt_at is None
+    assert failed.error == "publishing: quality_gate_failed:known_bad_collapse"
+    assert failed.english_srt_path_mac == pending.english_srt_path_mac
+    assert failed.english_srt_path_windows == pending.english_srt_path_windows
+
+
 def test_publication_success_is_only_from_claim_and_records_catalog_metadata(
     sqlite_path, mac_jobs_root
 ):
