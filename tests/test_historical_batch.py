@@ -1827,6 +1827,200 @@ def test_controller_hard_pauses_for_injected_worker_health_failure(
     assert result.enqueued == 0
 
 
+def test_process_inventory_uses_exact_ps_tokens_and_excludes_other_commands(
+    monkeypatch
+):
+    import subprocess
+
+    from orchestrator.__main__ import PsProcessInventory
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "101 /usr/bin/python -m orchestrator mac-translation-worker\n"
+                "102 /usr/bin/python -m orchestrator mac-translation-worker-once --job-id x\n"
+                "103 /usr/bin/python -m orchestrator "
+                "historical-repair-controller --allowlist-file x\n"
+                "104 /usr/bin/python -c broken\\ command\n"
+                "105 /bin/echo -m orchestrator mac-translation-worker\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    processes = PsProcessInventory().list_processes()
+
+    assert [process.pid for process in processes] == [101, 102, 103, 104, 105]
+    assert captured["command"] == ["ps", "-axo", "pid=,command="]
+    assert captured["kwargs"]["shell"] is False
+    assert captured["kwargs"]["timeout"] == 5
+    exact = [process for process in processes if process.is_translation_worker]
+    assert [process.pid for process in exact] == [101]
+
+
+def test_translation_worker_health_requires_one_os_process_and_one_fresh_heartbeat(
+    sqlite_path, mac_jobs_root
+):
+    from orchestrator.__main__ import (
+        ProcessRecord,
+        TranslationWorkerHealthProbe,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    store.record_worker_idle("fresh-worker", role="mac_translator")
+    with store.connection() as conn:
+        conn.execute(
+            "INSERT INTO worker_statuses (worker_id, role, state, last_seen_at, "
+            "updated_at) VALUES ('stale-worker', 'mac_translator', 'idle', ?, ?)",
+            ("2000-01-01T00:00:00+00:00", "2000-01-01T00:00:00+00:00"),
+        )
+
+    class Inventory:
+        def __init__(self, count):
+            self.count = count
+
+        def list_processes(self):
+            return tuple(
+                ProcessRecord(
+                    100 + index,
+                    ("/usr/bin/python", "-m", "orchestrator", "mac-translation-worker"),
+                )
+                for index in range(self.count)
+            )
+
+    assert TranslationWorkerHealthProbe(store, Inventory(1))() is None
+    assert (
+        TranslationWorkerHealthProbe(store, Inventory(2))()
+        == "translation_worker_count_mismatch"
+    )
+    assert (
+        TranslationWorkerHealthProbe(store, Inventory(0))()
+        == "translation_worker_count_mismatch"
+    )
+
+
+def test_translation_worker_health_fails_closed_when_process_inventory_errors(
+    sqlite_path, mac_jobs_root
+):
+    from orchestrator.__main__ import TranslationWorkerHealthProbe
+
+    store = _store(sqlite_path, mac_jobs_root)
+    store.record_worker_idle("fresh-worker", role="mac_translator")
+
+    class BrokenInventory:
+        def list_processes(self):
+            raise RuntimeError("ps unavailable")
+
+    assert (
+        TranslationWorkerHealthProbe(store, BrokenInventory())()
+        == "translation_worker_count_mismatch"
+    )
+
+
+@pytest.mark.parametrize("first_decision", ["normal_backlog", "hard_health", "complete"])
+def test_controller_first_run_pins_identity_before_any_decision(
+    sqlite_path, mac_jobs_root, tmp_path, first_decision
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    if first_decision == "complete":
+        _job(store, mac_jobs_root, "abc-001", bad=False)
+    else:
+        _job(store, mac_jobs_root, "abc-001")
+    if first_decision == "normal_backlog":
+        _add_normal_stage(
+            store,
+            "new-001",
+            JobStatus.TRANSCRIPTION_DONE,
+            claimed=False,
+        )
+    allowlist = tmp_path / "approved" / "allowlist.txt"
+    allowlist.parent.mkdir()
+    allowlist.write_text("abc-001\n")
+    health = (
+        (lambda: "translation_worker_count_mismatch")
+        if first_decision == "hard_health"
+        else (lambda: None)
+    )
+
+    first = HistoricalRepairController(
+        store,
+        allowlist,
+        worker_health_probe=health,
+    ).run_once()
+
+    expected_reason = {
+        "normal_backlog": "normal_backlog",
+        "hard_health": "translation_worker_count_mismatch",
+        "complete": "allowlist_complete",
+    }[first_decision]
+    assert first.reason_code == expected_reason
+    with store.connection() as conn:
+        identity = conn.execute(
+            "SELECT controller_allowlist_path_sha256, "
+            "controller_allowlist_sha256, controller_allowlist_codes_sha256 "
+            "FROM historical_repair_control WHERE singleton = 1"
+        ).fetchone()
+    assert all(identity)
+
+    replacement = tmp_path / "replacement" / "allowlist.txt"
+    replacement.parent.mkdir()
+    replacement.write_bytes(allowlist.read_bytes())
+    second = HistoricalRepairController(
+        store,
+        replacement,
+        worker_health_probe=health,
+    ).run_once()
+    assert second.reason_code == "allowlist_changed"
+    assert second.hard_pause is True
+    assert second.enqueued == 0
+
+
+def test_controller_identity_survives_crash_after_pin_before_enqueue(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "approved" / "allowlist.txt"
+    allowlist.parent.mkdir()
+    allowlist.write_text("abc-001\n")
+
+    def crash():
+        raise RuntimeError("simulated controller crash")
+
+    with pytest.raises(RuntimeError, match="simulated controller crash"):
+        HistoricalRepairController(
+            store,
+            allowlist,
+            before_enqueue=crash,
+        ).run_once()
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT controller_allowlist_sha256 FROM historical_repair_control "
+            "WHERE singleton = 1"
+        ).fetchone()[0] is not None
+
+    replacement = tmp_path / "replacement" / "allowlist.txt"
+    replacement.parent.mkdir()
+    replacement.write_bytes(allowlist.read_bytes())
+    result = HistoricalRepairController(store, replacement).run_once()
+    assert result.reason_code == "allowlist_changed"
+    assert result.enqueued == 0
+
+
 def test_controller_detects_allowlist_mutation_after_restart_without_writes(
     sqlite_path, mac_jobs_root, tmp_path
 ):

@@ -1441,8 +1441,37 @@ def test_inflight_historical_unit_finishes_then_normal_wins_before_next_repair(
     ]
 
 
+def _assert_historical_controller_pause(
+    store,
+    tmp_path,
+    movie,
+    expected_reason,
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    allowlist = tmp_path / f"{movie}-allowlist.txt"
+    allowlist.write_text(f"{movie}\n")
+    allowlist_sha = hashlib.sha256(allowlist.read_bytes()).hexdigest()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET allowlist_sha256 = ? "
+            "WHERE movie_code = ?",
+            (allowlist_sha, movie),
+        )
+    controller = HistoricalRepairController(
+        store,
+        allowlist,
+        worker_health_probe=lambda: None,
+    )
+    result = controller.run_once()
+    assert result.hard_pause is True
+    assert result.reason_code == expected_reason
+    assert result.enqueued == 0
+    return controller
+
+
 def test_historical_publication_exhaustion_is_terminal_without_retranslation(
-    sqlite_path, mac_jobs_root
+    sqlite_path, mac_jobs_root, tmp_path
 ):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -1465,12 +1494,25 @@ def test_historical_publication_exhaustion_is_terminal_without_retranslation(
     assert store.get_job(job.id).status is JobStatus.FAILED
     repair = store.get_historical_repair(job.id)
     assert repair.state is HistoricalRepairState.PERMANENT_FAILED
-    assert repair.reason_code == "publication_attempts_exhausted"
+    assert repair.reason_code == "supabase_verification_failed"
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == "supabase_verification_failed"
+    controller = _assert_historical_controller_pause(
+        store,
+        tmp_path,
+        "old-141",
+        "supabase_verification_failed",
+    )
     assert [event[0] for event in events] == ["translate", "publish"]
+    store.resume_historical_lane()
+    resumed = controller.run_once()
+    assert resumed.complete is True
+    assert resumed.counts["permanent_failed"] == 1
 
 
 def test_historical_catalog_exhaustion_is_terminal_without_reupload(
-    sqlite_path, mac_jobs_root
+    sqlite_path, mac_jobs_root, tmp_path
 ):
     from orchestrator.catalog_sync import CatalogSyncError
 
@@ -1498,8 +1540,127 @@ def test_historical_catalog_exhaustion_is_terminal_without_reupload(
     assert store.get_job(job.id).status is JobStatus.FAILED
     repair = store.get_historical_repair(job.id)
     assert repair.state is HistoricalRepairState.PERMANENT_FAILED
-    assert repair.reason_code == "catalog_fetch_failed"
+    assert repair.reason_code == "catalog_sync_failed"
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == "catalog_sync_failed"
+    _assert_historical_controller_pause(
+        store,
+        tmp_path,
+        "old-142",
+        "catalog_sync_failed",
+    )
     assert [event[0] for event in events] == ["translate", "publish", "catalog"]
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "catalog_auth_failed",
+        "catalog_redirect_rejected",
+        "catalog_response_invalid",
+        "catalog_response_mismatch",
+        "public_visibility_redirect_rejected",
+        "public_visibility_response_invalid",
+        "public_visibility_mismatch",
+    ],
+)
+def test_historical_structural_catalog_failure_pauses_on_first_attempt(
+    sqlite_path, mac_jobs_root, tmp_path, reason_code
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    movie = "old-171"
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, movie)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_catalog_sync_attempts=3,
+        catalog_sync_retry_seconds=0,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=[CatalogSyncError(reason_code), None],
+        ),
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == reason_code
+    _assert_historical_controller_pause(
+        store,
+        tmp_path,
+        movie,
+        reason_code,
+    )
+    store.resume_historical_lane()
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "pause_reason"),
+    [
+        ("catalog_fetch_failed", "catalog_sync_failed"),
+        ("catalog_sync_failed", "catalog_sync_failed"),
+        ("public_visibility_fetch_failed", "public_visibility_failed"),
+        ("public_visibility_not_found", "public_visibility_failed"),
+    ],
+)
+def test_historical_transient_catalog_exhaustion_pauses_with_bounded_reason(
+    sqlite_path, mac_jobs_root, tmp_path, reason_code, pause_reason
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    movie = "old-172"
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, movie)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_catalog_sync_attempts=1,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=[CatalogSyncError(reason_code)],
+        ),
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    repair = store.get_historical_repair(job.id)
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == pause_reason
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == pause_reason
+    _assert_historical_controller_pause(
+        store,
+        tmp_path,
+        movie,
+        pause_reason,
+    )
 
 
 def test_historical_catalog_auth_failure_pauses_lane_before_exhaustion(
@@ -1593,6 +1754,7 @@ def test_historical_terminal_stage_rolls_back_job_if_repair_update_fails(
     )
     assert current.status is expected
     assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert store.historical_lane_state().paused is False
 
 
 def test_catalog_completion_atomically_marks_historical_success(

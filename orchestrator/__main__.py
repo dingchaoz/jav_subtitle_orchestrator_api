@@ -2,15 +2,111 @@ import argparse
 import json
 import logging
 import os
+import re
+import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Protocol
 
 from orchestrator.logging_config import configure_logging
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessRecord:
+    pid: int
+    command: tuple[str, ...]
+
+    @property
+    def is_translation_worker(self) -> bool:
+        marker = ("-m", "orchestrator", "mac-translation-worker")
+        return any(
+            index > 0
+            and re.fullmatch(
+                r"python(?:\d+(?:\.\d+)*)?",
+                Path(self.command[index - 1]).name,
+            )
+            is not None
+            and self.command[index : index + len(marker)] == marker
+            and index + len(marker) == len(self.command)
+            for index in range(len(self.command) - len(marker) + 1)
+        )
+
+
+class ProcessInventory(Protocol):
+    def list_processes(self) -> tuple[ProcessRecord, ...]: ...
+
+
+class PsProcessInventory:
+    def list_processes(self) -> tuple[ProcessRecord, ...]:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            shell=False,
+            timeout=5,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("process inventory unavailable")
+        processes: list[ProcessRecord] = []
+        for line in completed.stdout.splitlines():
+            fields = line.strip().split(maxsplit=1)
+            if len(fields) != 2:
+                continue
+            try:
+                pid = int(fields[0])
+                command = tuple(shlex.split(fields[1], posix=True))
+            except (ValueError, TypeError):
+                continue
+            if pid > 0 and command:
+                processes.append(ProcessRecord(pid, command))
+        return tuple(processes)
+
+
+class TranslationWorkerHealthProbe:
+    def __init__(
+        self,
+        store,
+        process_inventory: ProcessInventory,
+        *,
+        freshness_seconds: int = 60,
+    ) -> None:
+        self.store = store
+        self.process_inventory = process_inventory
+        self.freshness_seconds = freshness_seconds
+
+    def __call__(self) -> str | None:
+        try:
+            process_count = sum(
+                process.is_translation_worker
+                for process in self.process_inventory.list_processes()
+            )
+            now = datetime.now(UTC)
+            fresh_heartbeats = 0
+            for worker in self.store.list_worker_statuses():
+                if worker.role != "mac_translator":
+                    continue
+                try:
+                    age = (
+                        now - datetime.fromisoformat(worker.last_seen_at)
+                    ).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= age <= self.freshness_seconds:
+                    fresh_heartbeats += 1
+        except Exception:
+            return "translation_worker_count_mismatch"
+        if process_count != 1 or fresh_heartbeats != 1:
+            return "translation_worker_count_mismatch"
+        return None
 
 
 def run_historical_repair_controller_loop(
@@ -51,34 +147,16 @@ def run_historical_repair_controller(
     store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
     store.initialize()
 
-    def worker_health_probe() -> str | None:
-        now = datetime.now(UTC)
-        translators = [
-            worker
-            for worker in store.list_worker_statuses()
-            if worker.role == "mac_translator"
-        ]
-        freshness_seconds = max(60, poll_interval_seconds * 3)
-        fresh = []
-        for worker in translators:
-            try:
-                age = (now - datetime.fromisoformat(worker.last_seen_at)).total_seconds()
-            except (TypeError, ValueError):
-                continue
-            if 0 <= age <= freshness_seconds:
-                fresh.append(worker)
-        if len(fresh) == 1:
-            return None
-        if translators and not fresh:
-            return "worker_health_stale"
-        return "worker_process_count_invalid"
-
     controller = HistoricalRepairController(
         store,
         allowlist_file,
         initial_batch_size=initial_batch_size,
         batch_size=batch_size,
-        worker_health_probe=worker_health_probe,
+        worker_health_probe=TranslationWorkerHealthProbe(
+            store,
+            PsProcessInventory(),
+            freshness_seconds=max(60, min(300, poll_interval_seconds * 3)),
+        ),
     )
     return run_historical_repair_controller_loop(
         controller,

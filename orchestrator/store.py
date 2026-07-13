@@ -40,6 +40,25 @@ _CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
         "public_visibility_mismatch",
     }
 )
+_IMMEDIATE_HISTORICAL_CATALOG_PAUSE_REASONS = frozenset(
+    {
+        "catalog_auth_failed",
+        "catalog_redirect_rejected",
+        "catalog_response_invalid",
+        "catalog_response_mismatch",
+        "public_visibility_redirect_rejected",
+        "public_visibility_response_invalid",
+        "public_visibility_mismatch",
+    }
+)
+_HISTORICAL_POLICY_PAUSE_REASONS = frozenset(
+    {
+        *_IMMEDIATE_HISTORICAL_CATALOG_PAUSE_REASONS,
+        "catalog_sync_failed",
+        "public_visibility_failed",
+        "supabase_verification_failed",
+    }
+)
 
 
 class CatalogLeaseLostError(PermissionError):
@@ -269,6 +288,63 @@ def normal_translation_backlog_exists(conn: sqlite3.Connection) -> bool:
         ),
     ).fetchone()
     return row is not None
+
+
+def pin_or_validate_historical_controller_identity_conn(
+    conn: sqlite3.Connection,
+    identity: tuple[str, str, str],
+    *,
+    now: str,
+) -> bool:
+    """Atomically pin the first allowlist identity or validate the durable pin."""
+    if len(identity) != 3:
+        raise ValueError("allowlist_changed")
+    for value in identity:
+        try:
+            _validate_expected_sha256(value, "controller identity")
+        except ValueError:
+            raise ValueError("allowlist_changed") from None
+    control = conn.execute(
+        "SELECT controller_allowlist_path_sha256, controller_allowlist_sha256, "
+        "controller_allowlist_codes_sha256 FROM historical_repair_control "
+        "WHERE singleton = 1"
+    ).fetchone()
+    if control is None:
+        raise RuntimeError("historical_controller_state_missing")
+    baseline = (
+        control["controller_allowlist_path_sha256"],
+        control["controller_allowlist_sha256"],
+        control["controller_allowlist_codes_sha256"],
+    )
+    if all(value is None for value in baseline):
+        repair_shas = {
+            row["allowlist_sha256"]
+            for row in conn.execute(
+                "SELECT DISTINCT allowlist_sha256 "
+                "FROM historical_translation_repairs"
+            ).fetchall()
+        }
+        if repair_shas and repair_shas != {identity[1]}:
+            raise ValueError("allowlist_changed")
+        cursor = conn.execute(
+            """
+            UPDATE historical_repair_control
+            SET controller_allowlist_path_sha256 = ?,
+                controller_allowlist_sha256 = ?,
+                controller_allowlist_codes_sha256 = ?, updated_at = ?
+            WHERE singleton = 1
+              AND controller_allowlist_path_sha256 IS NULL
+              AND controller_allowlist_sha256 IS NULL
+              AND controller_allowlist_codes_sha256 IS NULL
+            """,
+            (*identity, now),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("allowlist_changed")
+        return True
+    if baseline != identity:
+        raise ValueError("allowlist_changed")
+    return False
 
 
 class HistoricalRepairState(StrEnum):
@@ -1649,6 +1725,19 @@ class JobStore:
         with self.connection() as conn:
             return self._has_normal_translation_backlog_conn(conn)
 
+    def pin_or_validate_historical_controller_identity(
+        self,
+        identity: tuple[str, str, str],
+    ) -> bool:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return pin_or_validate_historical_controller_identity_conn(
+                conn,
+                identity,
+                now=now,
+            )
+
     def has_due_historical_repair(self) -> bool:
         with self.connection() as conn:
             row = conn.execute(
@@ -2532,6 +2621,20 @@ class JobStore:
             (now,),
         )
 
+    @staticmethod
+    def _pause_historical_policy_conn(
+        conn: sqlite3.Connection,
+        reason_code: str,
+        now: str,
+    ) -> None:
+        if reason_code not in _HISTORICAL_POLICY_PAUSE_REASONS:
+            raise ValueError("historical policy pause reason is invalid")
+        conn.execute(
+            "UPDATE historical_repair_control SET paused = 1, "
+            "reason_code = ?, updated_at = ? WHERE singleton = 1",
+            (reason_code, now),
+        )
+
     def _historical_failure_outcome_conn(
         self,
         conn: sqlite3.Connection,
@@ -3356,7 +3459,7 @@ class JobStore:
             terminal_reason = (
                 reason_code
                 if permanent
-                else "publication_attempts_exhausted"
+                else "supabase_verification_failed"
             )
             next_attempt_at = (
                 None
@@ -3418,6 +3521,12 @@ class JobStore:
                 elif permanent and quality_failure_limit is not None:
                     self._increment_historical_quality_failure_conn(
                         conn, quality_failure_limit, now
+                    )
+                elif terminal_reason == "supabase_verification_failed":
+                    self._pause_historical_policy_conn(
+                        conn,
+                        terminal_reason,
+                        now,
                     )
             return self._historical_failure_outcome_conn(
                 conn, job_id, terminal=terminal
@@ -3805,9 +3914,18 @@ class JobStore:
                     "historical catalog lease is lost"
                 )
             attempts = job.catalog_sync_attempt_count + 1
-            auth_pause = reason_code == "catalog_auth_failed"
+            immediate_pause = (
+                reason_code in _IMMEDIATE_HISTORICAL_CATALOG_PAUSE_REASONS
+            )
             terminal = (
-                not auth_pause and attempts >= max_catalog_sync_attempts
+                not immediate_pause and attempts >= max_catalog_sync_attempts
+            )
+            terminal_reason = (
+                "public_visibility_failed"
+                if terminal and reason_code.startswith("public_visibility_")
+                else "catalog_sync_failed"
+                if terminal
+                else reason_code
             )
             next_attempt_at = (
                 None
@@ -3856,7 +3974,7 @@ class JobStore:
                     """,
                     (
                         HistoricalRepairState.PERMANENT_FAILED.value,
-                        reason_code,
+                        terminal_reason,
                         now,
                         job_id,
                         HistoricalRepairState.RUNNING.value,
@@ -3866,14 +3984,11 @@ class JobStore:
                     raise CatalogLeaseLostError(
                         "historical catalog lease is lost"
                     )
-            if auth_pause:
-                conn.execute(
-                    """
-                    UPDATE historical_repair_control
-                    SET paused = 1, reason_code = 'catalog_auth_failed',
-                        updated_at = ? WHERE singleton = 1
-                    """,
-                    (now,),
+            if immediate_pause or terminal:
+                self._pause_historical_policy_conn(
+                    conn,
+                    terminal_reason,
+                    now,
                 )
             return self._historical_failure_outcome_conn(
                 conn, job_id, terminal=terminal

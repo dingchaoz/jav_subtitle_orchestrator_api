@@ -30,6 +30,7 @@ from orchestrator.store import (
     HistoricalRepairRecord,
     HistoricalRepairState,
     normal_translation_backlog_exists,
+    pin_or_validate_historical_controller_identity_conn,
     utc_now_iso,
 )
 from orchestrator.subtitle_quality import validate_translation_quality_snapshots
@@ -1799,23 +1800,18 @@ def _enqueue_historical_repairs_transaction(
             raise ValueError("allowlist_changed")
         if any(_LOWER_HEX_RE.fullmatch(value) is None for value in effective_identity):
             raise ValueError("allowlist_changed")
-        allowlist_sha = effective_identity[1]
-        control = conn.execute(
-            "SELECT * FROM historical_repair_control WHERE singleton = 1"
-        ).fetchone()
-        if control is None:
-            raise ValueError("historical_controller_state_missing")
-        baseline = (
-            control["controller_allowlist_path_sha256"],
-            control["controller_allowlist_sha256"],
-            control["controller_allowlist_codes_sha256"],
+        pin_or_validate_historical_controller_identity_conn(
+            conn,
+            effective_identity,
+            now=utc_now_iso(),
         )
-        if any(value is not None for value in baseline) and baseline != effective_identity:
-            raise ValueError("allowlist_changed")
-        historical_shas = {row["allowlist_sha256"] for row in repairs}
-        if historical_shas and historical_shas != {allowlist_sha}:
-            raise ValueError("allowlist_changed")
         if controller_identity is not None:
+            control = conn.execute(
+                "SELECT paused, reason_code FROM historical_repair_control "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if control is None:
+                raise ValueError("historical_controller_state_missing")
             if control["paused"]:
                 reason = control["reason_code"] or "historical_lane_paused"
                 raise ValueError(f"historical_controller_paused:{reason}")
@@ -2073,12 +2069,39 @@ class HistoricalRepairController:
         self.before_enqueue = before_enqueue or (lambda: None)
 
     def run_once(self) -> HistoricalControllerResult:
+        try:
+            identity = load_historical_allowlist_identity(self.allowlist_path)
+        except ValueError:
+            return _controller_result(
+                action="paused",
+                reason_code="allowlist_changed",
+                hard_pause=True,
+            )
+        try:
+            self.store.pin_or_validate_historical_controller_identity(
+                identity.as_store_tuple()
+            )
+        except (RuntimeError, sqlite3.Error):
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
+        except ValueError:
+            return _controller_result(
+                action="paused",
+                reason_code="allowlist_changed",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
         lane = self.store.historical_lane_state()
         if lane.paused:
             return _controller_result(
                 action="paused",
                 reason_code=lane.reason_code or "historical_lane_paused",
                 hard_pause=True,
+                allowlist_sha=identity.content_sha256,
             )
         try:
             health_reason = self.worker_health_probe()
@@ -2089,14 +2112,7 @@ class HistoricalRepairController:
                 action="paused",
                 reason_code=health_reason,
                 hard_pause=True,
-            )
-        try:
-            identity = load_historical_allowlist_identity(self.allowlist_path)
-        except ValueError:
-            return _controller_result(
-                action="paused",
-                reason_code="allowlist_changed",
-                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
             )
         try:
             baseline, repair_counts, repair_allowlist_shas = (
