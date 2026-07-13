@@ -80,7 +80,7 @@ source .venv/bin/activate
 python -m orchestrator mac-translation-worker
 ```
 
-The normal state flow is:
+When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the publication state flow is:
 
 ```text
 transcription_done
@@ -94,7 +94,14 @@ transcription_done
 → english_srt_ready
 ```
 
-`english_srt_ready` means both publication and verification completed. A
+When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker uses the
+local-only compatibility flow. After the quality gate it skips `publish_pending`,
+`publishing`, catalog resolution, Storage, and `movie_languages`, and moves directly
+to `english_srt_ready`. In this mode, ready means only that the local English SRT is
+quality-approved; it does not mean Supabase publication or verification occurred.
+
+With publication enabled, `english_srt_ready` means both publication and
+verification completed. A
 `metadata_status=placeholder` result is successful: when neither usable local
 metadata nor a MissAV catalog match is available, the RPC creates a code-only
 `public.movies` row, publication continues, and later metadata enrichment keeps
