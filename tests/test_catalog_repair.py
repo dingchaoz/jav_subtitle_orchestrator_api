@@ -112,9 +112,16 @@ def test_quality_pass_is_eligible_without_metadata(sqlite_path, mac_jobs_root):
     assert plan.english_srt == str(paths.english_srt_path_mac)
     assert plan.metadata_path is None
     assert plan.metadata_available is False
-    assert plan.expected_metadata_source == "missav_or_placeholder"
+    assert (
+        plan.expected_metadata_source
+        == "public_or_missav_or_placeholder"
+    )
     report = render_catalog_repair_report([plan])
     assert "metadata_path=-" in report
+    assert (
+        "expected_source_candidates=public_or_missav_or_placeholder"
+        in report
+    )
     assert str(paths.metadata_path_mac) not in report
     with pytest.raises(FrozenInstanceError):
         plan.action = "mutate"
@@ -133,7 +140,35 @@ def test_valid_local_metadata_sets_expected_source(sqlite_path, mac_jobs_root):
 
     assert plan.metadata_path == str(paths.metadata_path_mac)
     assert plan.metadata_available is True
-    assert plan.expected_metadata_source == "local"
+    assert plan.expected_metadata_source == "public_or_missav_or_local"
+
+
+def test_catalog_repair_excludes_verified_ready_publication_but_keeps_legacy_ready(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    verified = store.submit_job("abc-009", priority=1, force=False).job
+    legacy = store.submit_job("abc-010", priority=2, force=False).job
+    for movie in ("abc-009", "abc-010"):
+        _write_subtitles(mac_jobs_root, movie)
+    with store.connection() as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = 'english_srt_ready', catalog_movie_uuid = ?,
+                metadata_status = 'complete', metadata_source = 'public'
+            WHERE id = ?
+            """,
+            ("00000000-0000-0000-0000-000000000009", verified.id),
+        )
+        connection.execute(
+            "UPDATE jobs SET status = 'english_srt_ready' WHERE id = ?",
+            (legacy.id,),
+        )
+
+    plans = plan_catalog_repairs(store, allowlist=None, limit=100)
+
+    assert [plan.job_id for plan in plans] == [legacy.id]
 
 
 def test_catalog_repair_is_network_database_and_filesystem_read_only(
@@ -189,7 +224,7 @@ def test_catalog_repair_report_is_safe_and_complete(sqlite_path, mac_jobs_root):
         "job_id=",
         "movie_code=abc-007",
         "status=queued",
-        "source=local",
+        "expected_source_candidates=public_or_missav_or_local",
         "action=would_ensure_catalog_then_publish",
         "storage=would upsert/overwrite Storage",
     ):
@@ -216,6 +251,14 @@ def test_catalog_repair_cli_parses_optional_comma_allowlist_and_safe_limit():
     for parsed in (explicit, defaulted):
         for forbidden in ("force", "delete", "upload", "overwrite"):
             assert not hasattr(parsed, forbidden)
+
+
+def test_catalog_repair_allowlist_ignores_empty_tokens_and_canonicalizes():
+    from orchestrator.__main__ import _parse_allowlist
+
+    assert _parse_allowlist(" ABC1,abc-002,, ") == {"abc-001", "abc-002"}
+    assert _parse_allowlist(",,") is None
+    assert _parse_allowlist(None) is None
 
 
 def test_catalog_repair_cli_runner_only_prints(

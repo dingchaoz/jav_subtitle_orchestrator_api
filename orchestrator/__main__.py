@@ -280,6 +280,19 @@ def run_plan_catalog_repairs(
     print(render_catalog_repair_report(plans))
 
 
+def _parse_allowlist(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    from orchestrator.movie_code import canonical_movie_code
+
+    allowlist = {
+        canonical_movie_code(token.strip())
+        for token in value.split(",")
+        if token.strip()
+    }
+    return allowlist or None
+
+
 def _write_private_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -504,7 +517,7 @@ def main() -> None:
         )
     elif args.command == "plan-catalog-repairs":
         run_plan_catalog_repairs(
-            allowlist=set(args.allowlist.split(",")) if args.allowlist else None,
+            allowlist=_parse_allowlist(args.allowlist),
             limit=args.limit,
         )
     elif args.command == "audit-english-ai-local":

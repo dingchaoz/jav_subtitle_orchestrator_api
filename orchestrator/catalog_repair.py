@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import sqlite3
 
-from orchestrator.movie_catalog import load_publish_metadata
+from orchestrator.movie_catalog import (
+    METADATA_SOURCES,
+    METADATA_STATUSES,
+    load_publish_metadata,
+)
 from orchestrator.movie_code import canonical_movie_code
+from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
 from orchestrator.subtitle_quality import validate_translation_quality
@@ -48,15 +53,31 @@ def plan_catalog_repairs(
     database_uri = f"file:{store.db_path.resolve()}?mode=ro"
     with sqlite3.connect(database_uri, uri=True) as connection:
         rows = connection.execute(
-            "SELECT id, normalized_movie_number, status FROM jobs "
+            "SELECT id, normalized_movie_number, status, catalog_movie_uuid, "
+            "metadata_status, metadata_source FROM jobs "
             "ORDER BY priority ASC, created_at ASC, "
             "normalized_movie_number ASC, id ASC"
         ).fetchall()
 
     plans: list[CatalogRepairPlan] = []
-    for job_id, normalized_movie_number, status in rows:
+    for (
+        job_id,
+        normalized_movie_number,
+        status,
+        catalog_movie_uuid,
+        metadata_status,
+        metadata_source,
+    ) in rows:
         movie_code = canonical_movie_code(normalized_movie_number)
         if canonical_allowlist is not None and movie_code not in canonical_allowlist:
+            continue
+        if (
+            status == JobStatus.ENGLISH_SRT_READY.value
+            and isinstance(catalog_movie_uuid, str)
+            and bool(catalog_movie_uuid.strip())
+            and metadata_status in METADATA_STATUSES
+            and metadata_source in METADATA_SOURCES
+        ):
             continue
         paths = build_job_paths(
             normalized_movie_number,
@@ -95,7 +116,9 @@ def plan_catalog_repairs(
                 ),
                 metadata_available=metadata_available,
                 expected_metadata_source=(
-                    "local" if metadata_available else "missav_or_placeholder"
+                    "public_or_missav_or_local"
+                    if metadata_available
+                    else "public_or_missav_or_placeholder"
                 ),
                 action="would_ensure_catalog_then_publish",
                 storage_effect=(
@@ -116,7 +139,8 @@ def render_catalog_repair_report(plans: list[CatalogRepairPlan]) -> str:
             f"status={plan.current_status} "
             f"metadata_path={plan.metadata_path or '-'} "
             f"metadata_available={'yes' if plan.metadata_available else 'no'} "
-            f"source={plan.expected_metadata_source} action={plan.action} "
+            f"expected_source_candidates={plan.expected_metadata_source} "
+            f"action={plan.action} "
             f"storage={plan.storage_effect}"
         )
     return "\n".join(lines)
