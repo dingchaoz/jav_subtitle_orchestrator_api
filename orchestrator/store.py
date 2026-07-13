@@ -250,6 +250,27 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
+def normal_translation_backlog_exists(conn: sqlite3.Connection) -> bool:
+    """Check every unfinished normal translation/publication/catalog stage."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM jobs
+        WHERE translation_origin = ? AND status IN (?, ?, ?, ?, ?, ?)
+        LIMIT 1
+        """,
+        (
+            NORMAL_TRANSLATION_ORIGIN,
+            JobStatus.TRANSCRIPTION_DONE.value,
+            JobStatus.TRANSLATING.value,
+            JobStatus.PUBLISH_PENDING.value,
+            JobStatus.PUBLISHING.value,
+            JobStatus.CATALOG_SYNC_PENDING.value,
+            JobStatus.CATALOG_SYNCING.value,
+        ),
+    ).fetchone()
+    return row is not None
+
+
 class HistoricalRepairState(StrEnum):
     PLANNED = "planned"
     PENDING = "pending"
@@ -674,6 +695,10 @@ class JobStore:
                   paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
                   reason_code TEXT,
                   consecutive_quality_failures INTEGER NOT NULL DEFAULT 0,
+                  controller_allowlist_path_sha256 TEXT,
+                  controller_allowlist_sha256 TEXT,
+                  controller_allowlist_codes_sha256 TEXT,
+                  controller_last_plan_sha256 TEXT,
                   updated_at TEXT NOT NULL
                 )
                 """
@@ -687,6 +712,16 @@ class JobStore:
                     "ALTER TABLE historical_repair_control ADD COLUMN "
                     "consecutive_quality_failures INTEGER NOT NULL DEFAULT 0"
                 )
+            for column in (
+                "controller_allowlist_path_sha256",
+                "controller_allowlist_sha256",
+                "controller_allowlist_codes_sha256",
+                "controller_last_plan_sha256",
+            ):
+                if column not in control_columns:
+                    conn.execute(
+                        f"ALTER TABLE historical_repair_control ADD COLUMN {column} TEXT"
+                    )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO historical_repair_control (
@@ -1604,6 +1639,15 @@ class JobStore:
         now = utc_now_iso()
         with self.connection() as conn:
             return self._has_claimable_normal_work_conn(conn, now)
+
+    @staticmethod
+    def _has_normal_translation_backlog_conn(conn: sqlite3.Connection) -> bool:
+        return normal_translation_backlog_exists(conn)
+
+    def has_normal_translation_backlog(self) -> bool:
+        """Return whether any normal translation/publication unit is unfinished."""
+        with self.connection() as conn:
+            return self._has_normal_translation_backlog_conn(conn)
 
     def has_due_historical_repair(self) -> bool:
         with self.connection() as conn:
@@ -2789,7 +2833,8 @@ class JobStore:
         allowlist_path: Path,
         *,
         confirm_plan_sha256: str,
-    ) -> list[HistoricalRepairRecord]:
+        controller_identity: tuple[str, str, str] | None = None,
+    ) -> list[HistoricalRepairRecord] | tuple[list[HistoricalRepairRecord], bool]:
         from orchestrator.historical_batch import (
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
@@ -2804,14 +2849,15 @@ class JobStore:
 
         if not isinstance(plan, HistoricalBatchPlan):
             raise ValueError("historical_plan_changed")
-        existing = find_idempotent_historical_enqueue(
-            self,
-            plan,
-            Path(allowlist_path),
-            confirm_plan_sha256=confirm_plan_sha256,
-        )
-        if existing is not None:
-            return existing
+        if controller_identity is None:
+            existing = find_idempotent_historical_enqueue(
+                self,
+                plan,
+                Path(allowlist_path),
+                confirm_plan_sha256=confirm_plan_sha256,
+            )
+            if existing is not None:
+                return existing
         with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
             selected_audio = _hash_selected_audio(self.jobs_root_mac, plan.items)
             if any(
@@ -2837,6 +2883,7 @@ class JobStore:
                         filesystem=filesystem,
                         allowlist=allowlist,
                         selected_audio=selected_audio,
+                        controller_identity=controller_identity,
                     )
 
     def prepare_catalog_publication_repair(

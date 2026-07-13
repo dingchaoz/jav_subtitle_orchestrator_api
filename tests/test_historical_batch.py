@@ -1646,3 +1646,611 @@ def test_cli_has_only_explicit_bounded_plan_and_confirmed_enqueue_arguments(tmp_
             "force", "delete", "upload", "overwrite", "all", "selector", "movie"
         ):
             assert not hasattr(parsed, forbidden)
+
+
+def _set_repair_batch_terminal(store: JobStore, batch_id: str) -> None:
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs "
+            "SET state = ?, reason_code = NULL WHERE batch_id = ?",
+            (HistoricalRepairState.SUCCEEDED.value, batch_id),
+        )
+
+
+def _add_normal_stage(
+    store: JobStore,
+    movie: str,
+    status: JobStatus,
+    *,
+    claimed: bool,
+) -> None:
+    job = store.submit_job(movie, priority=1, force=False).job
+    assert job is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = 'normal', "
+            "claimed_by = ?, lease_expires_at = ? WHERE id = ?",
+            (
+                status.value,
+                "normal-worker" if claimed else None,
+                "2999-01-01T00:00:00+00:00" if claimed else None,
+                job.id,
+            ),
+        )
+
+
+def test_controller_enqueues_five_then_twenty(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    for index in range(1, 26):
+        _job(store, mac_jobs_root, f"abc-{index:03d}")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("".join(f"abc-{index:03d}\n" for index in range(1, 26)))
+    controller = HistoricalRepairController(
+        store,
+        allowlist,
+        initial_batch_size=5,
+        batch_size=20,
+    )
+
+    first = controller.run_once()
+
+    assert first.action == "enqueued"
+    assert first.enqueued == 5
+    assert first.counts["eligible_total"] == 25
+    assert first.batch_id is not None
+    _set_repair_batch_terminal(store, first.batch_id)
+
+    second = controller.run_once()
+
+    assert second.action == "enqueued"
+    assert second.enqueued == 20
+    assert second.counts["eligible_total"] == 20
+    assert second.batch_id != first.batch_id
+
+
+def test_controller_waits_until_every_previous_repair_is_terminal(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    for index in range(1, 8):
+        _job(store, mac_jobs_root, f"abc-{index:03d}")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("".join(f"abc-{index:03d}\n" for index in range(1, 8)))
+    controller = HistoricalRepairController(store, allowlist)
+    first = controller.run_once()
+
+    waiting = controller.run_once()
+
+    assert first.enqueued == 5
+    assert waiting.action == "waiting"
+    assert waiting.reason_code == "waiting_previous_batch"
+    assert waiting.hard_pause is False
+    assert waiting.enqueued == 0
+    assert waiting.counts["pending"] == 5
+
+
+@pytest.mark.parametrize(
+    ("status", "claimed"),
+    [
+        (JobStatus.TRANSCRIPTION_DONE, False),
+        (JobStatus.TRANSLATING, True),
+        (JobStatus.PUBLISH_PENDING, False),
+        (JobStatus.PUBLISHING, True),
+        (JobStatus.CATALOG_SYNC_PENDING, False),
+        (JobStatus.CATALOG_SYNCING, True),
+    ],
+)
+def test_controller_yields_to_each_normal_pending_or_inflight_stage(
+    sqlite_path, mac_jobs_root, tmp_path, status, claimed
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    _add_normal_stage(store, "new-001", status, claimed=claimed)
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.action == "waiting"
+    assert result.reason_code == "normal_backlog"
+    assert result.hard_pause is False
+    assert result.enqueued == 0
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    [
+        "quality_failure_limit",
+        "catalog_auth_failed",
+        "publication_configuration_missing",
+        "supabase_verification_failed",
+        "public_visibility_mismatch",
+        "preservation_hash_changed",
+        "quarantine_failed",
+        "catalog_response_invalid",
+        "catalog_response_mismatch",
+    ],
+)
+def test_controller_hard_pauses_for_durable_lane_blockers(
+    sqlite_path, mac_jobs_root, tmp_path, reason_code
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    store.pause_historical_lane(reason_code)
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.action == "paused"
+    assert result.reason_code == reason_code
+    assert result.hard_pause is True
+    assert result.enqueued == 0
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    ["worker_process_count_invalid", "worker_health_stale"],
+)
+def test_controller_hard_pauses_for_injected_worker_health_failure(
+    sqlite_path, mac_jobs_root, tmp_path, reason_code
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    result = HistoricalRepairController(
+        store,
+        allowlist,
+        worker_health_probe=lambda: reason_code,
+    ).run_once()
+
+    assert result.reason_code == reason_code
+    assert result.hard_pause is True
+    assert result.enqueued == 0
+
+
+def test_controller_detects_allowlist_mutation_after_restart_without_writes(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-002")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    first = HistoricalRepairController(store, allowlist).run_once()
+    assert first.enqueued == 1
+    _set_repair_batch_terminal(store, first.batch_id)
+    before = sqlite_path.read_bytes()
+    allowlist.write_text("abc-001\nabc-002\n")
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.reason_code == "allowlist_changed"
+    assert result.hard_pause is True
+    assert result.enqueued == 0
+    assert sqlite_path.read_bytes() == before
+
+
+def test_manual_enqueue_pins_allowlist_path_for_controller_restart(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import (
+        HistoricalRepairController,
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    original = tmp_path / "approved" / "allowlist.txt"
+    original.parent.mkdir()
+    original.write_text("abc-001\n")
+    plan = plan_historical_batch(store, original, limit=1)
+    records = enqueue_historical_batch(
+        store,
+        plan,
+        original,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+    assert len(records) == 1
+    _set_repair_batch_terminal(store, plan.batch_id)
+    moved = tmp_path / "replacement" / "allowlist.txt"
+    moved.parent.mkdir()
+    moved.write_bytes(original.read_bytes())
+
+    result = HistoricalRepairController(store, moved).run_once()
+
+    assert result.hard_pause is True
+    assert result.reason_code == "allowlist_changed"
+
+
+def test_controller_completes_with_explicit_ineligible_skipped_count(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "good-001", bad=False)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("good-001\n")
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.complete is True
+    assert result.hard_pause is False
+    assert result.counts["ineligible"] == 1
+    assert result.counts["succeeded"] == 0
+
+
+def test_controller_does_not_claim_complete_with_blocked_allowlist_entry(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    mac_jobs_root.mkdir(parents=True, exist_ok=True)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("missing-001\n")
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.complete is False
+    assert result.hard_pause is True
+    assert result.reason_code == "allowlist_blocked_entries"
+    assert result.counts["blocked"] == 1
+
+
+def test_controller_hard_pauses_when_historical_scan_root_is_unavailable(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    assert not mac_jobs_root.exists()
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("missing-001\n")
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.complete is False
+    assert result.hard_pause is True
+    assert result.reason_code == "historical_scan_failed"
+
+
+def test_controller_complete_counts_permanent_failures_as_terminal(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    controller = HistoricalRepairController(store, allowlist)
+    first = controller.run_once()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ?, "
+            "reason_code = 'quality_gate_failed_known_bad' WHERE batch_id = ?",
+            (HistoricalRepairState.PERMANENT_FAILED.value, first.batch_id),
+        )
+
+    complete = controller.run_once()
+
+    assert complete.complete is True
+    assert complete.action == "complete"
+    assert complete.counts["permanent_failed"] == 1
+    assert complete.counts["succeeded"] == 0
+
+
+def test_controller_rechecks_normal_backlog_atomically_before_enqueue(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    def normal_arrives_after_plan():
+        _add_normal_stage(
+            store,
+            "new-001",
+            JobStatus.TRANSCRIPTION_DONE,
+            claimed=False,
+        )
+
+    result = HistoricalRepairController(
+        store,
+        allowlist,
+        before_enqueue=normal_arrives_after_plan,
+    ).run_once()
+
+    assert result.reason_code == "normal_backlog"
+    assert result.hard_pause is False
+    assert result.enqueued == 0
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_controller_rejects_plan_digest_change_before_enqueue_without_records(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    def change_selected_snapshot():
+        paths.english_srt_path_mac.write_bytes(_srt(bad=False))
+
+    result = HistoricalRepairController(
+        store,
+        allowlist,
+        before_enqueue=change_selected_snapshot,
+    ).run_once()
+
+    assert result.reason_code == "plan_digest_changed"
+    assert result.hard_pause is True
+    assert result.enqueued == 0
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_two_controllers_never_create_overlapping_batches(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    for index in range(1, 8):
+        _job(store, mac_jobs_root, f"abc-{index:03d}")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("".join(f"abc-{index:03d}\n" for index in range(1, 8)))
+    barrier = threading.Barrier(2)
+    results = []
+
+    def run_controller():
+        results.append(
+            HistoricalRepairController(
+                store,
+                allowlist,
+                before_enqueue=lambda: barrier.wait(timeout=5),
+            ).run_once()
+        )
+
+    threads = [threading.Thread(target=run_controller) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(result.enqueued for result in results) == [0, 5]
+    with store.connection() as conn:
+        rows = conn.execute(
+            "SELECT batch_id, job_id FROM historical_translation_repairs"
+        ).fetchall()
+    assert len(rows) == 5
+    assert len({row["batch_id"] for row in rows}) == 1
+    assert len({row["job_id"] for row in rows}) == 5
+
+
+def test_controller_only_inserts_pending_repairs_and_preserves_jobs_and_files(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    for index in range(1, 3):
+        _job(store, mac_jobs_root, f"abc-{index:03d}")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\nabc-002\n")
+    before_files = _tree_snapshot(mac_jobs_root)
+    with store.connection() as conn:
+        before_jobs = [tuple(row) for row in conn.execute("SELECT * FROM jobs")]
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+
+    assert result.enqueued == 2
+    assert _tree_snapshot(mac_jobs_root) == before_files
+    with store.connection() as conn:
+        after_jobs = [tuple(row) for row in conn.execute("SELECT * FROM jobs")]
+        states = {
+            row[0]
+            for row in conn.execute(
+                "SELECT state FROM historical_translation_repairs"
+            )
+        }
+    assert after_jobs == before_jobs
+    assert states == {HistoricalRepairState.PENDING.value}
+
+
+def test_controller_cli_is_bounded_and_has_no_mutating_escape_hatches(tmp_path):
+    from orchestrator.__main__ import build_parser
+
+    parsed = build_parser().parse_args(
+        [
+            "historical-repair-controller",
+            "--allowlist-file",
+            str(tmp_path / "allowlist.txt"),
+            "--initial-batch-size",
+            "5",
+            "--batch-size",
+            "20",
+            "--poll-interval-seconds",
+            "30",
+        ]
+    )
+
+    assert parsed.initial_batch_size == 5
+    assert parsed.batch_size == 20
+    assert parsed.poll_interval_seconds == 30
+    for forbidden in (
+        "force",
+        "delete",
+        "upload",
+        "overwrite",
+        "all",
+        "selector",
+        "movie",
+    ):
+        assert not hasattr(parsed, forbidden)
+
+
+def test_controller_report_is_deterministic_and_contains_no_path_or_subtitle_text(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import (
+        HistoricalRepairController,
+        render_historical_controller_report,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "secret-adult-allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    result = HistoricalRepairController(store, allowlist).run_once()
+    first = render_historical_controller_report(result)
+    second = render_historical_controller_report(result)
+
+    assert first == second
+    assert str(tmp_path) not in first
+    assert "secret-adult" not in first
+    assert "Cannot translate" not in first
+    payload = json.loads(first)
+    assert payload["action"] == "enqueued"
+    assert payload["enqueued"] == 1
+
+
+def test_controller_loop_sleeps_for_healthy_wait_and_exits_zero_on_complete(
+    capsys
+):
+    from orchestrator.__main__ import run_historical_repair_controller_loop
+    from orchestrator.historical_batch import HistoricalControllerResult
+
+    counts = {
+        key: 0
+        for key in (
+            "eligible_total", "already_repaired", "ineligible", "blocked",
+            "pending", "running", "retry_wait", "succeeded",
+            "permanent_failed", "paused", "planned", "total_records",
+        )
+    }
+    results = iter(
+        [
+            HistoricalControllerResult(
+                "waiting", "normal_backlog", False, False, 0,
+                None, None, "a" * 64, counts,
+            ),
+            HistoricalControllerResult(
+                "complete", "allowlist_complete", False, True, 0,
+                None, "b" * 64, "a" * 64, counts,
+            ),
+        ]
+    )
+
+    class FakeController:
+        def run_once(self):
+            return next(results)
+
+    sleeps = []
+    code = run_historical_repair_controller_loop(
+        FakeController(),
+        poll_interval_seconds=3,
+        sleep_fn=sleeps.append,
+    )
+
+    assert code == 0
+    assert sleeps == [3]
+    output = capsys.readouterr().out
+    assert '"reason_code":"normal_backlog"' in output
+    assert '"complete":true' in output
+
+
+def test_controller_loop_exits_nonzero_without_sleep_on_hard_pause(capsys):
+    from orchestrator.__main__ import run_historical_repair_controller_loop
+    from orchestrator.historical_batch import HistoricalControllerResult
+
+    counts = {
+        key: 0
+        for key in (
+            "eligible_total", "already_repaired", "ineligible", "blocked",
+            "pending", "running", "retry_wait", "succeeded",
+            "permanent_failed", "paused", "planned", "total_records",
+        )
+    }
+
+    class FakeController:
+        def run_once(self):
+            return HistoricalControllerResult(
+                "paused", "quality_failure_limit", True, False, 0,
+                None, None, "a" * 64, counts,
+            )
+
+    sleeps = []
+    code = run_historical_repair_controller_loop(
+        FakeController(),
+        poll_interval_seconds=3,
+        sleep_fn=sleeps.append,
+    )
+
+    assert code == 2
+    assert sleeps == []
+    assert '"hard_pause":true' in capsys.readouterr().out
+
+
+def test_controller_loop_finite_test_mode_never_returns_zero_while_incomplete():
+    from orchestrator.__main__ import run_historical_repair_controller_loop
+    from orchestrator.historical_batch import HistoricalControllerResult
+
+    counts = {
+        key: 0
+        for key in (
+            "eligible_total", "already_repaired", "ineligible", "blocked",
+            "pending", "running", "retry_wait", "succeeded",
+            "permanent_failed", "paused", "planned", "total_records",
+        )
+    }
+
+    class FakeController:
+        def run_once(self):
+            return HistoricalControllerResult(
+                "waiting", "waiting_previous_batch", False, False, 0,
+                None, None, "a" * 64, counts,
+            )
+
+    assert run_historical_repair_controller_loop(
+        FakeController(),
+        poll_interval_seconds=1,
+        sleep_fn=lambda _: None,
+        max_cycles=1,
+    ) == 3

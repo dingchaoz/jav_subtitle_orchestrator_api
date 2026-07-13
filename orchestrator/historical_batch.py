@@ -7,7 +7,7 @@ import re
 import sqlite3
 import stat
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -26,7 +26,12 @@ from orchestrator.job_files_lock import (
 from orchestrator.models import JobStatus
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.paths import normalize_movie_number
-from orchestrator.store import HistoricalRepairRecord, HistoricalRepairState, utc_now_iso
+from orchestrator.store import (
+    HistoricalRepairRecord,
+    HistoricalRepairState,
+    normal_translation_backlog_exists,
+    utc_now_iso,
+)
 from orchestrator.subtitle_quality import validate_translation_quality_snapshots
 
 if TYPE_CHECKING:
@@ -169,6 +174,33 @@ class HistoricalBatchPlan:
         except (AttributeError, KeyError, TypeError, UnicodeError, ValueError):
             raise ValueError("historical_plan_invalid") from None
         return plan
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalAllowlistIdentity:
+    path_sha256: str
+    content_sha256: str
+    canonical_codes_sha256: str
+
+    def as_store_tuple(self) -> tuple[str, str, str]:
+        return (
+            self.path_sha256,
+            self.content_sha256,
+            self.canonical_codes_sha256,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalControllerResult:
+    action: str
+    reason_code: str
+    hard_pause: bool
+    complete: bool
+    enqueued: int
+    batch_id: str | None
+    plan_sha: str | None
+    allowlist_sha: str | None
+    counts: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -949,6 +981,20 @@ def load_repair_allowlist(path: Path) -> frozenset[str]:
     return frozenset(movies)
 
 
+def load_historical_allowlist_identity(path: Path) -> HistoricalAllowlistIdentity:
+    with _open_allowlist_snapshot(path) as snapshot:
+        codes_sha256 = hashlib.sha256(
+            canonical_plan_bytes({"movie_codes": list(snapshot.movies)})
+        ).hexdigest()
+        path_sha256 = hashlib.sha256(snapshot.absolute_path.encode("utf-8")).hexdigest()
+        snapshot.require_exact_unchanged()
+        return HistoricalAllowlistIdentity(
+            path_sha256=path_sha256,
+            content_sha256=snapshot.sha256,
+            canonical_codes_sha256=codes_sha256,
+        )
+
+
 def _scan_filesystem(
     root_lock: JobsRootLock,
     allowlist: _AllowlistSnapshot,
@@ -1722,7 +1768,11 @@ def _enqueue_historical_repairs_transaction(
     filesystem: _FilesystemScan,
     allowlist: _AllowlistSnapshot,
     selected_audio: dict[str, _FileSnapshot],
-) -> list[HistoricalRepairRecord]:
+    controller_identity: tuple[str, str, str] | None = None,
+) -> (
+    list[HistoricalRepairRecord]
+    | tuple[list[HistoricalRepairRecord], bool]
+):
     try:
         _validate_plan_confirmation(
             plan,
@@ -1732,7 +1782,54 @@ def _enqueue_historical_repairs_transaction(
         jobs, repairs = _read_database_snapshot(conn)
         existing_records = _exact_existing_records_from_rows(repairs, plan)
         if existing_records is not None:
-            return existing_records
+            return (
+                (existing_records, False)
+                if controller_identity is not None
+                else existing_records
+            )
+        derived_identity = (
+            hashlib.sha256(allowlist.absolute_path.encode("utf-8")).hexdigest(),
+            allowlist.sha256,
+            hashlib.sha256(
+                canonical_plan_bytes({"movie_codes": list(allowlist.movies)})
+            ).hexdigest(),
+        )
+        effective_identity = controller_identity or derived_identity
+        if controller_identity is not None and controller_identity != derived_identity:
+            raise ValueError("allowlist_changed")
+        if any(_LOWER_HEX_RE.fullmatch(value) is None for value in effective_identity):
+            raise ValueError("allowlist_changed")
+        allowlist_sha = effective_identity[1]
+        control = conn.execute(
+            "SELECT * FROM historical_repair_control WHERE singleton = 1"
+        ).fetchone()
+        if control is None:
+            raise ValueError("historical_controller_state_missing")
+        baseline = (
+            control["controller_allowlist_path_sha256"],
+            control["controller_allowlist_sha256"],
+            control["controller_allowlist_codes_sha256"],
+        )
+        if any(value is not None for value in baseline) and baseline != effective_identity:
+            raise ValueError("allowlist_changed")
+        historical_shas = {row["allowlist_sha256"] for row in repairs}
+        if historical_shas and historical_shas != {allowlist_sha}:
+            raise ValueError("allowlist_changed")
+        if controller_identity is not None:
+            if control["paused"]:
+                reason = control["reason_code"] or "historical_lane_paused"
+                raise ValueError(f"historical_controller_paused:{reason}")
+            if any(
+                row["state"]
+                not in {
+                    HistoricalRepairState.SUCCEEDED.value,
+                    HistoricalRepairState.PERMANENT_FAILED.value,
+                }
+                for row in repairs
+            ):
+                raise ValueError("waiting_previous_batch")
+            if normal_translation_backlog_exists(conn):
+                raise ValueError("normal_backlog")
         recalculated = _build_plan_from_snapshots(
             filesystem,
             jobs,
@@ -1779,8 +1876,31 @@ def _enqueue_historical_repairs_transaction(
             "ORDER BY movie_code ASC, job_id ASC",
             (plan.batch_id,),
         ).fetchall()
-        return [_row_to_repair(row) for row in rows]
-    except (OSError, sqlite3.Error, TypeError, ValueError):
+        records = [_row_to_repair(row) for row in rows]
+        conn.execute(
+            """
+            UPDATE historical_repair_control
+            SET controller_allowlist_path_sha256 = ?,
+                controller_allowlist_sha256 = ?,
+                controller_allowlist_codes_sha256 = ?,
+                controller_last_plan_sha256 = ?, updated_at = ?
+            WHERE singleton = 1
+            """,
+            (*effective_identity, plan.plan_sha256, now),
+        )
+        if controller_identity is not None:
+            return records, True
+        return records
+    except ValueError as exc:
+        if str(exc) in {
+            "allowlist_changed",
+            "historical_controller_state_missing",
+            "waiting_previous_batch",
+            "normal_backlog",
+        } or str(exc).startswith("historical_controller_paused:"):
+            raise
+        raise ValueError("historical_plan_changed") from None
+    except (OSError, sqlite3.Error, TypeError):
         raise ValueError("historical_plan_changed") from None
 
 
@@ -1796,3 +1916,388 @@ def enqueue_historical_batch(
         Path(allowlist_path),
         confirm_plan_sha256=confirm_plan_sha256,
     )
+
+
+def enqueue_historical_controller_batch(
+    store: JobStore,
+    plan: HistoricalBatchPlan,
+    allowlist_path: Path,
+    identity: HistoricalAllowlistIdentity,
+) -> tuple[list[HistoricalRepairRecord], bool]:
+    result = store.enqueue_historical_repairs(
+        plan,
+        Path(allowlist_path),
+        confirm_plan_sha256=plan.plan_sha256,
+        controller_identity=identity.as_store_tuple(),
+    )
+    if not isinstance(result, tuple):
+        raise RuntimeError("historical_controller_enqueue_contract")
+    return result
+
+
+_CONTROLLER_COUNT_KEYS = (
+    "eligible_total",
+    "already_repaired",
+    "ineligible",
+    "blocked",
+    "pending",
+    "running",
+    "retry_wait",
+    "succeeded",
+    "permanent_failed",
+    "paused",
+    "planned",
+    "total_records",
+)
+_NONTERMINAL_REPAIR_STATES = frozenset(
+    {
+        HistoricalRepairState.PLANNED.value,
+        HistoricalRepairState.PENDING.value,
+        HistoricalRepairState.RUNNING.value,
+        HistoricalRepairState.RETRY_WAIT.value,
+        HistoricalRepairState.PAUSED.value,
+    }
+)
+
+
+def _controller_database_snapshot(
+    store: JobStore,
+) -> tuple[tuple[str | None, str | None, str | None], dict[str, int], set[str]]:
+    conn = _read_only_connection(store.db_path)
+    try:
+        control = conn.execute(
+            "SELECT controller_allowlist_path_sha256, "
+            "controller_allowlist_sha256, controller_allowlist_codes_sha256 "
+            "FROM historical_repair_control WHERE singleton = 1"
+        ).fetchone()
+        if control is None:
+            raise RuntimeError("historical_controller_state_missing")
+        counts = {key: 0 for key in _CONTROLLER_COUNT_KEYS}
+        allowlist_shas: set[str] = set()
+        for row in conn.execute(
+            "SELECT state, allowlist_sha256, COUNT(*) AS count "
+            "FROM historical_translation_repairs "
+            "GROUP BY state, allowlist_sha256"
+        ).fetchall():
+            state = row["state"]
+            if state in counts:
+                counts[state] += row["count"]
+            counts["total_records"] += row["count"]
+            allowlist_shas.add(row["allowlist_sha256"])
+        baseline = (
+            control["controller_allowlist_path_sha256"],
+            control["controller_allowlist_sha256"],
+            control["controller_allowlist_codes_sha256"],
+        )
+        return baseline, counts, allowlist_shas
+    finally:
+        conn.close()
+
+
+def _with_plan_counts(
+    repair_counts: Mapping[str, int],
+    plan: HistoricalBatchPlan | None = None,
+) -> dict[str, int]:
+    counts = {key: int(repair_counts.get(key, 0)) for key in _CONTROLLER_COUNT_KEYS}
+    if plan is not None:
+        counts.update(
+            {
+                "eligible_total": plan.eligible_total,
+                "already_repaired": plan.already_repaired,
+                "ineligible": plan.ineligible,
+                "blocked": plan.blocked,
+            }
+        )
+    return counts
+
+
+def _controller_result(
+    *,
+    action: str,
+    reason_code: str,
+    hard_pause: bool,
+    complete: bool = False,
+    enqueued: int = 0,
+    batch_id: str | None = None,
+    plan_sha: str | None = None,
+    allowlist_sha: str | None = None,
+    counts: Mapping[str, int] | None = None,
+) -> HistoricalControllerResult:
+    if _SAFE_REASON_RE.fullmatch(reason_code) is None:
+        reason_code = "unsafe_controller_failure"
+        hard_pause = True
+        action = "paused"
+    return HistoricalControllerResult(
+        action=action,
+        reason_code=reason_code,
+        hard_pause=hard_pause,
+        complete=complete,
+        enqueued=enqueued,
+        batch_id=batch_id,
+        plan_sha=plan_sha,
+        allowlist_sha=allowlist_sha,
+        counts=_with_plan_counts(counts or {}),
+    )
+
+
+class HistoricalRepairController:
+    """Make one safe bounded historical-queue decision per ``run_once`` call."""
+
+    def __init__(
+        self,
+        store: JobStore,
+        allowlist_path: Path,
+        *,
+        initial_batch_size: int = 5,
+        batch_size: int = 20,
+        worker_health_probe: Callable[[], str | None] | None = None,
+        before_enqueue: Callable[[], None] | None = None,
+    ) -> None:
+        if (
+            not isinstance(initial_batch_size, int)
+            or isinstance(initial_batch_size, bool)
+            or not 1 <= initial_batch_size <= 5
+        ):
+            raise ValueError("initial historical batch size must be between 1 and 5")
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or not 1 <= batch_size <= MAX_BATCH_LIMIT
+        ):
+            raise ValueError("historical batch size must be between 1 and 20")
+        self.store = store
+        self.allowlist_path = Path(allowlist_path)
+        self.initial_batch_size = initial_batch_size
+        self.batch_size = batch_size
+        self.worker_health_probe = worker_health_probe or (lambda: None)
+        self.before_enqueue = before_enqueue or (lambda: None)
+
+    def run_once(self) -> HistoricalControllerResult:
+        lane = self.store.historical_lane_state()
+        if lane.paused:
+            return _controller_result(
+                action="paused",
+                reason_code=lane.reason_code or "historical_lane_paused",
+                hard_pause=True,
+            )
+        try:
+            health_reason = self.worker_health_probe()
+        except Exception:
+            health_reason = "worker_health_probe_failed"
+        if health_reason is not None:
+            return _controller_result(
+                action="paused",
+                reason_code=health_reason,
+                hard_pause=True,
+            )
+        try:
+            identity = load_historical_allowlist_identity(self.allowlist_path)
+        except ValueError:
+            return _controller_result(
+                action="paused",
+                reason_code="allowlist_changed",
+                hard_pause=True,
+            )
+        try:
+            baseline, repair_counts, repair_allowlist_shas = (
+                _controller_database_snapshot(self.store)
+            )
+        except (RuntimeError, sqlite3.Error):
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
+        expected = identity.as_store_tuple()
+        if (
+            (any(value is not None for value in baseline) and baseline != expected)
+            or (
+                repair_allowlist_shas
+                and repair_allowlist_shas != {identity.content_sha256}
+            )
+        ):
+            return _controller_result(
+                action="paused",
+                reason_code="allowlist_changed",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        if self.store.has_normal_translation_backlog():
+            return _controller_result(
+                action="waiting",
+                reason_code="normal_backlog",
+                hard_pause=False,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        nonterminal = sum(
+            repair_counts[state] for state in _NONTERMINAL_REPAIR_STATES
+        )
+        if repair_counts[HistoricalRepairState.PAUSED.value]:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_record_paused",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        if nonterminal:
+            return _controller_result(
+                action="waiting",
+                reason_code="waiting_previous_batch",
+                hard_pause=False,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        limit = (
+            self.initial_batch_size
+            if repair_counts["total_records"] == 0
+            else self.batch_size
+        )
+        try:
+            plan = plan_historical_batch(self.store, self.allowlist_path, limit=limit)
+        except ValueError:
+            return _controller_result(
+                action="paused",
+                reason_code="plan_digest_changed",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        except (JobFilesLockError, OSError, sqlite3.Error):
+            return _controller_result(
+                action="paused",
+                reason_code="historical_scan_failed",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        counts = _with_plan_counts(repair_counts, plan)
+        if plan.eligible_total == 0:
+            if plan.blocked:
+                return _controller_result(
+                    action="paused",
+                    reason_code="allowlist_blocked_entries",
+                    hard_pause=True,
+                    plan_sha=plan.plan_sha256,
+                    allowlist_sha=identity.content_sha256,
+                    counts=counts,
+                )
+            terminal = counts["succeeded"] + counts["permanent_failed"]
+            if (
+                terminal != plan.already_repaired
+                or terminal + plan.ineligible != plan.allowlist_entry_count
+            ):
+                return _controller_result(
+                    action="paused",
+                    reason_code="allowlist_terminal_count_mismatch",
+                    hard_pause=True,
+                    plan_sha=plan.plan_sha256,
+                    allowlist_sha=identity.content_sha256,
+                    counts=counts,
+                )
+            return _controller_result(
+                action="complete",
+                reason_code="allowlist_complete",
+                hard_pause=False,
+                complete=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        if not plan.items:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_plan_empty",
+                hard_pause=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        self.before_enqueue()
+        try:
+            records, created = enqueue_historical_controller_batch(
+                self.store,
+                plan,
+                self.allowlist_path,
+                identity,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "normal_backlog":
+                return _controller_result(
+                    action="waiting",
+                    reason_code=reason,
+                    hard_pause=False,
+                    plan_sha=plan.plan_sha256,
+                    allowlist_sha=identity.content_sha256,
+                    counts=counts,
+                )
+            if reason == "waiting_previous_batch":
+                return _controller_result(
+                    action="waiting",
+                    reason_code=reason,
+                    hard_pause=False,
+                    plan_sha=plan.plan_sha256,
+                    allowlist_sha=identity.content_sha256,
+                    counts=counts,
+                )
+            if reason.startswith("historical_controller_paused:"):
+                reason = reason.split(":", 1)[1]
+            elif reason == "historical_plan_changed":
+                reason = "plan_digest_changed"
+            return _controller_result(
+                action="paused",
+                reason_code=reason,
+                hard_pause=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        except (JobFilesLockError, OSError, sqlite3.Error):
+            return _controller_result(
+                action="paused",
+                reason_code="historical_enqueue_failed",
+                hard_pause=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        if not created:
+            return _controller_result(
+                action="waiting",
+                reason_code="waiting_previous_batch",
+                hard_pause=False,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        counts["pending"] += len(records)
+        counts["total_records"] += len(records)
+        return _controller_result(
+            action="enqueued",
+            reason_code="batch_enqueued",
+            hard_pause=False,
+            enqueued=len(records),
+            batch_id=plan.batch_id,
+            plan_sha=plan.plan_sha256,
+            allowlist_sha=identity.content_sha256,
+            counts=counts,
+        )
+
+
+def render_historical_controller_report(result: HistoricalControllerResult) -> str:
+    payload: dict[str, object] = {
+        "action": result.action,
+        "reason_code": result.reason_code,
+        "hard_pause": result.hard_pause,
+        "complete": result.complete,
+        "enqueued": result.enqueued,
+        "batch_id": result.batch_id,
+        "plan_sha": result.plan_sha,
+        "allowlist_sha": result.allowlist_sha,
+        "counts": {key: result.counts[key] for key in _CONTROLLER_COUNT_KEYS},
+    }
+    return canonical_plan_bytes(payload).decode("ascii")

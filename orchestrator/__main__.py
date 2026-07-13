@@ -3,12 +3,87 @@ import json
 import logging
 import os
 import subprocess
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from orchestrator.logging_config import configure_logging
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def run_historical_repair_controller_loop(
+    controller,
+    *,
+    poll_interval_seconds: int,
+    sleep_fn=time.sleep,
+    max_cycles: int | None = None,
+) -> int:
+    from orchestrator.historical_batch import render_historical_controller_report
+
+    cycles = 0
+    while max_cycles is None or cycles < max_cycles:
+        result = controller.run_once()
+        print(render_historical_controller_report(result))
+        cycles += 1
+        if result.hard_pause:
+            return 2
+        if result.complete:
+            return 0
+        if max_cycles is None or cycles < max_cycles:
+            sleep_fn(poll_interval_seconds)
+    return 3
+
+
+def run_historical_repair_controller(
+    *,
+    allowlist_file: Path,
+    initial_batch_size: int,
+    batch_size: int,
+    poll_interval_seconds: int,
+) -> int:
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_batch import HistoricalRepairController
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+
+    def worker_health_probe() -> str | None:
+        now = datetime.now(UTC)
+        translators = [
+            worker
+            for worker in store.list_worker_statuses()
+            if worker.role == "mac_translator"
+        ]
+        freshness_seconds = max(60, poll_interval_seconds * 3)
+        fresh = []
+        for worker in translators:
+            try:
+                age = (now - datetime.fromisoformat(worker.last_seen_at)).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if 0 <= age <= freshness_seconds:
+                fresh.append(worker)
+        if len(fresh) == 1:
+            return None
+        if translators and not fresh:
+            return "worker_health_stale"
+        return "worker_process_count_invalid"
+
+    controller = HistoricalRepairController(
+        store,
+        allowlist_file,
+        initial_batch_size=initial_batch_size,
+        batch_size=batch_size,
+        worker_health_probe=worker_health_probe,
+    )
+    return run_historical_repair_controller_loop(
+        controller,
+        poll_interval_seconds=poll_interval_seconds,
+    )
 
 
 def build_subtitle_audit_api_service(settings):
@@ -604,6 +679,17 @@ def build_parser() -> argparse.ArgumentParser:
     batch_enqueue.add_argument("--allowlist-file", type=Path, required=True)
     batch_enqueue.add_argument("--plan-file", type=Path, required=True)
     batch_enqueue.add_argument("--confirm-plan-sha256", required=True)
+    controller = subcommands.add_parser("historical-repair-controller")
+    controller.add_argument("--allowlist-file", type=Path, required=True)
+    controller.add_argument(
+        "--initial-batch-size", type=int, choices=range(1, 6), default=5
+    )
+    controller.add_argument(
+        "--batch-size", type=int, choices=range(1, 21), default=20
+    )
+    controller.add_argument(
+        "--poll-interval-seconds", type=int, choices=range(1, 3601), default=30
+    )
     catalog_repair_parser = subcommands.add_parser(
         "plan-catalog-repairs",
         help="print a read-only catalog publication repair plan",
@@ -684,6 +770,15 @@ def main() -> None:
             allowlist_file=args.allowlist_file,
             plan_file=args.plan_file,
             confirm_plan_sha256=args.confirm_plan_sha256,
+        )
+    elif args.command == "historical-repair-controller":
+        raise SystemExit(
+            run_historical_repair_controller(
+                allowlist_file=args.allowlist_file,
+                initial_batch_size=args.initial_batch_size,
+                batch_size=args.batch_size,
+                poll_interval_seconds=args.poll_interval_seconds,
+            )
         )
     elif args.command == "plan-catalog-repairs":
         run_plan_catalog_repairs(
