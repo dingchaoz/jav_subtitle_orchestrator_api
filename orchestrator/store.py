@@ -41,6 +41,14 @@ class CatalogLeaseLostError(PermissionError):
     """Raised when a catalog mutation no longer owns its fenced lease."""
 
 
+class StageLeaseLostError(PermissionError):
+    """Raised when translation/publication no longer owns its fenced lease."""
+
+
+class HistoricalRepairActivationError(RuntimeError):
+    """Raised after a historical repair is safely rejected before claim."""
+
+
 def _validate_expected_sha256(value: str, label: str) -> None:
     if (
         not isinstance(value, str)
@@ -267,6 +275,13 @@ class HistoricalRepairRecord:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class HistoricalLaneState:
+    paused: bool
+    reason_code: str | None
+    updated_at: str
+
+
 def _create_historical_translation_repairs_table(
     conn: sqlite3.Connection,
 ) -> None:
@@ -458,6 +473,7 @@ class JobRecord:
     translation_attempt_count: int
     publish_attempt_count: int
     next_publish_attempt_at: str | None
+    stage_lease_token: str | None
     translation_origin: str
     published_subtitle_id: str | None
     published_storage_path: str | None
@@ -551,6 +567,7 @@ class JobStore:
                   translation_attempt_count INTEGER NOT NULL DEFAULT 0,
                   publish_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_publish_attempt_at TEXT,
+                  stage_lease_token TEXT,
                   translation_origin TEXT NOT NULL DEFAULT '{NORMAL_TRANSLATION_ORIGIN}',
                   published_subtitle_id TEXT,
                   published_storage_path TEXT,
@@ -599,6 +616,7 @@ class JobStore:
                 if column not in columns:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
             durable_state_columns = {
+                "stage_lease_token": "TEXT",
                 "translation_origin": (
                     f"TEXT NOT NULL DEFAULT '{NORMAL_TRANSLATION_ORIGIN}'"
                 ),
@@ -635,6 +653,24 @@ class JobStore:
                 """
             )
             _initialize_historical_translation_repairs(conn)
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS historical_repair_control (
+                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                  paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+                  reason_code TEXT,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO historical_repair_control (
+                  singleton, paused, reason_code, updated_at
+                ) VALUES (1, 0, NULL, ?)
+                """,
+                (utc_now_iso(),),
+            )
 
     def submit_job(self, movie_number: str, priority: int, force: bool) -> SubmitResult:
         normalized = normalize_movie_number(movie_number)
@@ -1249,40 +1285,699 @@ class JobStore:
         self,
         worker_id: str,
         lease_seconds: int,
+        *,
+        origin: str = NORMAL_TRANSLATION_ORIGIN,
     ) -> JobRecord | None:
+        if origin not in {NORMAL_TRANSLATION_ORIGIN, HISTORICAL_TRANSLATION_ORIGIN}:
+            raise ValueError("translation origin is invalid")
         now = utc_now_iso()
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
             microsecond=0
         ).isoformat()
+        lease_token = uuid4().hex
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
                 SELECT * FROM jobs
                 WHERE status = ? AND claimed_by IS NULL
+                  AND translation_origin = ?
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 1
                 """,
-                (JobStatus.TRANSCRIPTION_DONE.value,),
+                (JobStatus.TRANSCRIPTION_DONE.value, origin),
             ).fetchone()
             if row is None:
                 return None
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                SET status = ?, claimed_by = ?, lease_expires_at = ?,
+                    stage_lease_token = ?, updated_at = ?
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
+                  AND translation_origin = ?
                 """,
                 (
                     JobStatus.TRANSLATING.value,
                     worker_id,
                     lease,
+                    lease_token,
                     now,
                     row["id"],
                     JobStatus.TRANSCRIPTION_DONE.value,
+                    origin,
                 ),
             )
             return self.get_job(row["id"], conn=conn)
+
+    @staticmethod
+    def _row_to_historical_repair(row: sqlite3.Row) -> HistoricalRepairRecord:
+        return HistoricalRepairRecord(
+            id=row["id"],
+            batch_id=row["batch_id"],
+            job_id=row["job_id"],
+            movie_code=row["movie_code"],
+            allowlist_sha256=row["allowlist_sha256"],
+            state=HistoricalRepairState(row["state"]),
+            attempt_count=row["attempt_count"],
+            next_attempt_at=row["next_attempt_at"],
+            reason_code=row["reason_code"],
+            japanese_sha256=row["japanese_sha256"],
+            audio_probe_snapshot_sha256=row["audio_probe_snapshot_sha256"],
+            audio_sha256=row["audio_sha256"],
+            source_english_sha256=row["source_english_sha256"],
+            english_sha256=row["english_sha256"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def get_historical_repair(
+        self,
+        job_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> HistoricalRepairRecord | None:
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM historical_translation_repairs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            return self._row_to_historical_repair(row) if row else None
+        with self.connection() as active_conn:
+            return self.get_historical_repair(job_id, conn=active_conn)
+
+    def historical_source_quarantine_path(
+        self,
+        repair: HistoricalRepairRecord,
+    ) -> Path:
+        paths = build_job_paths(
+            repair.movie_code,
+            self.jobs_root_mac,
+            self.jobs_root_windows,
+        )
+        return paths.job_dir_mac / "rejected" / (
+            f"{paths.english_srt_path_mac.stem}.rejected-old-"
+            f"{repair.id}-{repair.source_english_sha256[:12]}.srt"
+        )
+
+    @staticmethod
+    def _sha256_regular_file(path: Path) -> str:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+            raise OSError("historical_source_file_invalid")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(stream.fileno())
+        current = path.lstat()
+        if not _same_file_snapshot(before, after) or not _same_file_snapshot(
+            before, current
+        ):
+            raise OSError("historical_source_file_changed")
+        return digest.hexdigest()
+
+    def _validate_historical_source_files(
+        self,
+        repair: HistoricalRepairRecord,
+    ) -> None:
+        from orchestrator.job_files_lock import exclusive_job_files_lock
+
+        paths = build_job_paths(
+            repair.movie_code,
+            self.jobs_root_mac,
+            self.jobs_root_windows,
+        )
+        with exclusive_job_files_lock(
+            self.jobs_root_mac,
+            repair.movie_code,
+            blocking=True,
+        ):
+            if (
+                self._sha256_regular_file(paths.japanese_srt_path_mac)
+                != repair.japanese_sha256
+            ):
+                raise RuntimeError("preservation_hash_changed")
+            if (
+                self._sha256_regular_file(paths.audio_path_mac)
+                != repair.audio_sha256
+            ):
+                raise RuntimeError("preservation_hash_changed")
+            quarantine_path = self.historical_source_quarantine_path(repair)
+            old_path = paths.english_srt_path_mac
+            source_path = (
+                quarantine_path if quarantine_path.exists() else old_path
+            )
+            if (
+                self._sha256_regular_file(source_path)
+                != repair.source_english_sha256
+            ):
+                raise RuntimeError("historical_source_english_changed")
+
+    def validate_historical_preservation(
+        self,
+        repair: HistoricalRepairRecord,
+    ) -> None:
+        from orchestrator.job_files_lock import exclusive_job_files_lock
+
+        paths = build_job_paths(
+            repair.movie_code,
+            self.jobs_root_mac,
+            self.jobs_root_windows,
+        )
+        with exclusive_job_files_lock(
+            self.jobs_root_mac,
+            repair.movie_code,
+            blocking=True,
+        ):
+            if (
+                self._sha256_regular_file(paths.japanese_srt_path_mac)
+                != repair.japanese_sha256
+                or self._sha256_regular_file(paths.audio_path_mac)
+                != repair.audio_sha256
+            ):
+                raise RuntimeError("preservation_hash_changed")
+
+    def _has_claimable_normal_work_conn(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> bool:
+        direct = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE translation_origin = ? AND claimed_by IS NULL AND (
+              status = ?
+              OR (status = ? AND
+                  (next_publish_attempt_at IS NULL OR next_publish_attempt_at <= ?))
+            ) LIMIT 1
+            """,
+            (
+                NORMAL_TRANSLATION_ORIGIN,
+                JobStatus.TRANSCRIPTION_DONE.value,
+                JobStatus.PUBLISH_PENDING.value,
+                now,
+            ),
+        ).fetchone()
+        if direct is not None:
+            return True
+        rows = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE translation_origin = ? AND claimed_by IS NULL
+              AND status = ? AND (next_catalog_sync_attempt_at IS NULL
+                                   OR next_catalog_sync_attempt_at <= ?)
+            """,
+            (
+                NORMAL_TRANSLATION_ORIGIN,
+                JobStatus.CATALOG_SYNC_PENDING.value,
+                now,
+            ),
+        ).fetchall()
+        for row in rows:
+            job = self._row_to_job(row)
+            try:
+                _validate_verified_supabase_receipt(
+                    movie_code=job.normalized_movie_number,
+                    movie_uuid=job.catalog_movie_uuid,
+                    metadata_status=job.metadata_status,
+                    metadata_source=job.metadata_source,
+                    subtitle_id=job.published_subtitle_id,
+                    storage_path=job.published_storage_path,
+                    content_sha256=job.published_content_sha256,
+                    file_size=job.published_file_size,
+                )
+            except ValueError:
+                continue
+            return True
+        return False
+
+    def has_claimable_normal_work(self) -> bool:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            return self._has_claimable_normal_work_conn(conn, now)
+
+    def claim_next_historical_repair(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> JobRecord | None:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        lease_token = uuid4().hex
+        with self.connection() as read_conn:
+            row = read_conn.execute(
+                """
+                SELECT * FROM historical_translation_repairs
+                WHERE state IN (?, ?)
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY created_at ASC, id ASC LIMIT 1
+                """,
+                (
+                    HistoricalRepairState.PENDING.value,
+                    HistoricalRepairState.RETRY_WAIT.value,
+                    now,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        repair = self._row_to_historical_repair(row)
+        try:
+            self._validate_historical_source_files(repair)
+        except (OSError, RuntimeError):
+            rejected = False
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    """
+                    UPDATE historical_translation_repairs
+                    SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                        updated_at = ?
+                    WHERE id = ? AND state IN (?, ?)
+                    """,
+                    (
+                        HistoricalRepairState.PERMANENT_FAILED.value,
+                        "preservation_hash_changed",
+                        now,
+                        repair.id,
+                        HistoricalRepairState.PENDING.value,
+                        HistoricalRepairState.RETRY_WAIT.value,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    conn.execute(
+                        """
+                        UPDATE jobs SET status = ?, claimed_by = NULL,
+                            lease_expires_at = NULL, stage_lease_token = NULL,
+                            translation_origin = ?,
+                            updated_at = ?, error = ?
+                        WHERE id = ? AND claimed_by IS NULL
+                        """,
+                        (
+                            JobStatus.FAILED.value,
+                            HISTORICAL_TRANSLATION_ORIGIN,
+                            now,
+                            "historical_repair: preservation_hash_changed",
+                            repair.job_id,
+                        ),
+                    )
+                    rejected = True
+            if rejected:
+                raise HistoricalRepairActivationError(
+                    "preservation_hash_changed"
+                ) from None
+            return None
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            control = conn.execute(
+                "SELECT paused FROM historical_repair_control WHERE singleton = 1"
+            ).fetchone()
+            if control is None or control["paused"]:
+                return None
+            if self._has_claimable_normal_work_conn(conn, now):
+                return None
+            current = conn.execute(
+                "SELECT * FROM historical_translation_repairs WHERE id = ?",
+                (repair.id,),
+            ).fetchone()
+            if current is None:
+                return None
+            current_repair = self._row_to_historical_repair(current)
+            if (
+                current_repair.state
+                not in {HistoricalRepairState.PENDING, HistoricalRepairState.RETRY_WAIT}
+                or (
+                    current_repair.next_attempt_at is not None
+                    and current_repair.next_attempt_at > now
+                )
+                or current_repair != repair
+            ):
+                return None
+            job = self.get_job(repair.job_id, conn=conn)
+            if job is None or job.claimed_by is not None or job.status not in {
+                JobStatus.QUEUED,
+                JobStatus.FAILED,
+                JobStatus.ENGLISH_SRT_READY,
+            }:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, reason_code = NULL, updated_at = ?
+                WHERE id = ? AND state IN (?, ?)
+                """,
+                (
+                    HistoricalRepairState.RUNNING.value,
+                    now,
+                    repair.id,
+                    HistoricalRepairState.PENDING.value,
+                    HistoricalRepairState.RETRY_WAIT.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, translation_origin = ?, claimed_by = ?,
+                    lease_expires_at = ?, stage_lease_token = ?,
+                    translation_attempt_count = 0,
+                    publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                    published_subtitle_id = NULL, published_storage_path = NULL,
+                    published_content_sha256 = NULL, published_file_size = NULL,
+                    catalog_sync_attempt_count = 0,
+                    next_catalog_sync_attempt_at = NULL,
+                    catalog_lease_token = NULL, catalog_movie_uuid = NULL,
+                    metadata_status = NULL, metadata_source = NULL,
+                    english_srt_path_mac = NULL,
+                    english_srt_path_windows = NULL, updated_at = ?, error = NULL
+                WHERE id = ? AND claimed_by IS NULL
+                  AND status IN (?, ?, ?)
+                """,
+                (
+                    JobStatus.TRANSLATING.value,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                    worker_id,
+                    lease,
+                    lease_token,
+                    now,
+                    repair.job_id,
+                    JobStatus.QUEUED.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.ENGLISH_SRT_READY.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("historical_repair_state_changed")
+            return self.get_job(repair.job_id, conn=conn)
+
+    def historical_lane_state(self) -> HistoricalLaneState:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM historical_repair_control WHERE singleton = 1"
+            ).fetchone()
+            assert row is not None
+            return HistoricalLaneState(
+                paused=bool(row["paused"]),
+                reason_code=row["reason_code"],
+                updated_at=row["updated_at"],
+            )
+
+    def pause_historical_lane(self, reason_code: str) -> HistoricalLaneState:
+        if not reason_code or not reason_code.replace("_", "").isalnum():
+            raise ValueError("historical lane reason code is invalid")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE historical_repair_control SET paused = 1, "
+                "reason_code = ?, updated_at = ? WHERE singleton = 1",
+                (reason_code, now),
+            )
+        return self.historical_lane_state()
+
+    def resume_historical_lane(self) -> HistoricalLaneState:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE historical_repair_control SET paused = 0, "
+                "reason_code = NULL, updated_at = ? WHERE singleton = 1",
+                (now,),
+            )
+        return self.historical_lane_state()
+
+    def claim_inflight_historical_stage(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> JobRecord | None:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT j.id, j.status FROM jobs AS j
+                JOIN historical_translation_repairs AS r ON r.job_id = j.id
+                WHERE r.state = ? AND j.translation_origin = ?
+                  AND j.claimed_by IS NULL AND (
+                    (j.status = ? AND (j.next_publish_attempt_at IS NULL
+                                       OR j.next_publish_attempt_at <= ?))
+                    OR
+                    (j.status = ? AND (j.next_catalog_sync_attempt_at IS NULL
+                                       OR j.next_catalog_sync_attempt_at <= ?))
+                  )
+                ORDER BY j.priority ASC, j.created_at ASC LIMIT 1
+                """,
+                (
+                    HistoricalRepairState.RUNNING.value,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                    JobStatus.PUBLISH_PENDING.value,
+                    now,
+                    JobStatus.CATALOG_SYNC_PENDING.value,
+                    now,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["status"] == JobStatus.CATALOG_SYNC_PENDING.value:
+            return self.claim_catalog_sync_job(
+                worker_id,
+                lease_seconds,
+                job_id=row["id"],
+                origin=HISTORICAL_TRANSLATION_ORIGIN,
+            )
+        return self.claim_publication_job(
+            worker_id,
+            lease_seconds,
+            job_id=row["id"],
+            origin=HISTORICAL_TRANSLATION_ORIGIN,
+        )
+
+    def claim_normal_catalog_or_publication(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> JobRecord | None:
+        job = self.claim_catalog_sync_job(
+            worker_id,
+            lease_seconds,
+            origin=NORMAL_TRANSLATION_ORIGIN,
+        )
+        if job is not None:
+            return job
+        return self.claim_publication_job(
+            worker_id,
+            lease_seconds,
+            origin=NORMAL_TRANSLATION_ORIGIN,
+        )
+
+    def mark_historical_retry(
+        self,
+        job_id: str,
+        reason_code: str,
+        retry_seconds: int,
+        *,
+        max_attempts: int = 3,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> HistoricalRepairRecord:
+        if retry_seconds < 0 or max_attempts < 1:
+            raise ValueError("historical retry settings are invalid")
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            repair = self.get_historical_repair(job_id, conn=conn)
+            job = self.get_job(job_id, conn=conn)
+            if repair is None:
+                raise KeyError(job_id)
+            if (worker_id is None) != (lease_token is None):
+                raise ValueError("historical lease fence is incomplete")
+            if worker_id is not None and (
+                job is None
+                or job.status is not JobStatus.TRANSLATING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError("historical translation lease is lost")
+            if repair.state is not HistoricalRepairState.RUNNING:
+                raise PermissionError("historical repair is not running")
+            exhausted = repair.attempt_count >= max_attempts
+            state = (
+                HistoricalRepairState.PERMANENT_FAILED
+                if exhausted
+                else HistoricalRepairState.RETRY_WAIT
+            )
+            next_attempt_at = (
+                None
+                if exhausted
+                else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+            )
+            conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = ?, reason_code = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    state.value,
+                    next_attempt_at,
+                    reason_code,
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE jobs SET status = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    catalog_lease_token = NULL,
+                    updated_at = ?, error = ?
+                WHERE id = ? AND translation_origin = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    f"historical_repair: {reason_code}",
+                    job_id,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            updated = self.get_historical_repair(job_id, conn=conn)
+            assert updated is not None
+            return updated
+
+    def mark_historical_permanent_failure(
+        self,
+        job_id: str,
+        reason_code: str,
+        english_sha256: str | None = None,
+        *,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> HistoricalRepairRecord:
+        if english_sha256 is not None:
+            _validate_expected_sha256(english_sha256, "english_sha256")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            repair = self.get_historical_repair(job_id, conn=conn)
+            job = self.get_job(job_id, conn=conn)
+            if repair is None:
+                raise KeyError(job_id)
+            if (worker_id is None) != (lease_token is None):
+                raise ValueError("historical lease fence is incomplete")
+            if worker_id is not None and (
+                job is None
+                or job.status is not JobStatus.TRANSLATING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError("historical translation lease is lost")
+            if repair.state is not HistoricalRepairState.RUNNING:
+                raise PermissionError("historical repair is not running")
+            cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                    english_sha256 = COALESCE(?, english_sha256), updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    HistoricalRepairState.PERMANENT_FAILED.value,
+                    reason_code,
+                    english_sha256,
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("historical repair is not running")
+            conn.execute(
+                """
+                UPDATE jobs SET status = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    catalog_lease_token = NULL,
+                    updated_at = ?, error = ?
+                WHERE id = ? AND translation_origin = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    f"historical_repair: {reason_code}",
+                    job_id,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            updated = self.get_historical_repair(job_id, conn=conn)
+            assert updated is not None
+            return updated
+
+    def mark_historical_success(
+        self,
+        job_id: str,
+        english_sha256: str,
+    ) -> HistoricalRepairRecord:
+        _validate_expected_sha256(english_sha256, "english_sha256")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            repair = self.get_historical_repair(job_id, conn=conn)
+            if job is None or repair is None:
+                raise KeyError(job_id)
+            if (
+                repair.state is not HistoricalRepairState.RUNNING
+                or job.status is not JobStatus.ENGLISH_SRT_READY
+                or job.translation_origin != HISTORICAL_TRANSLATION_ORIGIN
+                or job.published_content_sha256 != english_sha256
+            ):
+                raise PermissionError("historical repair is not ready for success")
+            cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = NULL, reason_code = NULL,
+                    english_sha256 = ?, updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    HistoricalRepairState.SUCCEEDED.value,
+                    english_sha256,
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("historical repair is not running")
+            updated = self.get_historical_repair(job_id, conn=conn)
+            assert updated is not None
+            return updated
+
+    def find_historical_ready_to_finalize(self) -> JobRecord | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT j.* FROM jobs AS j
+                JOIN historical_translation_repairs AS r ON r.job_id = j.id
+                WHERE r.state = ? AND j.translation_origin = ?
+                  AND j.status = ? AND j.claimed_by IS NULL
+                  AND j.published_content_sha256 IS NOT NULL
+                ORDER BY r.updated_at ASC, r.id ASC LIMIT 1
+                """,
+                (
+                    HistoricalRepairState.RUNNING.value,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                    JobStatus.ENGLISH_SRT_READY.value,
+                ),
+            ).fetchone()
+            return self._row_to_job(row) if row else None
 
     def claim_translation_job(
         self,
@@ -1294,18 +1989,21 @@ class JobStore:
         lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).replace(
             microsecond=0
         ).isoformat()
+        lease_token = uuid4().hex
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                SET status = ?, claimed_by = ?, lease_expires_at = ?,
+                    stage_lease_token = ?, updated_at = ?
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
                 """,
                 (
                     JobStatus.TRANSLATING.value,
                     worker_id,
                     lease,
+                    lease_token,
                     now,
                     job_id,
                     JobStatus.TRANSCRIPTION_DONE.value,
@@ -1336,6 +2034,7 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    stage_lease_token = NULL,
                     translation_attempt_count = 0, publish_attempt_count = 0,
                     next_publish_attempt_at = NULL, catalog_movie_uuid = NULL,
                     metadata_status = NULL, metadata_source = NULL,
@@ -1557,6 +2256,7 @@ class JobStore:
                     """
                     UPDATE jobs
                     SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                        stage_lease_token = NULL,
                         publish_attempt_count = 0, next_publish_attempt_at = NULL,
                         catalog_lease_token = NULL,
                         catalog_movie_uuid = NULL, metadata_status = NULL,
@@ -1603,6 +2303,8 @@ class JobStore:
         job_id: str,
         worker_id: str,
         final_file_exists,
+        *,
+        lease_token: str,
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -1610,8 +2312,14 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.claimed_by != worker_id or job.status != JobStatus.TRANSLATING:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if (
+                job.claimed_by != worker_id
+                or job.status != JobStatus.TRANSLATING
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError(f"job {job_id} translation lease is lost")
             paths = build_job_paths(
                 job.normalized_movie_number,
                 self.jobs_root_mac,
@@ -1623,9 +2331,11 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                    catalog_lease_token = NULL, updated_at = ?, error = NULL,
+                    stage_lease_token = NULL, catalog_lease_token = NULL,
+                    updated_at = ?, error = NULL,
                     english_srt_path_mac = ?, english_srt_path_windows = ?
-                WHERE id = ? AND claimed_by = ?
+                WHERE id = ? AND claimed_by = ? AND stage_lease_token = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     JobStatus.ENGLISH_SRT_READY.value,
@@ -1634,6 +2344,8 @@ class JobStore:
                     paths.english_srt_path_windows,
                     job_id,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             completed = self.get_job(job_id, conn=conn)
@@ -1645,6 +2357,8 @@ class JobStore:
         job_id: str,
         worker_id: str,
         final_file_exists,
+        *,
+        lease_token: str,
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -1652,8 +2366,14 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.status != JobStatus.TRANSLATING or job.claimed_by != worker_id:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if (
+                job.status != JobStatus.TRANSLATING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError(f"job {job_id} translation lease is lost")
             paths = build_job_paths(
                 job.normalized_movie_number,
                 self.jobs_root_mac,
@@ -1667,9 +2387,10 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                    updated_at = ?, error = NULL,
+                    stage_lease_token = NULL, updated_at = ?, error = NULL,
                     english_srt_path_mac = ?, english_srt_path_windows = ?
                 WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND stage_lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     JobStatus.PUBLISH_PENDING.value,
@@ -1679,6 +2400,8 @@ class JobStore:
                     job_id,
                     JobStatus.TRANSLATING.value,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1693,10 +2416,14 @@ class JobStore:
         lease_seconds: int,
         *,
         job_id: str | None = None,
+        origin: str | None = None,
     ) -> JobRecord | None:
+        if origin not in {None, NORMAL_TRANSLATION_ORIGIN, HISTORICAL_TRANSLATION_ORIGIN}:
+            raise ValueError("translation origin is invalid")
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
         lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        lease_token = uuid4().hex
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             parameters: list[str] = [JobStatus.PUBLISH_PENDING.value, now]
@@ -1704,6 +2431,9 @@ class JobStore:
             if job_id is not None:
                 job_filter = " AND id = ?"
                 parameters.append(job_id)
+            if origin is not None:
+                job_filter += " AND translation_origin = ?"
+                parameters.append(origin)
             row = conn.execute(
                 f"""
                 SELECT id FROM jobs
@@ -1720,18 +2450,23 @@ class JobStore:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                SET status = ?, claimed_by = ?, lease_expires_at = ?,
+                    stage_lease_token = ?, updated_at = ?
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
                   AND (next_publish_attempt_at IS NULL OR next_publish_attempt_at <= ?)
+                  AND (? IS NULL OR translation_origin = ?)
                 """,
                 (
                     JobStatus.PUBLISHING.value,
                     worker_id,
                     lease,
+                    lease_token,
                     now,
                     row["id"],
                     JobStatus.PUBLISH_PENDING.value,
                     now,
+                    origin,
+                    origin,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1747,6 +2482,7 @@ class JobStore:
         max_publish_attempts: int,
         retry_seconds: int,
         permanent: bool = False,
+        lease_token: str,
     ) -> JobRecord:
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
@@ -1755,8 +2491,14 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if (
+                job.status != JobStatus.PUBLISHING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError(f"job {job_id} publication lease is lost")
             attempts = job.publish_attempt_count + 1
             exhausted = permanent or attempts >= max_publish_attempts
             next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
@@ -1770,7 +2512,9 @@ class JobStore:
                 UPDATE jobs
                 SET status = ?, publish_attempt_count = ?, next_publish_attempt_at = ?,
                     claimed_by = NULL, lease_expires_at = NULL, updated_at = ?, error = ?
+                    , stage_lease_token = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND stage_lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     next_status.value,
@@ -1781,6 +2525,8 @@ class JobStore:
                     job_id,
                     JobStatus.PUBLISHING.value,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1801,6 +2547,7 @@ class JobStore:
         storage_path: str,
         content_sha256: str,
         file_size: int,
+        lease_token: str,
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -1808,8 +2555,14 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if (
+                job.status != JobStatus.PUBLISHING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError(f"job {job_id} publication lease is lost")
             _validate_verified_supabase_receipt(
                 movie_code=job.normalized_movie_number,
                 movie_uuid=movie_uuid,
@@ -1830,8 +2583,10 @@ class JobStore:
                     catalog_sync_attempt_count = 0,
                     next_catalog_sync_attempt_at = NULL, catalog_lease_token = NULL,
                     claimed_by = NULL, lease_expires_at = NULL,
+                    stage_lease_token = NULL,
                     updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND stage_lease_token = ? AND lease_expires_at > ?
                 """,
                 (
                     JobStatus.CATALOG_SYNC_PENDING.value,
@@ -1846,6 +2601,8 @@ class JobStore:
                     job_id,
                     JobStatus.PUBLISHING.value,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -1860,7 +2617,10 @@ class JobStore:
         lease_seconds: int,
         *,
         job_id: str | None = None,
+        origin: str | None = None,
     ) -> JobRecord | None:
+        if origin not in {None, NORMAL_TRANSLATION_ORIGIN, HISTORICAL_TRANSLATION_ORIGIN}:
+            raise ValueError("translation origin is invalid")
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
         lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
@@ -1871,6 +2631,9 @@ class JobStore:
             if job_id is not None:
                 job_filter = " AND id = ?"
                 parameters.append(job_id)
+            if origin is not None:
+                job_filter += " AND translation_origin = ?"
+                parameters.append(origin)
             rows = conn.execute(
                 f"""
                 SELECT * FROM jobs
@@ -1925,6 +2688,7 @@ class JobStore:
                   AND published_storage_path IS NOT NULL
                   AND published_content_sha256 IS NOT NULL
                   AND published_file_size > 0
+                  AND (? IS NULL OR translation_origin = ?)
                 """,
                 (
                     JobStatus.CATALOG_SYNCING.value,
@@ -1935,6 +2699,8 @@ class JobStore:
                     candidate.id,
                     JobStatus.CATALOG_SYNC_PENDING.value,
                     now,
+                    origin,
+                    origin,
                 ),
             )
             if cursor.rowcount != 1:
@@ -2092,6 +2858,26 @@ class JobStore:
                 raise CatalogLeaseLostError(
                     f"job {job_id} catalog lease is no longer owned"
                 )
+            if job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN:
+                repair_cursor = conn.execute(
+                    """
+                    UPDATE historical_translation_repairs
+                    SET state = ?, next_attempt_at = NULL, reason_code = NULL,
+                        english_sha256 = ?, updated_at = ?
+                    WHERE job_id = ? AND state = ?
+                    """,
+                    (
+                        HistoricalRepairState.SUCCEEDED.value,
+                        job.published_content_sha256,
+                        now,
+                        job_id,
+                        HistoricalRepairState.RUNNING.value,
+                    ),
+                )
+                if repair_cursor.rowcount != 1:
+                    raise PermissionError(
+                        "historical repair is not running at catalog completion"
+                    )
             completed = self.get_job(job_id, conn=conn)
             assert completed is not None
             return completed
@@ -2105,19 +2891,28 @@ class JobStore:
         now = now_dt.isoformat()
         recovered = 0
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT id, claimed_by, catalog_lease_token,
-                       catalog_sync_attempt_count FROM jobs
+                SELECT * FROM jobs
                 WHERE status = ? AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= ?
                 """,
                 (JobStatus.CATALOG_SYNCING.value, now),
             ).fetchall()
-            for row in rows:
-                attempts = row["catalog_sync_attempt_count"] + 1
-                exhausted = attempts >= max_catalog_sync_attempts
+        for row in rows:
+            attempts = row["catalog_sync_attempt_count"] + 1
+            exhausted = attempts >= max_catalog_sync_attempts
+            preservation_changed = False
+            if exhausted and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+                repair = self.get_historical_repair(row["id"])
+                try:
+                    if repair is None:
+                        raise RuntimeError
+                    self.validate_historical_preservation(repair)
+                except (OSError, RuntimeError):
+                    preservation_changed = True
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 next_status = (
                     JobStatus.FAILED
                     if exhausted
@@ -2137,6 +2932,7 @@ class JobStore:
                         updated_at = ?, error = ?
                     WHERE id = ? AND status = ? AND claimed_by = ?
                       AND catalog_lease_token IS ?
+                      AND lease_expires_at = ?
                     """,
                     (
                         next_status.value,
@@ -2148,8 +2944,33 @@ class JobStore:
                         JobStatus.CATALOG_SYNCING.value,
                         row["claimed_by"],
                         row["catalog_lease_token"],
+                        row["lease_expires_at"],
                     ),
                 )
+                if (
+                    cursor.rowcount == 1
+                    and exhausted
+                    and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN
+                ):
+                    conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                            updated_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            HistoricalRepairState.PERMANENT_FAILED.value,
+                            (
+                                "preservation_hash_changed"
+                                if preservation_changed
+                                else "catalog_sync_lease_expired"
+                            ),
+                            now,
+                            row["id"],
+                            HistoricalRepairState.RUNNING.value,
+                        ),
+                    )
                 recovered += cursor.rowcount
         return recovered
 
@@ -2162,18 +2983,28 @@ class JobStore:
         now = now_dt.isoformat()
         recovered = 0
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT id, claimed_by, publish_attempt_count FROM jobs
+                SELECT * FROM jobs
                 WHERE status = ? AND lease_expires_at IS NOT NULL
                   AND lease_expires_at < ?
                 """,
                 (JobStatus.PUBLISHING.value, now),
             ).fetchall()
-            for row in rows:
-                attempts = row["publish_attempt_count"] + 1
-                exhausted = attempts >= max_publish_attempts
+        for row in rows:
+            attempts = row["publish_attempt_count"] + 1
+            exhausted = attempts >= max_publish_attempts
+            preservation_changed = False
+            if exhausted and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+                repair = self.get_historical_repair(row["id"])
+                try:
+                    if repair is None:
+                        raise RuntimeError
+                    self.validate_historical_preservation(repair)
+                except (OSError, RuntimeError):
+                    preservation_changed = True
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
                 next_attempt_at = (
                     None
@@ -2185,8 +3016,10 @@ class JobStore:
                     UPDATE jobs
                     SET status = ?, publish_attempt_count = ?,
                         next_publish_attempt_at = ?, claimed_by = NULL,
-                        lease_expires_at = NULL, updated_at = ?, error = ?
-                    WHERE id = ? AND status = ? AND claimed_by = ?
+                        lease_expires_at = NULL, stage_lease_token = NULL,
+                        updated_at = ?, error = ?
+                    WHERE id = ? AND status = ? AND claimed_by IS ?
+                      AND lease_expires_at = ? AND stage_lease_token IS ?
                     """,
                     (
                         next_status.value,
@@ -2197,8 +3030,34 @@ class JobStore:
                         row["id"],
                         JobStatus.PUBLISHING.value,
                         row["claimed_by"],
+                        row["lease_expires_at"],
+                        row["stage_lease_token"],
                     ),
                 )
+                if (
+                    cursor.rowcount == 1
+                    and exhausted
+                    and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN
+                ):
+                    conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                            updated_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            HistoricalRepairState.PERMANENT_FAILED.value,
+                            (
+                                "preservation_hash_changed"
+                                if preservation_changed
+                                else "publication_lease_expired"
+                            ),
+                            now,
+                            row["id"],
+                            HistoricalRepairState.RUNNING.value,
+                        ),
+                    )
                 recovered += cursor.rowcount
         return recovered
 
@@ -2210,6 +3069,7 @@ class JobStore:
         max_translation_attempts: int,
         *,
         permanent: bool = False,
+        lease_token: str,
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -2217,8 +3077,14 @@ class JobStore:
             job = self.get_job(job_id, conn=conn)
             if job is None:
                 raise KeyError(job_id)
-            if job.claimed_by != worker_id:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            if (
+                job.status is not JobStatus.TRANSLATING
+                or job.claimed_by != worker_id
+                or job.stage_lease_token != lease_token
+                or not job.lease_expires_at
+                or job.lease_expires_at <= now
+            ):
+                raise StageLeaseLostError(f"job {job_id} translation lease is lost")
             attempts = job.translation_attempt_count + 1
             next_status = (
                 JobStatus.FAILED
@@ -2229,8 +3095,10 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, translation_attempt_count = ?, claimed_by = NULL,
-                    lease_expires_at = NULL, updated_at = ?, error = ?
-                WHERE id = ? AND claimed_by = ?
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    updated_at = ?, error = ?
+                WHERE id = ? AND claimed_by = ? AND stage_lease_token = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     next_status.value,
@@ -2239,6 +3107,8 @@ class JobStore:
                     f"translating: {error}",
                     job_id,
                     worker_id,
+                    lease_token,
+                    now,
                 ),
             )
             failed = self.get_job(job_id, conn=conn)
@@ -2249,7 +3119,6 @@ class JobStore:
         now = utc_now_iso()
         recovered = 0
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
@@ -2258,19 +3127,96 @@ class JobStore:
                 """,
                 (JobStatus.TRANSLATING.value, now),
             ).fetchall()
-            for row in rows:
+        for row in rows:
+            preservation_changed = False
+            if row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+                repair = self.get_historical_repair(row["id"])
+                if repair is None or repair.state is not HistoricalRepairState.RUNNING:
+                    continue
+                try:
+                    self.validate_historical_preservation(repair)
+                except (OSError, RuntimeError):
+                    preservation_changed = True
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+                    repair = conn.execute(
+                        "SELECT * FROM historical_translation_repairs "
+                        "WHERE job_id = ? AND state = ?",
+                        (row["id"], HistoricalRepairState.RUNNING.value),
+                    ).fetchone()
+                    if repair is None:
+                        continue
+                    exhausted = (
+                        preservation_changed
+                        or repair["attempt_count"] >= max_translation_attempts
+                    )
+                    repair_state = (
+                        HistoricalRepairState.PERMANENT_FAILED
+                        if exhausted
+                        else HistoricalRepairState.RETRY_WAIT
+                    )
+                    conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET state = ?, next_attempt_at = ?, reason_code = ?,
+                            updated_at = ?
+                        WHERE id = ? AND state = ? AND attempt_count = ?
+                        """,
+                        (
+                            repair_state.value,
+                            None if exhausted else now,
+                            (
+                                "preservation_hash_changed"
+                                if preservation_changed
+                                else "translation_lease_expired"
+                            ),
+                            now,
+                            repair["id"],
+                            HistoricalRepairState.RUNNING.value,
+                            repair["attempt_count"],
+                        ),
+                    )
+                    cursor = conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = ?, claimed_by = NULL,
+                            lease_expires_at = NULL, stage_lease_token = NULL,
+                            updated_at = ?, error = ?
+                        WHERE id = ? AND status = ? AND claimed_by IS ?
+                          AND lease_expires_at = ? AND stage_lease_token IS ?
+                        """,
+                        (
+                            JobStatus.FAILED.value,
+                            now,
+                            (
+                                "historical_repair: preservation_hash_changed"
+                                if preservation_changed
+                                else "historical_repair: translation_lease_expired"
+                            ),
+                            row["id"],
+                            JobStatus.TRANSLATING.value,
+                            row["claimed_by"],
+                            row["lease_expires_at"],
+                            row["stage_lease_token"],
+                        ),
+                    )
+                    recovered += cursor.rowcount
+                    continue
                 attempts = row["translation_attempt_count"] + 1
                 next_status = (
                     JobStatus.FAILED
                     if attempts >= max_translation_attempts
                     else JobStatus.TRANSCRIPTION_DONE
                 )
-                conn.execute(
+                cursor = conn.execute(
                     """
                     UPDATE jobs
                     SET status = ?, translation_attempt_count = ?, claimed_by = NULL,
-                        lease_expires_at = NULL, updated_at = ?, error = ?
-                    WHERE id = ?
+                        lease_expires_at = NULL, stage_lease_token = NULL,
+                        updated_at = ?, error = ?
+                    WHERE id = ? AND status = ? AND claimed_by IS ?
+                      AND lease_expires_at = ? AND stage_lease_token IS ?
                     """,
                     (
                         next_status.value,
@@ -2278,9 +3224,13 @@ class JobStore:
                         now,
                         "translating: translation lease expired",
                         row["id"],
+                        JobStatus.TRANSLATING.value,
+                        row["claimed_by"],
+                        row["lease_expires_at"],
+                        row["stage_lease_token"],
                     ),
                 )
-                recovered += 1
+                recovered += cursor.rowcount
         return recovered
 
     def fail_worker_job(
@@ -2443,7 +3393,8 @@ class JobStore:
             """
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
-                error = NULL, translation_attempt_count = 0,
+                stage_lease_token = NULL, error = NULL,
+                translation_attempt_count = 0,
                 publish_attempt_count = 0, next_publish_attempt_at = NULL,
                 translation_origin = ?, published_subtitle_id = NULL,
                 published_storage_path = NULL, published_content_sha256 = NULL,
@@ -2484,6 +3435,7 @@ class JobStore:
             translation_attempt_count=row["translation_attempt_count"],
             publish_attempt_count=row["publish_attempt_count"],
             next_publish_attempt_at=row["next_publish_attempt_at"],
+            stage_lease_token=row["stage_lease_token"],
             translation_origin=row["translation_origin"],
             published_subtitle_id=row["published_subtitle_id"],
             published_storage_path=row["published_storage_path"],

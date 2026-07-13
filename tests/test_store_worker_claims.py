@@ -100,6 +100,7 @@ def test_initialize_adds_catalog_and_historical_repair_schema(
         "published_file_size",
         "catalog_sync_attempt_count",
         "next_catalog_sync_attempt_at",
+        "stage_lease_token",
         "catalog_lease_token",
     } <= job_columns.keys()
     assert job_columns["translation_origin"]["dflt_value"] == (
@@ -213,6 +214,7 @@ def _prepare_publication_job(store, root: Path, movie: str, *, worker_id="mac-qu
         claimed.id,
         worker_id,
         lambda path: Path(path).exists(),
+        lease_token=claimed.stage_lease_token,
     )
 
 
@@ -1161,7 +1163,8 @@ def test_translation_quality_success_moves_to_publish_pending_and_preserves_coun
     paths.english_srt_path_mac.write_text("valid", encoding="utf-8")
 
     completed = store.complete_mac_translation_quality(
-        claimed.id, "mac-quality", lambda path: Path(path).exists()
+        claimed.id, "mac-quality", lambda path: Path(path).exists(),
+        lease_token=claimed.stage_lease_token,
     )
 
     assert completed.status is JobStatus.PUBLISH_PENDING
@@ -1188,7 +1191,8 @@ def test_translation_quality_rejects_empty_english_file_without_partial_update(
 
     with pytest.raises(FileNotFoundError, match="empty"):
         store.complete_mac_translation_quality(
-            claimed.id, "mac-quality", lambda path: Path(path).exists()
+            claimed.id, "mac-quality", lambda path: Path(path).exists(),
+            lease_token=claimed.stage_lease_token,
         )
 
     unchanged = store.get_job(claimed.id)
@@ -1236,6 +1240,7 @@ def test_publication_failure_uses_independent_counter_and_preserves_english(
         "catalog unavailable",
         max_publish_attempts=3,
         retry_seconds=120,
+        lease_token=claimed.stage_lease_token,
     )
 
     assert failed.status is JobStatus.PUBLISH_PENDING
@@ -1261,6 +1266,7 @@ def test_publication_final_attempt_fails_job(sqlite_path, mac_jobs_root):
         "catalog unavailable",
         max_publish_attempts=1,
         retry_seconds=120,
+        lease_token=claimed.stage_lease_token,
     )
 
     assert failed.status is JobStatus.FAILED
@@ -1284,6 +1290,7 @@ def test_permanent_publication_failure_fails_immediately_without_translation_att
         max_publish_attempts=10,
         retry_seconds=120,
         permanent=True,
+        lease_token=claimed.stage_lease_token,
     )
 
     assert failed.status is JobStatus.FAILED
@@ -1314,6 +1321,7 @@ def test_supabase_success_is_only_from_claim_and_records_verified_receipt(
             storage_path="abc/abc-016/abc-016-English_AI.srt",
             content_sha256="a" * 64,
             file_size=123,
+            lease_token="not-claimed",
         )
     claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
     completed = store.complete_supabase_publication(
@@ -1326,6 +1334,7 @@ def test_supabase_success_is_only_from_claim_and_records_verified_receipt(
         storage_path="abc/abc-016/abc-016-English_AI.srt",
         content_sha256="a" * 64,
         file_size=123,
+        lease_token=claimed.stage_lease_token,
     )
 
     assert completed.status is JobStatus.CATALOG_SYNC_PENDING
@@ -1373,6 +1382,7 @@ def test_supabase_success_rejects_invalid_receipt_values_atomically(
             storage_path="abc/abc-017/abc-017-English_AI.srt",
             content_sha256="a" * 64,
             file_size=123,
+            lease_token=claimed.stage_lease_token,
         )
 
     unchanged = store.get_job(claimed.id)
@@ -1412,6 +1422,7 @@ def test_supabase_success_uses_strict_shared_receipt_validator(
         store.complete_supabase_publication(
             claimed.id,
             "publisher",
+            lease_token=claimed.stage_lease_token,
             **receipt,
         )
 
@@ -1437,6 +1448,7 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
         storage_path="abc/abc-023/abc-023-English_AI.srt",
         content_sha256="b" * 64,
         file_size=456,
+        lease_token=claimed.stage_lease_token,
     )
 
     with pytest.raises(PermissionError):
@@ -1503,6 +1515,7 @@ def test_expired_catalog_sync_lease_uses_only_catalog_counter(
         storage_path="abc/abc-024/abc-024-English_AI.srt",
         content_sha256="c" * 64,
         file_size=789,
+        lease_token=publishing.stage_lease_token,
     )
     syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
     expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
@@ -1535,6 +1548,7 @@ def test_migrated_null_catalog_token_expired_lease_recovers(
         storage_path="abc/abc-033/abc-033-English_AI.srt",
         content_sha256="3" * 64,
         file_size=333,
+        lease_token=publishing.stage_lease_token,
     )
     expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
     with store.connection() as conn:
@@ -1574,6 +1588,7 @@ def test_catalog_recovery_includes_lease_expiring_exactly_now(
         storage_path="abc/abc-034/abc-034-English_AI.srt",
         content_sha256="4" * 64,
         file_size=444,
+        lease_token=publishing.stage_lease_token,
     )
     syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
     fixed_now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
@@ -1607,6 +1622,7 @@ def test_catalog_fencing_rejects_stale_same_worker_complete_and_fail(
         storage_path="abc/abc-027/abc-027-English_AI.srt",
         content_sha256="e" * 64,
         file_size=654,
+        lease_token=publishing.stage_lease_token,
     )
     first = store.claim_catalog_sync_job("same-worker", 60, job_id=receipt.id)
     first_token = first.catalog_lease_token
@@ -1665,6 +1681,7 @@ def test_catalog_fencing_rejects_different_worker_and_expired_lease(
         storage_path="abc/abc-032/abc-032-English_AI.srt",
         content_sha256="2" * 64,
         file_size=222,
+        lease_token=publishing.stage_lease_token,
     )
     syncing = store.claim_catalog_sync_job("owner", 60, job_id=receipt.id)
 
@@ -1753,6 +1770,7 @@ def test_catalog_claim_refuses_strictly_invalid_verified_receipt(
         storage_path="abc/abc-028/abc-028-English_AI.srt",
         content_sha256="f" * 64,
         file_size=987,
+        lease_token=publishing.stage_lease_token,
     )
     with store.connection() as conn:
         conn.execute(f"UPDATE jobs SET {column} = ? WHERE id = ?", (invalid_value, receipt.id))
@@ -1780,6 +1798,7 @@ def test_catalog_complete_revalidates_receipt_after_claim(
         storage_path="abc/abc-029/abc-029-English_AI.srt",
         content_sha256="1" * 64,
         file_size=111,
+        lease_token=publishing.stage_lease_token,
     )
     syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
     with store.connection() as conn:
@@ -1838,6 +1857,7 @@ def test_catalog_sync_failure_rejects_unrecognized_reason_text(
         storage_path="abc/abc-026/abc-026-English_AI.srt",
         content_sha256="d" * 64,
         file_size=321,
+        lease_token=publishing.stage_lease_token,
     )
     syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
 
@@ -1890,8 +1910,9 @@ def test_publication_failure_rejects_wrong_worker_without_partial_update(
             claimed.id,
             "intruder",
             "bad",
-            max_publish_attempts=3,
-            retry_seconds=30,
+                max_publish_attempts=3,
+                retry_seconds=30,
+                lease_token=claimed.stage_lease_token,
         )
 
     unchanged = store.get_job(claimed.id)

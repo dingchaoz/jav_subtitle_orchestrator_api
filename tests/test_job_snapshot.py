@@ -17,3 +17,5 @@ def test_write_job_snapshot_creates_human_readable_job_json(sqlite_path, mac_job
     assert data["movie_number"] == "ktb-096"
     assert data["status"] == "queued"
     assert data["job_dir_windows"] == "M:\\ktb-096"
+    assert "stage_lease_token" not in data
+    assert "catalog_lease_token" not in data
