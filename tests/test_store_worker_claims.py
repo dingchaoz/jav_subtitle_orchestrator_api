@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import orchestrator.store as store_module
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
@@ -551,6 +553,212 @@ def test_prepare_catalog_publication_rejects_symlinked_job_directory_atomically(
 
     assert store.get_job(job.id) == row_before
     assert _catalog_artifact_snapshot(canonical_paths) == files_before
+
+
+def test_prepare_catalog_publication_rejects_replaced_english_basename_during_hash(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-033"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    english_inode = paths.english_srt_path_mac.stat().st_ino
+    replacement = b"replacement canonical english subtitle\n"
+    replacement_path = tmp_path / "replacement.English.srt"
+    replacement_path.write_bytes(replacement)
+    real_read = os.read
+    replaced = False
+
+    def read_then_replace(file_fd, byte_count):
+        nonlocal replaced
+        chunk = real_read(file_fd, byte_count)
+        if (
+            not replaced
+            and chunk
+            and os.fstat(file_fd).st_ino == english_inode
+        ):
+            os.replace(replacement_path, paths.english_srt_path_mac)
+            replaced = True
+        return chunk
+
+    monkeypatch.setattr(store_module.os, "read", read_then_replace)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-033",
+            **expected_hashes,
+        )
+
+    assert replaced is True
+    assert store.get_job(job_id) == row_before
+    expected_files = {
+        **files_before,
+        paths.english_srt_path_mac: replacement,
+    }
+    assert _catalog_artifact_snapshot(paths) == expected_files
+
+
+def test_prepare_catalog_publication_rolls_back_if_english_replaced_after_update(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-036"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    replacement = b"replacement after conditional update\n"
+    replacement_path = tmp_path / "post-update.English.srt"
+    replacement_path.write_bytes(replacement)
+    replaced = False
+
+    class ReplaceAfterUpdateConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal replaced
+            cursor = super().execute(sql, parameters)
+            if (
+                not replaced
+                and "UPDATE jobs" in sql
+                and parameters
+                and parameters[0] == JobStatus.PUBLISH_PENDING.value
+            ):
+                os.replace(replacement_path, paths.english_srt_path_mac)
+                replaced = True
+            return cursor
+
+    def connect_with_replacement():
+        connection = sqlite3.connect(
+            sqlite_path,
+            factory=ReplaceAfterUpdateConnection,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
+
+    monkeypatch.setattr(store, "connect", connect_with_replacement)
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-036",
+            **expected_hashes,
+        )
+
+    assert replaced is True
+    assert store.get_job(job_id) == row_before
+    expected_files = {
+        **files_before,
+        paths.english_srt_path_mac: replacement,
+    }
+    assert _catalog_artifact_snapshot(paths) == expected_files
+
+
+def test_prepare_catalog_publication_rejects_oversized_sparse_subtitle_atomically(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-034"
+    )
+    maximum_size = 32 * 1024 * 1024
+    assert store_module.MAX_PUBLICATION_CANARY_SRT_BYTES == maximum_size
+    paths.english_srt_path_mac.write_bytes(b"x")
+    os.truncate(paths.english_srt_path_mac, maximum_size + 1)
+    row_before = store.get_job(job_id)
+    stat_before = paths.english_srt_path_mac.stat()
+    japanese_before = paths.japanese_srt_path_mac.read_bytes()
+    audio_before = paths.audio_path_mac.read_bytes()
+
+    with pytest.raises(FileNotFoundError, match="size limit"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-034",
+            expected_japanese_sha256="0" * 64,
+            expected_english_sha256="0" * 64,
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert paths.english_srt_path_mac.stat().st_size == stat_before.st_size
+    assert paths.japanese_srt_path_mac.read_bytes() == japanese_before
+    assert paths.audio_path_mac.read_bytes() == audio_before
+
+
+def test_prepare_catalog_publication_rejects_append_truncate_race_atomically(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-035"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    expected_hashes = _catalog_subtitle_hashes(paths)
+    english_before = paths.english_srt_path_mac.stat()
+    real_read = os.read
+    raced = False
+
+    def read_then_append_and_restore(file_fd, byte_count):
+        nonlocal raced
+        chunk = real_read(file_fd, byte_count)
+        if (
+            not raced
+            and chunk
+            and os.fstat(file_fd).st_ino == english_before.st_ino
+        ):
+            with paths.english_srt_path_mac.open("ab") as subtitle:
+                subtitle.write(b"transient-extra-byte")
+            os.truncate(paths.english_srt_path_mac, english_before.st_size)
+            os.utime(
+                paths.english_srt_path_mac,
+                ns=(english_before.st_atime_ns, english_before.st_mtime_ns),
+            )
+            raced = True
+        return chunk
+
+    monkeypatch.setattr(
+        store_module.os,
+        "read",
+        read_then_append_and_restore,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^subtitle_snapshot_changed_before_prepare$",
+    ):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-035",
+            **expected_hashes,
+        )
+
+    assert raced is True
+    assert (
+        paths.english_srt_path_mac.stat().st_ctime_ns
+        != english_before.st_ctime_ns
+    )
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
 
 
 def test_prepare_catalog_publication_accepts_unverified_legacy_ready(

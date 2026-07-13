@@ -3,7 +3,7 @@ import os
 import sqlite3
 import stat
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +20,7 @@ _VERIFIED_METADATA_SOURCES = frozenset(
     {"public", "missav", "local", "placeholder"}
 )
 _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
+MAX_PUBLICATION_CANARY_SRT_BYTES = 32 * 1024 * 1024
 
 
 def _validate_expected_sha256(value: str, label: str) -> None:
@@ -37,19 +38,26 @@ def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_mode,
+        before.st_nlink,
     ) == (
         after.st_dev,
         after.st_ino,
         after.st_size,
         after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_mode,
+        after.st_nlink,
     )
 
 
-def _sha256_regular_nonempty_file_at(
+def _open_regular_nonempty_file_at(
     directory_fd: int,
     basename: str,
     label: str,
-) -> str:
+    stack: ExitStack,
+) -> tuple[int, os.stat_result]:
     try:
         path_stat = os.stat(
             basename,
@@ -66,6 +74,10 @@ def _sha256_regular_nonempty_file_at(
         )
     if path_stat.st_size <= 0:
         raise FileNotFoundError(f"final {label} file empty before prepare")
+    if path_stat.st_size > MAX_PUBLICATION_CANARY_SRT_BYTES:
+        raise FileNotFoundError(
+            f"final {label} file exceeds publication canary size limit"
+        )
     try:
         file_fd = os.open(
             basename,
@@ -76,29 +88,65 @@ def _sha256_regular_nonempty_file_at(
         raise FileNotFoundError(
             f"final {label} file unavailable before prepare"
         ) from exc
+    stack.callback(os.close, file_fd)
+    before = os.fstat(file_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise FileNotFoundError(
+            f"final {label} file is not regular before prepare"
+        )
+    if before.st_size <= 0:
+        raise FileNotFoundError(f"final {label} file empty before prepare")
+    if before.st_size > MAX_PUBLICATION_CANARY_SRT_BYTES:
+        raise FileNotFoundError(
+            f"final {label} file exceeds publication canary size limit"
+        )
+    if not _same_file_snapshot(path_stat, before):
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare")
+    return file_fd, before
+
+
+def _sha256_open_file(file_fd: int, before: os.stat_result) -> str:
     try:
-        before = os.fstat(file_fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise FileNotFoundError(
-                f"final {label} file is not regular before prepare"
-            )
-        if before.st_size <= 0:
-            raise FileNotFoundError(
-                f"final {label} file empty before prepare"
-            )
         digest = hashlib.sha256()
-        while chunk := os.read(file_fd, 1024 * 1024):
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(file_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("subtitle_snapshot_changed_before_prepare")
             digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(file_fd, 1):
+            raise RuntimeError("subtitle_snapshot_changed_before_prepare")
         after = os.fstat(file_fd)
         if not _same_file_snapshot(before, after):
             raise RuntimeError("subtitle_snapshot_changed_before_prepare")
         return digest.hexdigest()
-    except FileNotFoundError:
-        raise
     except OSError as exc:
         raise RuntimeError("subtitle_snapshot_changed_before_prepare") from exc
-    finally:
-        os.close(file_fd)
+
+
+def _require_basename_matches_open_file(
+    directory_fd: int,
+    basename: str,
+    file_fd: int,
+    expected_stat: os.stat_result,
+) -> None:
+    try:
+        path_stat = os.stat(
+            basename,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        opened_stat = os.fstat(file_fd)
+    except OSError as exc:
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare") from exc
+    if (
+        not stat.S_ISREG(path_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino)
+        != (opened_stat.st_dev, opened_stat.st_ino)
+        or not _same_file_snapshot(expected_stat, opened_stat)
+    ):
+        raise RuntimeError("subtitle_snapshot_changed_before_prepare")
 
 
 def utc_now_iso() -> str:
@@ -1006,16 +1054,17 @@ class JobStore:
                 raise ValueError(
                     "catalog_publication_subtitle_not_direct_child"
                 )
-            try:
-                directory_fd = os.open(
-                    paths.job_dir_mac,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                )
-            except OSError as exc:
-                raise ValueError(
-                    "catalog_publication_job_directory_unavailable"
-                ) from exc
-            try:
+            with ExitStack() as stack:
+                try:
+                    directory_fd = os.open(
+                        paths.job_dir_mac,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        "catalog_publication_job_directory_unavailable"
+                    ) from exc
+                stack.callback(os.close, directory_fd)
                 opened_directory_stat = os.fstat(directory_fd)
                 if not stat.S_ISDIR(opened_directory_stat.st_mode) or (
                     opened_directory_stat.st_dev,
@@ -1027,16 +1076,33 @@ class JobStore:
                     raise RuntimeError(
                         "subtitle_snapshot_changed_before_prepare"
                     )
-                japanese_sha256 = _sha256_regular_nonempty_file_at(
+                japanese_fd, japanese_stat = _open_regular_nonempty_file_at(
                     directory_fd,
                     paths.japanese_srt_path_mac.name,
                     "japanese",
+                    stack,
                 )
-                english_sha256 = _sha256_regular_nonempty_file_at(
+                english_fd, english_stat = _open_regular_nonempty_file_at(
                     directory_fd,
                     paths.english_srt_path_mac.name,
                     "english",
+                    stack,
                 )
+                japanese_sha256 = _sha256_open_file(
+                    japanese_fd,
+                    japanese_stat,
+                )
+                english_sha256 = _sha256_open_file(
+                    english_fd,
+                    english_stat,
+                )
+                if (
+                    japanese_sha256 != expected_japanese_sha256
+                    or english_sha256 != expected_english_sha256
+                ):
+                    raise RuntimeError(
+                        "subtitle_snapshot_changed_before_prepare"
+                    )
                 try:
                     final_directory_stat = paths.job_dir_mac.lstat()
                 except OSError as exc:
@@ -1058,37 +1124,56 @@ class JobStore:
                     raise RuntimeError(
                         "subtitle_snapshot_changed_before_prepare"
                     )
-            finally:
-                os.close(directory_fd)
-            if (
-                japanese_sha256 != expected_japanese_sha256
-                or english_sha256 != expected_english_sha256
-            ):
-                raise RuntimeError("subtitle_snapshot_changed_before_prepare")
-            cursor = conn.execute(
-                """
-                UPDATE jobs
-                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                    publish_attempt_count = 0, next_publish_attempt_at = NULL,
-                    catalog_movie_uuid = NULL, metadata_status = NULL,
-                    metadata_source = NULL, updated_at = ?, error = NULL,
-                    english_srt_path_mac = ?, english_srt_path_windows = ?
-                WHERE id = ? AND status = ? AND claimed_by IS NULL
-                """,
-                (
-                    JobStatus.PUBLISH_PENDING.value,
-                    now,
-                    str(paths.english_srt_path_mac),
-                    paths.english_srt_path_windows,
-                    job_id,
-                    expected_status.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("catalog publication state changed before prepare")
-            prepared = self.get_job(job_id, conn=conn)
-            assert prepared is not None
-            return prepared
+                _require_basename_matches_open_file(
+                    directory_fd,
+                    paths.japanese_srt_path_mac.name,
+                    japanese_fd,
+                    japanese_stat,
+                )
+                _require_basename_matches_open_file(
+                    directory_fd,
+                    paths.english_srt_path_mac.name,
+                    english_fd,
+                    english_stat,
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                        publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                        catalog_movie_uuid = NULL, metadata_status = NULL,
+                        metadata_source = NULL, updated_at = ?, error = NULL,
+                        english_srt_path_mac = ?, english_srt_path_windows = ?
+                    WHERE id = ? AND status = ? AND claimed_by IS NULL
+                    """,
+                    (
+                        JobStatus.PUBLISH_PENDING.value,
+                        now,
+                        str(paths.english_srt_path_mac),
+                        paths.english_srt_path_windows,
+                        job_id,
+                        expected_status.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "catalog publication state changed before prepare"
+                    )
+                prepared = self.get_job(job_id, conn=conn)
+                assert prepared is not None
+                _require_basename_matches_open_file(
+                    directory_fd,
+                    paths.japanese_srt_path_mac.name,
+                    japanese_fd,
+                    japanese_stat,
+                )
+                _require_basename_matches_open_file(
+                    directory_fd,
+                    paths.english_srt_path_mac.name,
+                    english_fd,
+                    english_stat,
+                )
+                return prepared
 
     def complete_mac_translation(
         self,
