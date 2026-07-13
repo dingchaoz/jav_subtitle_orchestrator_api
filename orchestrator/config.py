@@ -78,6 +78,25 @@ class MacSettings(BaseSettings):
         default=None,
         alias="SUPABASE_SERVICE_ROLE_KEY",
     )
+    javsubtitle_api_base: str | None = Field(
+        default=None,
+        alias="JAVSUBTITLE_API_BASE",
+    )
+    javsubtitle_admin_api_token: str | None = Field(
+        default=None,
+        alias="JAVSUBTITLE_ADMIN_API_TOKEN",
+    )
+    catalog_sync_retry_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+        alias="CATALOG_SYNC_RETRY_SECONDS",
+    )
+    max_catalog_sync_attempts: int = Field(
+        default=10,
+        ge=1,
+        alias="MAX_CATALOG_SYNC_ATTEMPTS",
+    )
     supabase_subtitle_bucket: str = Field(
         default="subtitles",
         alias="SUPABASE_SUBTITLE_BUCKET",

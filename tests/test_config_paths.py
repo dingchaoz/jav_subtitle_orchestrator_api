@@ -35,6 +35,10 @@ MAC_ENV_ALIASES = (
     "MAX_PUBLISH_ATTEMPTS",
     "MAC_PUBLISH_RETRY_SECONDS",
     "SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS",
+    "JAVSUBTITLE_API_BASE",
+    "JAVSUBTITLE_ADMIN_API_TOKEN",
+    "CATALOG_SYNC_RETRY_SECONDS",
+    "MAX_CATALOG_SYNC_ATTEMPTS",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -237,6 +241,25 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.max_publish_attempts == 10
     assert settings.mac_publish_retry_seconds == 30
     assert settings.supabase_publish_verify_timeout_seconds == 90
+    assert settings.javsubtitle_api_base is None
+    assert settings.javsubtitle_admin_api_token is None
+    assert settings.catalog_sync_retry_seconds == 30
+    assert settings.max_catalog_sync_attempts == 10
+
+
+def test_mac_catalog_sync_settings_load_overrides(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv("JAVSUBTITLE_API_BASE", "https://javsubtitle.example")
+    monkeypatch.setenv("JAVSUBTITLE_ADMIN_API_TOKEN", "test-admin-token")
+    monkeypatch.setenv("CATALOG_SYNC_RETRY_SECONDS", "45")
+    monkeypatch.setenv("MAX_CATALOG_SYNC_ATTEMPTS", "12")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.javsubtitle_api_base == "https://javsubtitle.example"
+    assert settings.javsubtitle_admin_api_token == "test-admin-token"
+    assert settings.catalog_sync_retry_seconds == 45
+    assert settings.max_catalog_sync_attempts == 12
 
 
 @pytest.mark.parametrize(
@@ -245,6 +268,9 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
         ("MAX_PUBLISH_ATTEMPTS", "0"),
         ("MAC_PUBLISH_RETRY_SECONDS", "0"),
         ("MAC_PUBLISH_RETRY_SECONDS", "3601"),
+        ("CATALOG_SYNC_RETRY_SECONDS", "0"),
+        ("CATALOG_SYNC_RETRY_SECONDS", "3601"),
+        ("MAX_CATALOG_SYNC_ATTEMPTS", "0"),
     ],
 )
 def test_mac_publication_retry_settings_are_bounded(monkeypatch, alias, value):
