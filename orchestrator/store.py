@@ -664,6 +664,86 @@ class JobStore:
             audio_path_windows=paths.audio_path_windows,
         )
 
+    def finalize_interrupted_audio(
+        self,
+        job_id: str,
+        *,
+        expected_movie_code: str,
+        expected_job_dir_mac: str,
+        expected_job_dir_windows: str,
+        expected_audio_path_mac: str,
+        expected_audio_path_windows: str,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            paths = build_job_paths(
+                expected_movie_code,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if (
+                expected_job_dir_mac != str(paths.job_dir_mac)
+                or expected_job_dir_windows != paths.job_dir_windows
+                or expected_audio_path_mac != str(paths.audio_path_mac)
+                or expected_audio_path_windows != paths.audio_path_windows
+                or job.normalized_movie_number != expected_movie_code
+                or job.job_dir_mac != expected_job_dir_mac
+                or job.job_dir_windows != expected_job_dir_windows
+            ):
+                raise RuntimeError("audio_recovery_state_changed")
+            exact_optional_paths = (
+                (job.metadata_path_mac, str(paths.metadata_path_mac)),
+                (job.audio_path_mac, str(paths.audio_path_mac)),
+                (job.audio_path_windows, paths.audio_path_windows),
+                (job.japanese_srt_path_mac, str(paths.japanese_srt_path_mac)),
+                (job.japanese_srt_path_windows, paths.japanese_srt_path_windows),
+                (job.english_srt_path_mac, str(paths.english_srt_path_mac)),
+                (job.english_srt_path_windows, paths.english_srt_path_windows),
+            )
+            if any(
+                actual is not None and actual != expected
+                for actual, expected in exact_optional_paths
+            ):
+                raise RuntimeError("audio_recovery_state_changed")
+            metadata_path_mac = (
+                str(paths.metadata_path_mac)
+                if paths.metadata_path_mac.exists()
+                else None
+            )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?,
+                    metadata_path_mac = COALESCE(?, metadata_path_mac),
+                    audio_path_mac = ?, audio_path_windows = ?, error = NULL
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                  AND lease_expires_at IS NULL
+                  AND normalized_movie_number = ?
+                  AND job_dir_mac = ? AND job_dir_windows = ?
+                """,
+                (
+                    JobStatus.AUDIO_READY.value,
+                    now,
+                    metadata_path_mac,
+                    str(paths.audio_path_mac),
+                    paths.audio_path_windows,
+                    job_id,
+                    JobStatus.DOWNLOADING_AUDIO.value,
+                    expected_movie_code,
+                    expected_job_dir_mac,
+                    expected_job_dir_windows,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("audio_recovery_state_changed")
+            finalized = self.get_job(job_id, conn=conn)
+            assert finalized is not None
+            return finalized
+
     def record_download_failure(
         self,
         job_id: str,

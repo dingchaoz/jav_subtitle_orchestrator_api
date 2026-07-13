@@ -472,6 +472,33 @@ def run_windows_worker() -> None:
     run_windows_forever(worker, settings.poll_interval_seconds)
 
 
+def run_recover_interrupted_audio(
+    *,
+    job_id: str,
+    movie: str,
+    expected_sha256: str,
+) -> None:
+    from orchestrator.audio_recovery import recover_interrupted_audio
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+    receipt = recover_interrupted_audio(
+        store,
+        job_id=job_id,
+        movie=movie,
+        expected_sha256=expected_sha256,
+    )
+    print(
+        f"job_id={receipt.job_id} movie={receipt.movie_code} "
+        f"status={receipt.status.value} sha256={receipt.sha256} "
+        f"size={receipt.size_bytes} duration={receipt.duration_seconds:.6f} "
+        f"reused_final={str(receipt.reused_final).lower()}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m orchestrator")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -482,6 +509,10 @@ def build_parser() -> argparse.ArgumentParser:
     one_shot = subcommands.add_parser("mac-translation-worker-once")
     one_shot.add_argument("--job-id", required=True)
     subcommands.add_parser("windows-worker")
+    audio_recovery = subcommands.add_parser("recover-interrupted-audio")
+    audio_recovery.add_argument("--job-id", required=True)
+    audio_recovery.add_argument("--movie", required=True)
+    audio_recovery.add_argument("--expected-sha256", required=True)
     repair_parser = subcommands.add_parser(
         "plan-historical-subtitle-repair",
         help="print a read-only translation-stage repair plan",
@@ -551,6 +582,12 @@ def main() -> None:
         run_mac_translation_worker_once(args.job_id)
     elif args.command == "windows-worker":
         run_windows_worker()
+    elif args.command == "recover-interrupted-audio":
+        run_recover_interrupted_audio(
+            job_id=args.job_id,
+            movie=args.movie,
+            expected_sha256=args.expected_sha256,
+        )
     elif args.command == "plan-historical-subtitle-repair":
         run_plan_historical_repairs(
             allowlist=set(args.allowlist) if args.allowlist else None,
