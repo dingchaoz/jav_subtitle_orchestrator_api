@@ -216,18 +216,33 @@ class FailingMacTranslator:
 
 
 class RecordingPublisher:
-    def __init__(self, events=None, *, error=None):
+    def __init__(
+        self,
+        events=None,
+        *,
+        errors=None,
+        metadata_status="complete",
+        metadata_source="missav",
+        verified=True,
+    ):
         self.events = events if events is not None else []
-        self.error = error
+        self.errors = iter(errors or [])
+        self.metadata_status = metadata_status
+        self.metadata_source = metadata_source
+        self.verified = verified
 
-    def publish_english_ai(self, movie, path):
-        self.events.append(("publish", movie, path.name))
-        if self.error is not None:
-            raise self.error
+    def publish_english_ai(self, movie, path, metadata_path):
+        self.events.append(("publish", movie, path.name, metadata_path.name))
+        error = next(self.errors, None)
+        if error is not None:
+            raise error
         return SimpleNamespace(
+            movie_uuid="00000000-0000-0000-0000-000000000001",
             content_sha256="a" * 64,
             file_size=path.stat().st_size,
-            verified=True,
+            verified=self.verified,
+            metadata_status=self.metadata_status,
+            metadata_source=self.metadata_source,
         )
 
 
@@ -290,7 +305,9 @@ def test_mac_translation_worker_claims_transcription_and_marks_quality_pass_read
     assert worker_status.state == "idle"
 
 
-def test_good_translation_publishes_before_ready(sqlite_path, mac_jobs_root):
+def test_good_translation_becomes_pending_then_publishes_without_retranslation(
+    sqlite_path, mac_jobs_root
+):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job = prepare_transcription_done_job(store, mac_jobs_root)
@@ -305,7 +322,10 @@ def test_good_translation_publishes_before_ready(sqlite_path, mac_jobs_root):
     )
 
     assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert [event[0] for event in events] == ["translate"]
 
+    assert worker.process_one() is True
     assert [event[0] for event in events] == ["translate", "publish"]
     assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
     log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
@@ -313,7 +333,77 @@ def test_good_translation_publishes_before_ready(sqlite_path, mac_jobs_root):
     assert "Distinct English" not in log.read_text(encoding="utf-8")
 
 
-def test_publish_failure_is_transient_and_never_ready(sqlite_path, mac_jobs_root):
+def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            metadata_status="placeholder",
+            metadata_source="placeholder",
+        ),
+    )
+
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.ENGLISH_SRT_READY
+    assert refreshed.catalog_movie_uuid == "00000000-0000-0000-0000-000000000001"
+    assert refreshed.metadata_status == "placeholder"
+    assert refreshed.metadata_source == "placeholder"
+
+
+def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_publish_attempts=3,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(
+            events,
+            errors=[RuntimeError("publish unavailable"), None],
+        ),
+    )
+
+    assert worker.process_one() is True
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.PUBLISH_PENDING
+    assert refreshed.translation_attempt_count == 0
+    assert refreshed.publish_attempt_count == 1
+    assert refreshed.next_publish_attempt_at is not None
+    assert refreshed.claimed_by is None
+    assert audio.read_bytes() == b"keep-audio"
+    assert english.exists()
+
+    assert worker.process_one() is True
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.ENGLISH_SRT_READY
+    assert [event[0] for event in events].count("translate") == 1
+    assert [event[0] for event in events].count("publish") == 2
+
+
+def test_final_publish_attempt_fails_but_preserves_validated_files(
+    sqlite_path, mac_jobs_root
+):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job = prepare_transcription_done_job(store, mac_jobs_root)
@@ -325,16 +415,75 @@ def test_publish_failure_is_transient_and_never_ready(sqlite_path, mac_jobs_root
         max_translation_attempts=3,
         worker_id="mac-translation-1",
         lease_seconds=60,
-        publisher=RecordingPublisher(error=RuntimeError("publish unavailable")),
+        max_publish_attempts=1,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(errors=[RuntimeError("publish unavailable")]),
     )
 
     assert worker.process_one() is True
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+    assert worker.process_one() is True
 
     refreshed = store.get_job(job.id)
-    assert refreshed.status is JobStatus.TRANSCRIPTION_DONE
-    assert refreshed.translation_attempt_count == 1
-    assert refreshed.claimed_by is None
+    assert refreshed.status is JobStatus.FAILED
+    assert refreshed.error == "publishing: publish unavailable"
+    assert refreshed.translation_attempt_count == 0
+    assert refreshed.publish_attempt_count == 1
+    assert english.exists()
     assert audio.read_bytes() == b"keep-audio"
+
+
+def test_due_publication_has_priority_over_new_translation(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-001")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+    )
+    assert worker.process_one() is True
+    new_job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-002")
+
+    assert worker.process_one() is True
+
+    assert store.get_job(pending.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_job(new_job.id).status is JobStatus.TRANSCRIPTION_DONE
+    assert [event[0] for event in events] == ["translate", "publish"]
+
+
+def test_future_publication_retry_does_not_block_new_translation(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-003")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publish_retry_seconds=3600,
+        publisher=RecordingPublisher(
+            events,
+            errors=[RuntimeError("publish unavailable")],
+        ),
+    )
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    new_job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-004")
+
+    assert worker.process_one() is True
+
+    assert store.get_job(pending.id).status is JobStatus.PUBLISH_PENDING
+    assert store.get_job(new_job.id).status is JobStatus.PUBLISH_PENDING
+    assert [event[0] for event in events] == ["translate", "publish", "translate"]
 
 
 def test_exact_job_worker_does_not_claim_other_translation(
@@ -357,6 +506,94 @@ def test_exact_job_worker_does_not_claim_other_translation(
 
     assert store.get_job(first.id).status is JobStatus.TRANSCRIPTION_DONE
     assert store.get_job(second.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_exact_pending_job_publishes_without_claiming_other_pending(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-005")
+    second = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-006")
+    setup_worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-setup",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+    )
+    assert setup_worker.process_job_id(first.id) is True
+    first_ready = store.get_job(first.id)
+    assert first_ready.status is JobStatus.ENGLISH_SRT_READY
+    claimed_second = store.claim_translation_job(second.id, "mac-setup", 60)
+    assert claimed_second is not None
+    setup_worker._process_claimed_translation(claimed_second)
+    assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
+
+    third = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-007")
+    claimed_third = store.claim_translation_job(third.id, "mac-setup", 60)
+    assert claimed_third is not None
+    setup_worker._process_claimed_translation(claimed_third)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-canary",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+    )
+
+    assert worker.process_job_id(third.id) is True
+
+    assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
+    assert store.get_job(third.id).status is JobStatus.ENGLISH_SRT_READY
+    assert [event[0] for event in events] == ["publish"]
+
+
+def test_publisher_receives_metadata_json_path(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert events == [
+        ("publish", job.normalized_movie_number, "ktb-096.English.srt", "metadata.json")
+    ]
+
+
+def test_unverified_publication_never_becomes_ready(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(verified=False),
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.PUBLISH_PENDING
+    assert refreshed.error == "publishing: Supabase publication was not verified"
 
 
 def test_mac_translation_worker_permanently_rejects_collapsed_output(

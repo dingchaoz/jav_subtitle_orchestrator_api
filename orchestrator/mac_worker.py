@@ -144,6 +144,8 @@ class MacTranslationWorker:
         lease_seconds: int,
         quality_failure_limit: int = 3,
         publisher=None,
+        max_publish_attempts: int = 10,
+        publish_retry_seconds: int = 30,
     ) -> None:
         self.store = store
         self.translator = translator
@@ -152,6 +154,8 @@ class MacTranslationWorker:
         self.lease_seconds = lease_seconds
         self.quality_failure_limit = quality_failure_limit
         self.publisher = publisher
+        self.max_publish_attempts = max_publish_attempts
+        self.publish_retry_seconds = publish_retry_seconds
         self.consecutive_quality_failures = 0
 
     def _record_idle(self, *, error: str | None = None) -> None:
@@ -172,27 +176,67 @@ class MacTranslationWorker:
                 f"{self.consecutive_quality_failures} consecutive quality failures"
             )
         self.store.recover_expired_translation_leases(self.max_translation_attempts)
+        self.store.recover_expired_publication_leases(
+            self.max_publish_attempts,
+            self.publish_retry_seconds,
+        )
+        if self.publisher is not None:
+            publication = self.store.claim_publication_job(
+                self.worker_id,
+                self.lease_seconds,
+            )
+            if publication is not None:
+                return self._process_claimed_publication(publication)
         job = self.store.claim_next_translation_job(self.worker_id, self.lease_seconds)
         if job is None:
             self._record_idle()
             return False
-        return self._process_claimed_job(job)
+        return self._process_claimed_translation(job)
 
     def process_job_id(self, job_id: str) -> bool:
         if self.consecutive_quality_failures >= self.quality_failure_limit:
             raise MacTranslationUnhealthyError(
                 "Mac translation worker stopped after consecutive quality failures"
             )
-        job = self.store.claim_translation_job(
-            job_id,
+        current = self.store.get_job(job_id)
+        if current is None:
+            raise RuntimeError(f"exact job {job_id} does not exist")
+        if current.status is JobStatus.TRANSCRIPTION_DONE:
+            job = self.store.claim_translation_job(
+                job_id,
+                self.worker_id,
+                self.lease_seconds,
+            )
+            if job is None:
+                raise RuntimeError(
+                    f"exact job {job_id} is not claimable for translation"
+                )
+            self._process_claimed_translation(job)
+            if self.publisher is None:
+                return True
+            current = self.store.get_job(job_id)
+            if current is None or current.status is not JobStatus.PUBLISH_PENDING:
+                return True
+        elif current.status is not JobStatus.PUBLISH_PENDING:
+            raise RuntimeError(
+                f"exact job {job_id} is not claimable from stage "
+                f"{current.status.value}"
+            )
+
+        if self.publisher is None:
+            raise RuntimeError(
+                f"exact job {job_id} requires a publisher from stage publish_pending"
+            )
+        publication = self.store.claim_publication_job(
             self.worker_id,
             self.lease_seconds,
+            job_id=job_id,
         )
-        if job is None:
-            raise RuntimeError("exact translation job is not claimable")
-        return self._process_claimed_job(job)
+        if publication is None:
+            raise RuntimeError(f"exact job {job_id} is not claimable for publication")
+        return self._process_claimed_publication(publication)
 
-    def _process_claimed_job(self, job: JobRecord) -> bool:
+    def _process_claimed_translation(self, job: JobRecord) -> bool:
         try:
             self.store.record_worker_processing(
                 self.worker_id,
@@ -204,7 +248,7 @@ class MacTranslationWorker:
             pass
         error: str | None = None
         try:
-            self._process_job(job)
+            self._process_translation(job)
         except Exception as exc:
             error = str(exc)
             if isinstance(exc, MacTranslationQualityError):
@@ -226,7 +270,7 @@ class MacTranslationWorker:
             self._record_idle(error=error)
         return True
 
-    def _process_job(self, job: JobRecord) -> None:
+    def _process_translation(self, job: JobRecord) -> None:
         paths = build_job_paths(
             job.normalized_movie_number,
             self.store.jobs_root_mac,
@@ -253,26 +297,87 @@ class MacTranslationWorker:
             raise MacTranslationQualityError(
                 "quality_gate_failed:" + ",".join(report.reason_codes)
             )
-        if self.publisher is not None:
-            published = self.publisher.publish_english_ai(
-                job.normalized_movie_number,
-                paths.english_srt_path_mac,
+        if self.publisher is None:
+            updated = self.store.complete_mac_translation(
+                job.id,
+                self.worker_id,
+                lambda path: Path(path).exists(),
             )
-            if published.verified is not True:
-                raise RuntimeError("Supabase publication was not verified")
-            _append_job_log_safely(
-                paths.job_dir_mac,
-                "mac-translation.log",
-                f"publish_verified {job.id} movie={job.normalized_movie_number} "
-                f"sha256={published.content_sha256} size={published.file_size}",
+            ready_message = f"english_srt_ready {job.id}"
+        else:
+            updated = self.store.complete_mac_translation_quality(
+                job.id,
+                self.worker_id,
+                lambda path: Path(path).exists(),
             )
-        updated = self.store.complete_mac_translation(
-            job.id,
-            self.worker_id,
-            lambda path: Path(path).exists(),
-        )
+            ready_message = f"publish_pending {job.id}"
         self.consecutive_quality_failures = 0
         write_job_snapshot(updated)
+        _append_job_log_safely(
+            paths.job_dir_mac,
+            "mac-translation.log",
+            ready_message,
+        )
+
+    def _process_claimed_publication(self, job: JobRecord) -> bool:
+        try:
+            self.store.record_worker_processing(
+                self.worker_id,
+                role="mac_translator",
+                job=job,
+                stage=JobStatus.PUBLISHING.value,
+            )
+        except Exception:
+            pass
+        error: str | None = None
+        try:
+            self._process_publication(job)
+        except Exception as exc:
+            error = "publishing: publication failed"
+            updated = self.store.fail_publication(
+                job.id,
+                self.worker_id,
+                str(exc),
+                max_publish_attempts=self.max_publish_attempts,
+                retry_seconds=self.publish_retry_seconds,
+            )
+            write_job_snapshot(updated)
+            _append_job_log_safely(
+                Path(job.job_dir_mac),
+                "mac-translation.log",
+                f"publication_failed {job.id}",
+            )
+        finally:
+            self._record_idle(error=error)
+        return True
+
+    def _process_publication(self, job: JobRecord) -> None:
+        paths = build_job_paths(
+            job.normalized_movie_number,
+            self.store.jobs_root_mac,
+            self.store.jobs_root_windows,
+        )
+        published = self.publisher.publish_english_ai(
+            job.normalized_movie_number,
+            paths.english_srt_path_mac,
+            paths.metadata_path_mac,
+        )
+        if published.verified is not True:
+            raise RuntimeError("Supabase publication was not verified")
+        updated = self.store.complete_publication(
+            job.id,
+            self.worker_id,
+            movie_uuid=published.movie_uuid,
+            metadata_status=published.metadata_status,
+            metadata_source=published.metadata_source,
+        )
+        write_job_snapshot(updated)
+        _append_job_log_safely(
+            paths.job_dir_mac,
+            "mac-translation.log",
+            f"publish_verified {job.id} sha256={published.content_sha256} "
+            f"size={published.file_size}",
+        )
         _append_job_log_safely(
             paths.job_dir_mac,
             "mac-translation.log",
