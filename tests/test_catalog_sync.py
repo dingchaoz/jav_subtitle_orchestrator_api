@@ -11,6 +11,7 @@ from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, Catal
 CANONICAL_CODE = "roe-291"
 TOKEN = "never-log-this-token"
 ADULT_TEXT = "sensitive-response-subtitle-text"
+CREDENTIAL_URL = f"https://user:{TOKEN}@javsubtitle.example/private"
 
 
 def valid_body() -> dict[str, object]:
@@ -158,8 +159,9 @@ def test_http_failures_are_classified_without_leaking_secrets(status: int, reaso
 
 
 def test_request_exception_is_safe_catalog_fetch_failure():
-    secret_url = f"https://user:{TOKEN}@javsubtitle.example/private"
-    session = FakeSession(error=requests.ConnectionError(f"failed {secret_url} {ADULT_TEXT}"))
+    session = FakeSession(
+        error=requests.ConnectionError(f"failed {CREDENTIAL_URL} {ADULT_TEXT}")
+    )
 
     with pytest.raises(CatalogSyncError) as raised:
         CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session).sync(
@@ -169,8 +171,10 @@ def test_request_exception_is_safe_catalog_fetch_failure():
     assert raised.value.reason_code == "catalog_fetch_failed"
     assert str(raised.value) == "catalog_fetch_failed"
     assert raised.value.__cause__ is None
-    assert TOKEN not in repr(raised.value)
-    assert ADULT_TEXT not in repr(raised.value)
+    assert raised.value.__context__ is None
+    for sensitive in (TOKEN, CREDENTIAL_URL, ADULT_TEXT, session.response.text):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -178,8 +182,14 @@ def test_request_exception_is_safe_catalog_fetch_failure():
     [
         ([], None),
         ("not-an-object", None),
-        (None, ValueError(f"invalid JSON containing {ADULT_TEXT}")),
-        (None, TypeError(f"invalid JSON containing {ADULT_TEXT}")),
+        (
+            None,
+            ValueError(f"invalid JSON containing {TOKEN} {CREDENTIAL_URL} {ADULT_TEXT}"),
+        ),
+        (
+            None,
+            TypeError(f"invalid JSON containing {TOKEN} {CREDENTIAL_URL} {ADULT_TEXT}"),
+        ),
     ],
 )
 def test_invalid_json_or_non_object_response_is_rejected_safely(body, json_error):
@@ -188,7 +198,10 @@ def test_invalid_json_or_non_object_response_is_rejected_safely(body, json_error
 
     assert raised.value.reason_code == "catalog_response_invalid"
     assert raised.value.__cause__ is None
-    assert ADULT_TEXT not in repr(raised.value)
+    assert raised.value.__context__ is None
+    for sensitive in (TOKEN, CREDENTIAL_URL, ADULT_TEXT):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
 
 
 def response_mutations() -> list[tuple[str, object]]:
@@ -204,6 +217,11 @@ def response_mutations() -> list[tuple[str, object]]:
         ("results wrong type", lambda body: body.update(results={})),
         ("results wrong count", lambda body: body.update(results=[])),
         ("result not object", lambda body: body.update(results=[ADULT_TEXT])),
+        ("extra top-level field", lambda body: body.update(extra=ADULT_TEXT)),
+        (
+            "extra result field",
+            lambda body: body["results"][0].update(extra=ADULT_TEXT),
+        ),
         (
             "canonical code mismatch",
             lambda body: body["results"][0].update(canonicalCode="abc-123"),
@@ -262,8 +280,13 @@ def test_malformed_or_mismatched_success_response_is_rejected(_name, mutate):
         "ftp://javsubtitle.example",
         "http://javsubtitle.example",
         f"https://user:{TOKEN}@javsubtitle.example",
+        "https://javsubtitle.example/base",
         "https://javsubtitle.example/path?token=private",
         "https://javsubtitle.example/path#fragment",
+        "https://javsubtitle.example?",
+        "https://javsubtitle.example#",
+        "https://javsubtitle.example/?",
+        "https://javsubtitle.example/#",
     ],
 )
 def test_base_url_validation_fails_closed_without_leaking_input(base_url: str):
@@ -280,7 +303,8 @@ def test_base_url_validation_fails_closed_without_leaking_input(base_url: str):
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://[::1]:3000",
-        "https://javsubtitle.example/base",
+        "https://javsubtitle.example",
+        "https://javsubtitle.example/",
     ],
 )
 def test_base_url_accepts_https_and_explicit_localhost_http(base_url: str):

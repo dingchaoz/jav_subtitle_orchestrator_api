@@ -70,6 +70,7 @@ class CatalogSyncClient:
         except (AttributeError, TypeError, ValueError):
             raise ValueError("invalid movie code") from None
 
+        request_failed = False
         try:
             response = self.session.post(
                 self.endpoint,
@@ -87,7 +88,9 @@ class CatalogSyncClient:
                 allow_redirects=False,
             )
         except requests.RequestException:
-            raise CatalogSyncError("catalog_fetch_failed") from None
+            request_failed = True
+        if request_failed:
+            raise CatalogSyncError("catalog_fetch_failed")
 
         if 300 <= response.status_code < 400:
             raise CatalogSyncError("catalog_redirect_rejected")
@@ -96,16 +99,21 @@ class CatalogSyncClient:
         if response.status_code != 200:
             raise CatalogSyncError("catalog_sync_failed")
 
+        invalid_json = False
         try:
             body = response.json()
         except (TypeError, ValueError):
-            raise CatalogSyncError("catalog_response_invalid") from None
+            invalid_json = True
+            body = None
+        if invalid_json:
+            raise CatalogSyncError("catalog_response_invalid")
         if not isinstance(body, dict):
             raise CatalogSyncError("catalog_response_invalid")
 
         result_rows = body.get("results")
         if (
-            body.get("success") is not True
+            set(body) != {"success", "requested", "synced", "failed", "results"}
+            or body.get("success") is not True
             or not self._exact_int(body.get("requested"), 1)
             or not self._exact_int(body.get("synced"), 1)
             or body.get("failed") != []
@@ -124,7 +132,15 @@ class CatalogSyncClient:
             f"movie:light:{canonical}",
         }
         if (
-            row.get("canonicalCode") != canonical
+            set(row)
+            != {
+                "canonicalCode",
+                "d1RowsUpdated",
+                "subtitleCount",
+                "kvKeysDeleted",
+                "dryRun",
+            }
+            or row.get("canonicalCode") != canonical
             or row.get("dryRun") is not False
             or not self._positive_int(d1_rows_updated)
             or not self._positive_int(subtitle_count)
@@ -160,11 +176,14 @@ class CatalogSyncClient:
             or not parsed.netloc
             or not hostname
             or has_credentials
+            or parsed.path not in {"", "/"}
+            or "?" in base_url
+            or "#" in base_url
             or parsed.query
             or parsed.fragment
         ):
             raise ValueError("catalog API base URL is invalid")
-        return base_url.rstrip("/") + _SYNC_PATH
+        return f"{parsed.scheme}://{parsed.netloc}{_SYNC_PATH}"
 
     @staticmethod
     def _exact_int(value: object, expected: int) -> bool:
