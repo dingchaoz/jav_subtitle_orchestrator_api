@@ -445,6 +445,50 @@ def test_prepare_catalog_publication_canary_cli_requires_exact_arguments():
         assert not hasattr(parsed, forbidden)
 
 
+def test_prepare_catalog_publication_canary_main_dispatches_exact_arguments(
+    monkeypatch,
+):
+    import orchestrator.__main__ as main_module
+
+    calls = []
+
+    def record_prepare(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "python -m orchestrator",
+            "prepare-catalog-publication-canary",
+            "--allowlist-file",
+            "approved.txt",
+            "--movie",
+            "MIST166",
+            "--limit",
+            "1",
+            "--confirm-job-id",
+            "job_exact",
+        ],
+    )
+    monkeypatch.setattr(main_module, "configure_logging", lambda: None)
+    monkeypatch.setattr(
+        main_module,
+        "run_prepare_catalog_publication_canary",
+        record_prepare,
+    )
+
+    main_module.main()
+
+    assert calls == [
+        {
+            "allowlist_file": Path("approved.txt"),
+            "movie": "MIST166",
+            "limit": 1,
+            "confirm_job_id": "job_exact",
+        }
+    ]
+
+
 def test_prepare_catalog_publication_canary_cli_runner_is_sanitized_and_local(
     sqlite_path, mac_jobs_root, tmp_path, monkeypatch, capsys
 ):

@@ -193,9 +193,34 @@ overwrite, or requeue anything.
 
 ## One-job catalog publication-only canary
 
-Use this path only after the exact job and publication operation have received
-separate approval. Create a private allowlist file containing exactly `mist-166`,
-then prepare and run only the approved job:
+### Deployment approval and preflight gate
+
+Do not run either command below until the migration deployment and this exact
+one-job publication have received separate approval, and all of these conditions
+have been confirmed:
+
+- The reviewed `ensure_subtitle_movie` migration is deployed to the intended
+  Supabase project. RPC execute access has been verified as denied for `anon` and
+  `authenticated`, and allowed only for `service_role`.
+- The production `.env` contains the real `SUPABASE_URL` and
+  `SUPABASE_SERVICE_ROLE_KEY`. Check only that they are present; never print the
+  service key or place it in logs, screenshots, shell history, or reports.
+- `MAC_TRANSLATION_PUBLISH_ENABLED=true`,
+  `SUPABASE_SUBTITLE_BUCKET=subtitles`, and
+  `SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90` are set for the one-shot process.
+- The API and worker commands use the reviewed code from the approved production
+  checkout, not an older running process or an unreviewed local change.
+- `python -m orchestrator mac-translation-smoke-test` has passed in that checkout
+  with the production runtime configuration.
+
+If any condition is not satisfied, do not prepare the canary. In particular,
+`MAC_TRANSLATION_PUBLISH_ENABLED=false` is the default: with publication disabled,
+the exact one-shot worker has no publisher and rejects a prepared
+`publish_pending` job. Do not move the row to `publish_pending` first and plan to
+enable publication later.
+
+After the gate passes, create a private allowlist file containing exactly
+`mist-166`, then prepare and run only the approved job:
 
 ```bash
 python -m orchestrator prepare-catalog-publication-canary \
