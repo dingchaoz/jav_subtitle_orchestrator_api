@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import orchestrator.supabase_publisher as publisher_module
 from orchestrator.movie_catalog import MovieCatalogResult
 from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
 
@@ -35,6 +36,20 @@ class RecordingCatalogEnsurer:
             ),
             metadata_source=self.source,
         )
+
+
+class MutatingCatalogEnsurer(RecordingCatalogEnsurer):
+    def __init__(self, english_srt_path):
+        super().__init__()
+        self.english_srt_path = english_srt_path
+
+    def ensure_movie(self, movie_code, metadata_path):
+        result = super().ensure_movie(movie_code, metadata_path)
+        self.english_srt_path.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\nUnvalidated replacement\n",
+            encoding="utf-8",
+        )
+        return result
 
 
 class FakeResponse:
@@ -142,6 +157,7 @@ def test_good_translation_uploads_normally(tmp_path, metadata_source):
     result = publisher.publish_english_ai("ktb-112", english)
 
     assert result.subtitle_id == "subtitle-uuid"
+    assert result.metadata_status == "complete"
     assert result.metadata_source == metadata_source
     assert any("/storage/v1/object/" in call[1] for call in session.calls)
     assert any(call[0] == "POST" and "/movie_languages" in call[1] for call in session.calls)
@@ -294,6 +310,60 @@ def test_catalog_failure_cannot_reach_storage_or_languages(tmp_path):
     assert not any("/movie_languages" in call[1] for call in session.calls)
 
 
+def test_subtitle_changed_during_catalog_ensure_cannot_be_uploaded(tmp_path):
+    english = _write_pair(tmp_path)
+    session = FakeSession()
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=MutatingCatalogEnsurer(english),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^quality_gate_failed:subtitle_changed_after_validation$",
+    ):
+        publisher.publish_english_ai("ktb-112", english)
+
+    assert session.calls == []
+
+
+def test_subtitle_changed_during_validation_cannot_reach_catalog(
+    tmp_path, monkeypatch
+):
+    english = _write_pair(tmp_path)
+    session = FakeSession()
+    catalog = RecordingCatalogEnsurer()
+    validate = publisher_module.validate_translation_quality
+
+    def mutate_after_validation(japanese_path, english_path):
+        report = validate(japanese_path, english_path)
+        english_path.write_text("changed after validation", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(
+        publisher_module,
+        "validate_translation_quality",
+        mutate_after_validation,
+    )
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=catalog,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^quality_gate_failed:subtitle_changed_during_validation$",
+    ):
+        publisher.publish_english_ai("ktb-112", english)
+
+    assert catalog.events == []
+    assert session.calls == []
+
+
 def test_placeholder_movie_is_ensured_before_quality_approved_upload(tmp_path):
     english = _write_pair(tmp_path)
     metadata_path = tmp_path / "missing-metadata.json"
@@ -362,3 +432,19 @@ def test_metadata_path_defaults_next_to_english_srt(tmp_path):
     publisher.publish_english_ai("ktb-112", english)
 
     assert catalog.events == [("ensure", "ktb-112", tmp_path / "metadata.json")]
+
+
+def test_default_catalog_ensurer_reuses_publisher_http_configuration():
+    session = FakeSession()
+
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co/",
+        "service-key",
+        timeout_seconds=17,
+        session=session,
+    )
+
+    assert publisher.catalog_ensurer.url == "https://example.supabase.co"
+    assert publisher.catalog_ensurer.service_key == "service-key"
+    assert publisher.catalog_ensurer.timeout_seconds == 17
+    assert publisher.catalog_ensurer.session is session

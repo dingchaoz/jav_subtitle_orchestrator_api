@@ -4,16 +4,27 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 import requests
 
+from orchestrator.movie_catalog import (
+    MetadataSource,
+    MetadataStatus,
+    MovieCatalogResult,
+)
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.subtitle_quality import validate_translation_quality
 
 
 AI_ENGLISH_LANGUAGE = "English_AI"
+
+
+class MovieCatalogEnsurer(Protocol):
+    def ensure_movie(
+        self, movie_code: str, metadata_path: Path
+    ) -> MovieCatalogResult: ...
 
 
 def build_ai_subtitle_storage_path(movie_code: str) -> str:
@@ -31,8 +42,8 @@ class SupabasePublishResult:
     content_sha256: str
     file_size: int
     verified: bool
-    metadata_status: str
-    metadata_source: str
+    metadata_status: MetadataStatus
+    metadata_source: MetadataSource
 
 
 class SupabaseSubtitlePublisher:
@@ -49,7 +60,7 @@ class SupabaseSubtitlePublisher:
         clock=time.monotonic,
         sleeper=time.sleep,
         nonce_factory=None,
-        catalog_ensurer=None,
+        catalog_ensurer: MovieCatalogEnsurer | None = None,
     ) -> None:
         if verification_timeout_seconds <= 0:
             raise ValueError("verification timeout must be positive")
@@ -93,31 +104,48 @@ class SupabaseSubtitlePublisher:
         japanese_srt_path = english_srt_path.with_name(
             f"{canonical}.Japanese.srt"
         )
+        japanese_before = japanese_srt_path.read_bytes()
+        english_before = english_srt_path.read_bytes()
         report = validate_translation_quality(japanese_srt_path, english_srt_path)
         if not report.passed:
             raise RuntimeError(
                 "quality_gate_failed:" + ",".join(report.reason_codes)
+            )
+        japanese_snapshot = japanese_srt_path.read_bytes()
+        english_snapshot = english_srt_path.read_bytes()
+        if (
+            japanese_snapshot != japanese_before
+            or english_snapshot != english_before
+        ):
+            raise RuntimeError(
+                "quality_gate_failed:subtitle_changed_during_validation"
             )
 
         catalog = self.catalog_ensurer.ensure_movie(
             canonical,
             metadata_path or english_srt_path.with_name("metadata.json"),
         )
-        subtitle_bytes = english_srt_path.read_bytes()
-        content_sha256 = hashlib.sha256(subtitle_bytes).hexdigest()
+        if (
+            japanese_srt_path.read_bytes() != japanese_snapshot
+            or english_srt_path.read_bytes() != english_snapshot
+        ):
+            raise RuntimeError(
+                "quality_gate_failed:subtitle_changed_after_validation"
+            )
+        content_sha256 = hashlib.sha256(english_snapshot).hexdigest()
         storage_path = build_ai_subtitle_storage_path(canonical)
-        self._upload_storage_object(storage_path, subtitle_bytes)
+        self._upload_storage_object(storage_path, english_snapshot)
         subtitle_id = self._upsert_language_row(
             catalog.movie_uuid,
             storage_path,
-            len(subtitle_bytes),
+            len(english_snapshot),
         )
-        self._verify_storage(storage_path, subtitle_bytes, content_sha256)
+        self._verify_storage(storage_path, english_snapshot, content_sha256)
         self._verify_catalog(
             subtitle_id,
             catalog.movie_uuid,
             storage_path,
-            len(subtitle_bytes),
+            len(english_snapshot),
         )
         return SupabasePublishResult(
             movie_code=canonical,
@@ -125,7 +153,7 @@ class SupabaseSubtitlePublisher:
             movie_uuid=catalog.movie_uuid,
             subtitle_id=subtitle_id,
             content_sha256=content_sha256,
-            file_size=len(subtitle_bytes),
+            file_size=len(english_snapshot),
             verified=True,
             metadata_status=catalog.metadata_status,
             metadata_source=catalog.metadata_source,
