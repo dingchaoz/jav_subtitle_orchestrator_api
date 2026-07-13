@@ -18,7 +18,7 @@ class CatalogRepairPlan:
     current_status: str
     japanese_srt: str
     english_srt: str
-    metadata_path: str
+    metadata_path: str | None
     metadata_available: bool
     expected_metadata_source: str
     action: str
@@ -88,7 +88,11 @@ def plan_catalog_repairs(
                 current_status=status,
                 japanese_srt=str(paths.japanese_srt_path_mac),
                 english_srt=str(paths.english_srt_path_mac),
-                metadata_path=str(paths.metadata_path_mac),
+                metadata_path=(
+                    str(paths.metadata_path_mac)
+                    if paths.metadata_path_mac.is_file()
+                    else None
+                ),
                 metadata_available=metadata_available,
                 expected_metadata_source=(
                     "local" if metadata_available else "missav_or_placeholder"
@@ -110,6 +114,7 @@ def render_catalog_repair_report(plans: list[CatalogRepairPlan]) -> str:
         lines.append(
             f"job_id={plan.job_id} movie_code={plan.movie_code} "
             f"status={plan.current_status} "
+            f"metadata_path={plan.metadata_path or '-'} "
             f"metadata_available={'yes' if plan.metadata_available else 'no'} "
             f"source={plan.expected_metadata_source} action={plan.action} "
             f"storage={plan.storage_effect}"

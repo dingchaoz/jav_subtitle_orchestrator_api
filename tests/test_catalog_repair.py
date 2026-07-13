@@ -110,9 +110,12 @@ def test_quality_pass_is_eligible_without_metadata(sqlite_path, mac_jobs_root):
     assert plan.job_id == job.id
     assert plan.japanese_srt == str(paths.japanese_srt_path_mac)
     assert plan.english_srt == str(paths.english_srt_path_mac)
-    assert plan.metadata_path == str(paths.metadata_path_mac)
+    assert plan.metadata_path is None
     assert plan.metadata_available is False
     assert plan.expected_metadata_source == "missav_or_placeholder"
+    report = render_catalog_repair_report([plan])
+    assert "metadata_path=-" in report
+    assert str(paths.metadata_path_mac) not in report
     with pytest.raises(FrozenInstanceError):
         plan.action = "mutate"
 
@@ -128,6 +131,7 @@ def test_valid_local_metadata_sets_expected_source(sqlite_path, mac_jobs_root):
 
     plan = plan_catalog_repairs(store, allowlist=None, limit=100)[0]
 
+    assert plan.metadata_path == str(paths.metadata_path_mac)
     assert plan.metadata_available is True
     assert plan.expected_metadata_source == "local"
 
