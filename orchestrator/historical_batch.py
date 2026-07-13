@@ -20,6 +20,8 @@ from orchestrator.job_files_lock import (
     JobsRootLock,
     exclusive_jobs_root_lock,
     open_job_directory_from_root,
+    shared_job_files_lock_from_root,
+    shared_jobs_root_lock,
 )
 from orchestrator.models import JobStatus
 from orchestrator.movie_code import canonical_movie_code
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
     from orchestrator.store import JobStore
 
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 MAX_BATCH_LIMIT = 20
 MAX_ALLOWLIST_BYTES = 1024 * 1024
 MAX_ALLOWLIST_VERIFY_BYTES = MAX_ALLOWLIST_BYTES
@@ -63,7 +65,8 @@ class HistoricalBatchItem:
     japanese_sha256: str
     japanese_size: int
     japanese_mtime_ns: int
-    audio_snapshot_sha256: str
+    audio_probe_snapshot_sha256: str
+    audio_sha256: str
     audio_size: int
     audio_mtime_ns: int
     english_sha256: str
@@ -362,7 +365,8 @@ _ITEM_KEYS = frozenset(
         "japanese_sha256",
         "japanese_size",
         "japanese_mtime_ns",
-        "audio_snapshot_sha256",
+        "audio_probe_snapshot_sha256",
+        "audio_sha256",
         "audio_size",
         "audio_mtime_ns",
         "english_sha256",
@@ -411,7 +415,10 @@ def _item_from_payload(value: object) -> HistoricalBatchItem:
         japanese_sha256=_require_digest(payload["japanese_sha256"]),
         japanese_size=_require_int(payload["japanese_size"], minimum=1),
         japanese_mtime_ns=_require_int(payload["japanese_mtime_ns"]),
-        audio_snapshot_sha256=_require_digest(payload["audio_snapshot_sha256"]),
+        audio_probe_snapshot_sha256=_require_digest(
+            payload["audio_probe_snapshot_sha256"]
+        ),
+        audio_sha256=_require_digest(payload["audio_sha256"]),
         audio_size=_require_int(payload["audio_size"], minimum=1),
         audio_mtime_ns=_require_int(payload["audio_mtime_ns"]),
         english_sha256=_require_digest(payload["english_sha256"]),
@@ -706,6 +713,25 @@ def _open_bounded_wav_snapshot_at(
             bits_per_sample,
         ) = fmt_metadata
         data_offset, data_size = data_metadata
+        sample_size = min(64, data_size)
+        sample_offsets = tuple(
+            sorted(
+                {
+                    data_offset,
+                    data_offset + max(0, (data_size - sample_size) // 2),
+                    data_offset + max(0, data_size - sample_size),
+                }
+            )
+        )
+        samples = [
+            {
+                "offset": offset,
+                "sha256": hashlib.sha256(
+                    _bounded_pread(fd, sample_size, offset, consumed=consumed)
+                ).hexdigest(),
+            }
+            for offset in sample_offsets
+        ]
         fingerprint = hashlib.sha256(
             canonical_plan_bytes(
                 {
@@ -724,6 +750,7 @@ def _open_bounded_wav_snapshot_at(
                     "data_size": data_size,
                     "duration_frames": data_size // block_align,
                     "duration_ms": data_size * 1000 // byte_rate,
+                    "samples": samples,
                 }
             )
         ).hexdigest()
@@ -1048,7 +1075,7 @@ def _scan_snapshot_entry(
             "mtime_ns": english.mtime_ns,
         },
         "audio": {
-            "snapshot_sha256": audio.sha256,
+            "probe_snapshot_sha256": audio.sha256,
             "size": audio.size,
             "mtime_ns": audio.mtime_ns,
         },
@@ -1062,6 +1089,7 @@ def _build_plan_from_snapshots(
     *,
     limit: int,
     ignore_batch_id: str | None = None,
+    audio_content_by_path: dict[str, _FileSnapshot] | None = None,
 ) -> HistoricalBatchPlan:
     jobs_by_movie: dict[str, list[Any]] = {}
     for row in jobs:
@@ -1191,7 +1219,13 @@ def _build_plan_from_snapshots(
                 japanese_sha256=japanese.sha256,
                 japanese_size=japanese.size,
                 japanese_mtime_ns=japanese.mtime_ns,
-                audio_snapshot_sha256=audio.sha256,
+                audio_probe_snapshot_sha256=audio.sha256,
+                audio_sha256=(
+                    audio_content_by_path[path_movie_number].sha256
+                    if audio_content_by_path is not None
+                    and path_movie_number in audio_content_by_path
+                    else UNAVAILABLE_SELECTED_AUDIO_SHA256
+                ),
                 audio_size=audio.size,
                 audio_mtime_ns=audio.mtime_ns,
                 english_sha256=english.sha256,
@@ -1200,6 +1234,11 @@ def _build_plan_from_snapshots(
             )
         )
     eligible.sort(key=lambda item: (item.movie_code, item.path_movie_number, item.job_id))
+    selected = tuple(eligible[:limit])
+    if audio_content_by_path is not None and any(
+        item.path_movie_number not in audio_content_by_path for item in selected
+    ):
+        raise ValueError("historical_plan_changed")
     return HistoricalBatchPlan.build(
         allowlist_path=filesystem.absolute_allowlist_path,
         allowlist_sha256=filesystem.allowlist_sha256,
@@ -1214,8 +1253,92 @@ def _build_plan_from_snapshots(
         scan_sha256=hashlib.sha256(
             canonical_plan_bytes({"entries": scan_entries})
         ).hexdigest(),
-        items=tuple(eligible[:limit]),
+        items=selected,
     )
+
+
+UNAVAILABLE_SELECTED_AUDIO_SHA256 = "0" * 64
+
+
+def _hash_selected_audio(
+    jobs_root: Path,
+    items: tuple[HistoricalBatchItem, ...],
+) -> dict[str, _FileSnapshot]:
+    snapshots: dict[str, _FileSnapshot] = {}
+    try:
+        with shared_jobs_root_lock(jobs_root, blocking=True) as root_lock:
+            for item in items:
+                with shared_job_files_lock_from_root(
+                    root_lock,
+                    item.path_movie_number,
+                    blocking=True,
+                ) as job_lock:
+                    snapshot = _open_stable_regular_file_at(
+                        job_lock.job_fd,
+                        "audio.wav",
+                        keep_content=False,
+                        max_bytes=None,
+                    )
+                    if (
+                        snapshot.size != item.audio_size
+                        or snapshot.mtime_ns != item.audio_mtime_ns
+                        or item.path_movie_number in snapshots
+                    ):
+                        raise OSError("selected audio changed")
+                    snapshots[item.path_movie_number] = snapshot
+    except (JobFilesLockError, OSError):
+        raise ValueError("historical_plan_changed") from None
+    return snapshots
+
+
+def _require_selected_audio_identity(
+    filesystem: _FilesystemScan,
+    selected_audio: dict[str, _FileSnapshot],
+) -> None:
+    for path_movie_number, content_snapshot in selected_audio.items():
+        scanned = filesystem.files_by_path.get(path_movie_number)
+        if scanned is None:
+            raise ValueError("historical_plan_changed")
+        probe = scanned.audio
+        if (
+            probe.device,
+            probe.inode,
+            probe.ctime_ns,
+            probe.size,
+            probe.mtime_ns,
+        ) != (
+            content_snapshot.device,
+            content_snapshot.inode,
+            content_snapshot.ctime_ns,
+            content_snapshot.size,
+            content_snapshot.mtime_ns,
+        ):
+            raise ValueError("historical_plan_changed")
+
+
+def _require_same_provisional_selection(
+    provisional: HistoricalBatchPlan,
+    final: HistoricalBatchPlan,
+) -> None:
+    normalized = HistoricalBatchPlan.build(
+        allowlist_path=final.allowlist_path,
+        allowlist_sha256=final.allowlist_sha256,
+        allowlist_entry_count=final.allowlist_entry_count,
+        limit=final.limit,
+        eligible_total=final.eligible_total,
+        already_repaired=final.already_repaired,
+        ineligible=final.ineligible,
+        blocked=final.blocked,
+        scan_entries=final.scan_entries,
+        audio_probe_max_bytes=final.audio_probe_max_bytes,
+        scan_sha256=final.scan_sha256,
+        items=tuple(
+            replace(item, audio_sha256=UNAVAILABLE_SELECTED_AUDIO_SHA256)
+            for item in final.items
+        ),
+    )
+    if normalized != provisional:
+        raise ValueError("historical_plan_changed")
 
 
 def plan_historical_batch(
@@ -1230,12 +1353,35 @@ def plan_historical_batch(
         or not 1 <= limit <= MAX_BATCH_LIMIT
     ):
         raise ValueError("historical batch limit must be between 1 and 20")
-    with exclusive_jobs_root_lock(
-        store.jobs_root_mac,
-        blocking=True,
-    ) as root_lock:
-        with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+    with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+        with exclusive_jobs_root_lock(
+            store.jobs_root_mac,
+            blocking=True,
+        ) as root_lock:
             filesystem = _scan_filesystem(root_lock, allowlist)
+            _require_allowlist_unchanged(allowlist, exact=False)
+            conn = _read_only_connection(store.db_path)
+            try:
+                conn.execute("BEGIN")
+                jobs, repairs = _read_database_snapshot(conn)
+                provisional = _build_plan_from_snapshots(
+                    filesystem,
+                    jobs,
+                    repairs,
+                    limit=limit,
+                )
+                conn.commit()
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.close()
+        selected_audio = _hash_selected_audio(store.jobs_root_mac, provisional.items)
+        with exclusive_jobs_root_lock(
+            store.jobs_root_mac,
+            blocking=True,
+        ) as root_lock:
+            filesystem = _scan_filesystem(root_lock, allowlist)
+            _require_selected_audio_identity(filesystem, selected_audio)
             _require_allowlist_unchanged(allowlist, exact=False)
             conn = _read_only_connection(store.db_path)
             try:
@@ -1246,7 +1392,9 @@ def plan_historical_batch(
                     jobs,
                     repairs,
                     limit=limit,
+                    audio_content_by_path=selected_audio,
                 )
+                _require_same_provisional_selection(provisional, plan)
                 _require_allowlist_unchanged(allowlist, exact=True)
                 conn.commit()
                 return plan
@@ -1472,7 +1620,8 @@ def _row_to_repair(row: sqlite3.Row) -> HistoricalRepairRecord:
         next_attempt_at=row["next_attempt_at"],
         reason_code=row["reason_code"],
         japanese_sha256=row["japanese_sha256"],
-        audio_snapshot_sha256=row["audio_snapshot_sha256"],
+        audio_probe_snapshot_sha256=row["audio_probe_snapshot_sha256"],
+        audio_sha256=row["audio_sha256"],
         source_english_sha256=row["source_english_sha256"],
         english_sha256=row["english_sha256"],
         created_at=row["created_at"],
@@ -1533,7 +1682,9 @@ def _exact_existing_records_from_rows(
             or row["movie_code"] != item.movie_code
             or row["allowlist_sha256"] != plan.allowlist_sha256
             or row["japanese_sha256"] != item.japanese_sha256
-            or row["audio_snapshot_sha256"] != item.audio_snapshot_sha256
+            or row["audio_probe_snapshot_sha256"]
+            != item.audio_probe_snapshot_sha256
+            or row["audio_sha256"] != item.audio_sha256
             or row["source_english_sha256"] != item.english_sha256
         ):
             raise ValueError("historical_plan_changed")
@@ -1570,6 +1721,7 @@ def _enqueue_historical_repairs_transaction(
     confirm_plan_sha256: str,
     filesystem: _FilesystemScan,
     allowlist: _AllowlistSnapshot,
+    selected_audio: dict[str, _FileSnapshot],
 ) -> list[HistoricalRepairRecord]:
     try:
         _validate_plan_confirmation(
@@ -1587,6 +1739,7 @@ def _enqueue_historical_repairs_transaction(
             repairs,
             limit=plan.limit,
             ignore_batch_id=plan.batch_id,
+            audio_content_by_path=selected_audio,
         )
         if recalculated != plan:
             raise ValueError
@@ -1601,9 +1754,10 @@ def _enqueue_historical_repairs_transaction(
                 INSERT INTO historical_translation_repairs (
                   id, batch_id, job_id, movie_code, allowlist_sha256, state,
                   attempt_count, next_attempt_at, reason_code, japanese_sha256,
-                  audio_snapshot_sha256, source_english_sha256, english_sha256,
+                  audio_probe_snapshot_sha256, audio_sha256,
+                  source_english_sha256, english_sha256,
                   created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     repair_id,
@@ -1613,7 +1767,8 @@ def _enqueue_historical_repairs_transaction(
                     plan.allowlist_sha256,
                     HistoricalRepairState.PENDING.value,
                     item.japanese_sha256,
-                    item.audio_snapshot_sha256,
+                    item.audio_probe_snapshot_sha256,
+                    item.audio_sha256,
                     item.english_sha256,
                     now,
                     now,

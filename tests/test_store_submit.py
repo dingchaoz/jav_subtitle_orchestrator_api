@@ -249,7 +249,7 @@ def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
         }
         repair = conn.execute(
             "SELECT state, reason_code, source_english_sha256, "
-            "audio_snapshot_sha256, english_sha256 "
+            "audio_probe_snapshot_sha256, audio_sha256, english_sha256 "
             "FROM historical_translation_repairs WHERE id = 'repair_legacy'"
         ).fetchone()
         first_schema = conn.execute(
@@ -274,13 +274,14 @@ def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
 
     assert "source_english_sha256" in columns
     assert columns["source_english_sha256"]["notnull"] == 1
-    assert columns["audio_snapshot_sha256"]["notnull"] == 1
-    assert "audio_sha256" not in columns
+    assert columns["audio_probe_snapshot_sha256"]["notnull"] == 1
+    assert columns["audio_sha256"]["notnull"] == 1
     assert repair["source_english_sha256"] == legacy_english_sha256
-    assert repair["audio_snapshot_sha256"] == "0" * 64
+    assert repair["audio_probe_snapshot_sha256"] == "0" * 64
+    assert repair["audio_sha256"] == "b" * 64
     assert repair["english_sha256"] == legacy_english_sha256
     assert repair["state"] == "permanent_failed"
-    assert repair["reason_code"] == "migration_audio_snapshot_unavailable"
+    assert repair["reason_code"] == "migration_audio_probe_snapshot_unavailable"
     assert remigrated["source_english_sha256"] == legacy_english_sha256
     assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
     assert foreign_key_violations == []
@@ -370,9 +371,11 @@ def test_initialize_safely_fails_runnable_legacy_repairs_missing_identity(
         ).fetchall()
 
     assert columns["source_english_sha256"]["notnull"] == 1
-    assert repairs["repair_source"]["state"] == "pending"
+    assert repairs["repair_source"]["state"] == "permanent_failed"
     assert repairs["repair_source"]["source_english_sha256"] == "e" * 64
-    assert repairs["repair_source"]["reason_code"] is None
+    assert repairs["repair_source"]["reason_code"] == (
+        "migration_audio_content_sha256_unavailable"
+    )
     assert repairs["repair_missing"]["state"] == "permanent_failed"
     assert repairs["repair_missing"]["source_english_sha256"] == "0" * 64
     assert repairs["repair_missing"]["reason_code"] == (

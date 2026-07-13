@@ -3,73 +3,60 @@
 ## Scope
 
 Harden historical repair planning/enqueue so large audio files never create a
-long SQLite lock, legacy repair rows have strict immutable identity, and private
-plan output closes its final in-function parent-swap window. Production repair,
-upload, deletion, and requeue behavior is out of scope.
+long SQLite lock, while every selected repair has a true audio preservation
+hash. Production repair, upload, deletion, and requeue remain out of scope.
 
 ## Lock and snapshot model
 
-Both plan and enqueue use this order:
+Planning and enqueue use three phases without a root-lock upgrade:
 
-1. Acquire the jobs-root exclusive cooperative lock.
-2. Open the bounded allowlist through an `O_NOFOLLOW` directory chain, retain
-   its parent/file descriptors through commit, and build a complete bounded
-   filesystem view from its initial exact bytes.
-3. Fully hash Japanese/English SRT files, each capped by
-   `MAX_SUBTITLE_BYTES`.
-4. Validate audio as RIFF/WAVE using bounded positioned reads and seeks. Persist
-   a canonical metadata fingerprint named `audio_snapshot_sha256`; it includes
-   size, mtime, validated format/data offsets and sizes, and derived duration,
-   but never claims to be an audio content hash.
-5. Recheck the runtime inode/stat bindings.
-6. Revalidate the allowlist path/inode/stat, then begin the short SQLite
-   transaction, read jobs and repair rows once, and recompute the plan from the
-   prescanned view. Immediately before insert, exactly reread and hash only the
-   bounded allowlist through its retained fd.
-7. Commit the SQLite transaction before releasing the jobs-root lock.
+1. Under jobs-root EX, retain bounded allowlist descriptors, fully hash bounded
+   Japanese/English SRT files, and scan every allowlisted WAV with at most
+   `MAX_AUDIO_PROBE_BYTES`. `audio_probe_snapshot_sha256` fingerprints validated
+   structure, selected samples, stat metadata, and duration for eligibility and
+   deterministic counts. It is never a preservation proof.
+2. Release EX. Under jobs-root SH and one selected job SH at a time, read every
+   byte of `audio.wav` for only the selected `<= limit` items. Persist that true
+   content digest as `audio_sha256`. No SQLite transaction is open; unrelated
+   normal writers can take their own job EX lock.
+3. Release SH, reacquire jobs-root EX, repeat the complete bounded scan, and
+   compare each selected dev/inode/ctime/size/mtime identity with its full-hash
+   snapshot. Then use one short SQLite snapshot/transaction to validate the
+   selection and insert records. Root EX remains held through commit.
 
-No job-file read, hash, stat, or seek occurs after `BEGIN IMMEDIATE`; the sole
-exception is the explicitly bounded allowlist exact verification (at most 1
-MiB). Windows/API SQLite writers remain unblocked throughout the full job-file
-scan. Cooperative Mac file writers remain blocked by the root lock until the
-short transaction commits, preventing a stale file snapshot from being
-accepted.
-
-Planning uses the same root-first order and an explicit short read transaction,
-so its jobs and repair rows come from one SQLite snapshot.
+No job file is read after `BEGIN IMMEDIATE`; only the retained allowlist fd may
+be reread, capped at 1 MiB. The allowlist parent/file descriptors remain pinned
+through the final commit. Any filesystem, allowlist, selection, or database
+identity change fails with `historical_plan_changed` and is safe to retry.
 
 ## Persistent schema
 
-Plan format version 2 replaces `audio_sha256` with
-`audio_snapshot_sha256`. Reports expose deterministic `scan_entries` and
-`audio_probe_max_bytes`; wall-clock duration is not part of a replayable plan.
+Strict plan format version 3 and `historical_translation_repairs` both carry:
 
-`historical_translation_repairs` is rebuilt transactionally when its legacy
-shape is detected. The new table has both `source_english_sha256` and
-`audio_snapshot_sha256` as `NOT NULL`. A legacy non-null English hash is copied
-to the immutable source field. Missing legacy source identity receives the
-all-zero valid digest sentinel. Runnable rows lacking source identity become
-`permanent_failed` with `migration_source_english_unavailable`. Legacy audio
-content hashes are not relabeled as metadata fingerprints; runnable rows that
-only have the old audio field become permanent failures with
-`migration_audio_snapshot_unavailable`. Existing IDs, batch/job identity,
-timestamps, foreign keys, uniqueness, and indexes are preserved.
+- `audio_probe_snapshot_sha256`: bounded scan fingerprint only;
+- `audio_sha256`: true byte-for-byte preservation hash for the selected item;
+- `source_english_sha256`: immutable pre-repair English identity.
+
+Legacy content hashes are never relabeled as probes, and legacy probe-only rows
+never masquerade as preservation hashes. Runnable rows missing either identity
+become `permanent_failed` with
+`migration_audio_probe_snapshot_unavailable` or
+`migration_audio_content_sha256_unavailable`. Missing source English identity
+uses `migration_source_english_unavailable`. IDs, batch/job identity, timestamps,
+foreign keys, uniqueness, and indexes are preserved transactionally.
 
 ## Private plan writer
 
 After linking the final file, removing the temporary link, and syncing the held
-parent directory, the writer performs one last parent-path binding check plus a
-target inode/type/mode check. If it fails, cleanup through the held parent fd
-removes only the target with the inode created by this invocation. A rename
-after the function returns is outside the function's control; the last window
-inside the function is closed.
+parent directory, the writer performs a final parent-path and target
+inode/type/mode check. Failure cleanup uses the held parent fd and removes only
+the inode created by the invocation.
 
 ## Verification
 
-Tests instrument audio probe reads against a sparse tens-of-gigabytes file,
-prove SQLite writers can commit during the prescan, assert no job-file calls
-occur inside the write transaction, bound the one allowlist reread, verify
-explicit read-snapshot planning, exercise real legacy table rebuilds, and
-trigger the exact parent swap after the second binding check. Existing
-idempotency, tamper rejection, bounded file descriptor, lock order, and full
-test suites remain green.
+Tests prove a non-selected 32 GiB sparse WAV receives only bounded probe reads;
+only selected records up to the batch limit receive full-content reads; an
+unrelated normal writer proceeds during selected hashing; sampled audio mutation
+is rejected even if mtime is restored; SQLite writers proceed during prescan;
+and migration, replay identity, allowlist, transaction, descriptor, and private
+plan safety contracts remain green.

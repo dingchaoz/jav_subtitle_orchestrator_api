@@ -718,6 +718,11 @@ git commit -m "feat: enqueue bounded historical repairs"
 
 ## Task 6: Implement normal-first historical scheduling
 
+**Preservation contract:** Task 5 persists both a bounded
+`audio_probe_snapshot_sha256` and the selected file's true byte-for-byte
+`audio_sha256`. Task 6 must compare the latter before success or failure. The
+probe fingerprint is never sufficient preservation evidence.
+
 **Files:**
 - Modify: `orchestrator/store.py`
 - Modify: `orchestrator/mac_worker.py`
@@ -836,7 +841,9 @@ An in-flight historical unit may finish publication/catalog sync. After it reach
 terminal/retry-wait state, a normal job wins before another repair. Historical
 deterministic failures update the repair counter and pause at three; normal failure
 behavior remains unchanged. Reuse the existing collision-safe `rejected/` quarantine;
-compare Japanese/audio snapshots before marking either historical success or failure.
+compare the Japanese content hash and true `audio_sha256` before marking either
+historical success or failure. Never substitute
+`audio_probe_snapshot_sha256` for that preservation comparison.
 
 - [ ] **Step 4: Verify all scheduling regressions**
 

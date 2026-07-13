@@ -5,13 +5,20 @@
 **Goal:** Make historical batch snapshots bounded, transactionally consistent,
 and migration-safe without performing job-file I/O under a SQLite write lock.
 
-**Architecture:** Hold jobs-root EX while creating a bounded filesystem view,
-then open a short SQLite transaction and build the plan solely from that view
-and one database snapshot. Persist a RIFF metadata fingerprint rather than an
-audio content hash, atomically rebuild incompatible legacy repair tables, and
-perform a final parent/target verification in the private plan writer.
+**Architecture:** Use root EX for bounded complete scans, root SH plus each
+selected job SH for full audio hashing outside SQLite, then root EX through the
+short final transaction. Persist the RIFF probe fingerprint separately from the
+selected file's true content hash, atomically rebuild incompatible legacy
+repair tables, and perform final parent/target verification in the private plan
+writer.
 
 **Tech Stack:** Python 3.12, SQLite/WAL, POSIX `fcntl`/`openat`/`pread`, pytest.
+
+> **Version 3 preservation correction:** `audio_probe_snapshot_sha256` is only
+> the bounded complete-scan fingerprint. Every selected plan item and repair row
+> also stores the true byte-for-byte `audio_sha256`; Task 6 must use only that
+> content hash to prove audio preservation. Full hashing is limited to selected
+> items and runs outside SQLite and outside jobs-root EX.
 
 ---
 
@@ -24,14 +31,15 @@ perform a final parent/target verification in the private plan writer.
 - Test: `tests/test_store_worker_claims.py`
 
 - [x] Add failing strict-schema and sparse-WAV tests expecting
-  `audio_snapshot_sha256`, deterministic probe metadata, and no more than
+  `audio_probe_snapshot_sha256`, deterministic probe metadata, and no more than
   `MAX_AUDIO_PROBE_BYTES` bytes read from a tens-of-gigabytes sparse file.
-- [x] Run the new tests and confirm they fail on the old `audio_sha256` full
-  file hash.
+- [x] Prove a non-selected 32 GiB WAV receives only bounded probe reads and the
+  selected limit receives true full-content hashes.
 - [x] Add a bounded RIFF/WAVE parser with fixed read-byte and chunk-count
-  budgets; include only canonical persisted metadata in its SHA-256.
-- [x] Bump the strict plan version and rename all plan/record/schema identity
-  fields to `audio_snapshot_sha256`.
+  budgets; include canonical structure, stat metadata, and bounded sample
+  digests in its probe SHA-256.
+- [x] Bump the strict plan version and split probe identity from true
+  `audio_sha256` preservation identity.
 - [x] Run the focused tests to green.
 
 ### Task 2: Filesystem prescan before short SQLite transaction

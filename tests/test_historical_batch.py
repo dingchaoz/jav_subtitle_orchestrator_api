@@ -144,7 +144,8 @@ def test_sparse_tens_of_gigabytes_audio_uses_bounded_wav_probe(
     import orchestrator.historical_batch as historical_batch
 
     store = _store(sqlite_path, mac_jobs_root)
-    _, paths = _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-001")
+    _, paths = _job(store, mac_jobs_root, "zzz-001")
     with paths.audio_path_mac.open("r+b") as audio_file:
         audio_file.truncate(32 * 1024**3)
     audio_inode = paths.audio_path_mac.stat().st_ino
@@ -169,15 +170,178 @@ def test_sparse_tens_of_gigabytes_audio_uses_bounded_wav_probe(
     monkeypatch.setattr(historical_batch.os, "read", bounded_read)
     monkeypatch.setattr(historical_batch.os, "pread", bounded_pread)
     allowlist = tmp_path / "allowlist.txt"
-    allowlist.write_text("abc-001\n")
+    allowlist.write_text("abc-001\nzzz-001\n")
 
     plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
 
     assert len(plan.items) == 1
     item = plan.items[0]
-    assert len(item.audio_snapshot_sha256) == 64
-    assert not hasattr(item, "audio_sha256")
+    assert item.movie_code == "abc-001"
+    assert len(item.audio_probe_snapshot_sha256) == 64
+    assert len(item.audio_sha256) == 64
     assert 0 < bytes_requested <= historical_batch.MAX_AUDIO_PROBE_BYTES
+
+
+def test_plan_full_hashes_every_byte_only_for_selected_limit(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    paths_by_inode = {}
+    for index in range(1, 8):
+        _, paths = _job(store, mac_jobs_root, f"abc-{index:03d}")
+        paths.audio_path_mac.write_bytes(_wav(data_size=64 + 2 * index))
+        paths_by_inode[paths.audio_path_mac.stat().st_ino] = (
+            index,
+            paths.audio_path_mac.stat().st_size,
+        )
+    bytes_read = {index: 0 for index in range(1, 8)}
+    real_read = historical_batch.os.read
+
+    def tracked_read(fd, size):
+        chunk = real_read(fd, size)
+        tracked = paths_by_inode.get(os.fstat(fd).st_ino)
+        if tracked is not None:
+            bytes_read[tracked[0]] += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(historical_batch.os, "read", tracked_read)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("".join(f"abc-{index:03d}\n" for index in range(1, 8)))
+
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=5)
+
+    assert [item.movie_code for item in plan.items] == [
+        "abc-001", "abc-002", "abc-003", "abc-004", "abc-005"
+    ]
+    assert all(
+        item.audio_sha256
+        == hashlib.sha256(
+            (mac_jobs_root / item.path_movie_number / "audio.wav").read_bytes()
+        ).hexdigest()
+        for item in plan.items
+    )
+    assert bytes_read == {
+        index: (size if index <= 5 else 0)
+        for index, size in paths_by_inode.values()
+    }
+
+
+def test_selected_full_hash_does_not_block_unrelated_normal_writer(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+    from orchestrator.job_files_lock import exclusive_job_files_lock
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-002")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    hashing = threading.Event()
+    release = threading.Event()
+    real_open = historical_batch._open_stable_regular_file_at
+
+    def paused_open(directory_fd, basename, *, keep_content, max_bytes=None):
+        if basename == "audio.wav" and max_bytes is None:
+            hashing.set()
+            assert release.wait(2)
+        return real_open(
+            directory_fd,
+            basename,
+            keep_content=keep_content,
+            max_bytes=max_bytes,
+        )
+
+    monkeypatch.setattr(historical_batch, "_open_stable_regular_file_at", paused_open)
+    outcome = []
+    planner = threading.Thread(
+        target=lambda: outcome.append(
+            historical_batch.plan_historical_batch(store, allowlist, limit=1)
+        )
+    )
+    planner.start()
+    assert hashing.wait(2)
+    with exclusive_job_files_lock(mac_jobs_root, "abc-002", blocking=False):
+        pass
+    release.set()
+    planner.join(timeout=2)
+    assert not planner.is_alive()
+    assert len(outcome) == 1
+
+
+def test_enqueue_rejects_audio_byte_mutation_even_when_mtime_is_restored(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    original_stat = paths.audio_path_mac.stat()
+    real_hash = historical_batch._hash_selected_audio
+
+    def hash_then_mutate(*args, **kwargs):
+        snapshots = real_hash(*args, **kwargs)
+        with paths.audio_path_mac.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            stream.write(b"X")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.utime(
+            paths.audio_path_mac,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        return snapshots
+
+    monkeypatch.setattr(historical_batch, "_hash_selected_audio", hash_then_mutate)
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_enqueue_rejects_selected_audio_inode_change_after_full_hash(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    real_hash = historical_batch._hash_selected_audio
+
+    def hash_then_replace(*args, **kwargs):
+        snapshots = real_hash(*args, **kwargs)
+        before = paths.audio_path_mac.stat()
+        replacement = paths.job_dir_mac / ".replacement.audio.wav"
+        replacement.write_bytes(paths.audio_path_mac.read_bytes())
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(replacement, paths.audio_path_mac)
+        return snapshots
+
+    monkeypatch.setattr(historical_batch, "_hash_selected_audio", hash_then_replace)
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
 
 
 @pytest.mark.parametrize("limit", [0, 21, -1, True])
@@ -430,6 +594,8 @@ def test_plan_json_parser_rejects_extra_missing_bool_counts_and_tampering(
         lambda value: value.update(version=99),
         lambda value: value.update(plan_sha256="A" * 64),
         lambda value: value["items"][0].update(extra="unsafe"),
+        lambda value: value["items"][0].pop("audio_probe_snapshot_sha256"),
+        lambda value: value["items"][0].pop("audio_sha256"),
     ):
         changed = json.loads(json.dumps(payload))
         mutate(changed)
@@ -467,6 +633,13 @@ def test_enqueue_inserts_pending_without_mutating_job_and_is_idempotent(
     assert first[0].movie_code == "abc-001"
     assert first[0].state is HistoricalRepairState.PENDING
     assert first[0].source_english_sha256 == plan.items[0].english_sha256
+    assert first[0].audio_probe_snapshot_sha256 == (
+        plan.items[0].audio_probe_snapshot_sha256
+    )
+    assert first[0].audio_sha256 == hashlib.sha256(
+        paths.audio_path_mac.read_bytes()
+    ).hexdigest()
+    assert first[0].audio_sha256 == plan.items[0].audio_sha256
     assert first[0].english_sha256 is None
     assert store.get_job(job.id) == before_job
     assert _tree_snapshot(mac_jobs_root) == before_files
@@ -627,7 +800,7 @@ def test_plan_and_enqueue_read_database_only_inside_explicit_transactions(
     )
 
     assert len(records) == 1
-    assert transaction_modes == ["transaction", "transaction"]
+    assert transaction_modes == ["transaction", "transaction", "transaction"]
 
 
 def test_plan_jobs_and_repairs_share_one_sqlite_snapshot(
@@ -661,10 +834,10 @@ def test_plan_jobs_and_repairs_share_one_sqlite_snapshot(
                         """
                         INSERT INTO historical_translation_repairs (
                           id, batch_id, job_id, movie_code, allowlist_sha256,
-                          state, japanese_sha256, audio_snapshot_sha256,
-                          source_english_sha256, english_sha256,
+                          state, japanese_sha256, audio_probe_snapshot_sha256,
+                          audio_sha256, source_english_sha256, english_sha256,
                           created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                         """,
                         (
                             "repair_interleaved",
@@ -675,6 +848,7 @@ def test_plan_jobs_and_repairs_share_one_sqlite_snapshot(
                             "pending",
                             "j" * 64,
                             "f" * 64,
+                            "b" * 64,
                             "e" * 64,
                             "2026-07-01T00:00:00+00:00",
                             "2026-07-01T00:00:00+00:00",
@@ -690,11 +864,10 @@ def test_plan_jobs_and_repairs_share_one_sqlite_snapshot(
         interleaving_connection,
     )
 
-    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.plan_historical_batch(store, allowlist, limit=1)
 
     assert inserted is True
-    assert plan.eligible_total == 1
-    assert plan.already_repaired == 0
     with store.connection() as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM historical_translation_repairs "
@@ -1014,7 +1187,8 @@ def test_terminal_replay_uses_immutable_source_hash_and_performs_zero_writes(
         ("job_id", "use_second_job"),
         ("movie_code", "tampered-999"),
         ("allowlist_sha256", "0" * 64),
-        ("audio_snapshot_sha256", "0" * 64),
+        ("audio_probe_snapshot_sha256", "0" * 64),
+        ("audio_sha256", "0" * 64),
         ("source_english_sha256", "0" * 64),
     ],
 )

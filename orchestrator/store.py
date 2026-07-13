@@ -259,7 +259,8 @@ class HistoricalRepairRecord:
     next_attempt_at: str | None
     reason_code: str | None
     japanese_sha256: str
-    audio_snapshot_sha256: str
+    audio_probe_snapshot_sha256: str
+    audio_sha256: str
     source_english_sha256: str
     english_sha256: str | None
     created_at: str
@@ -282,7 +283,8 @@ def _create_historical_translation_repairs_table(
           next_attempt_at TEXT,
           reason_code TEXT,
           japanese_sha256 TEXT NOT NULL,
-          audio_snapshot_sha256 TEXT NOT NULL,
+          audio_probe_snapshot_sha256 TEXT NOT NULL,
+          audio_sha256 TEXT NOT NULL,
           source_english_sha256 TEXT NOT NULL,
           english_sha256 TEXT,
           created_at TEXT NOT NULL,
@@ -324,11 +326,13 @@ def _initialize_historical_translation_repairs(
         if not required_legacy_columns <= columns.keys():
             raise RuntimeError("historical repair schema is not migratable")
         current = (
-            "audio_snapshot_sha256" in columns
-            and columns["audio_snapshot_sha256"]["notnull"] == 1
+            "audio_probe_snapshot_sha256" in columns
+            and columns["audio_probe_snapshot_sha256"]["notnull"] == 1
+            and "audio_sha256" in columns
+            and columns["audio_sha256"]["notnull"] == 1
             and "source_english_sha256" in columns
             and columns["source_english_sha256"]["notnull"] == 1
-            and "audio_sha256" not in columns
+            and "audio_snapshot_sha256" not in columns
         )
         if not current:
             legacy_table = "historical_translation_repairs_legacy_migration"
@@ -349,22 +353,37 @@ def _initialize_historical_translation_repairs(
                 if "source_english_sha256" in columns
                 else "english_sha256 IS NULL"
             )
-            if "audio_snapshot_sha256" in columns:
-                audio_expression = (
+            if "audio_probe_snapshot_sha256" in columns:
+                audio_probe_expression = (
+                    "COALESCE(audio_probe_snapshot_sha256, "
+                    f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
+                )
+                audio_probe_unavailable = "audio_probe_snapshot_sha256 IS NULL"
+            elif "audio_snapshot_sha256" in columns:
+                audio_probe_expression = (
                     "COALESCE(audio_snapshot_sha256, "
                     f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
                 )
-                audio_unavailable = "audio_snapshot_sha256 IS NULL"
+                audio_probe_unavailable = "audio_snapshot_sha256 IS NULL"
             else:
-                audio_expression = f"'{UNAVAILABLE_HISTORICAL_SHA256}'"
-                audio_unavailable = "1"
+                audio_probe_expression = f"'{UNAVAILABLE_HISTORICAL_SHA256}'"
+                audio_probe_unavailable = "1"
+            if "audio_sha256" in columns:
+                audio_content_expression = (
+                    "COALESCE(audio_sha256, "
+                    f"'{UNAVAILABLE_HISTORICAL_SHA256}')"
+                )
+                audio_content_unavailable = "audio_sha256 IS NULL"
+            else:
+                audio_content_expression = f"'{UNAVAILABLE_HISTORICAL_SHA256}'"
+                audio_content_unavailable = "1"
             runnable = (
                 "state IN ('planned', 'pending', 'running', "
                 "'retry_wait', 'paused')"
             )
             unavailable_runnable = (
                 f"({runnable} AND (({source_unavailable}) OR "
-                f"({audio_unavailable})))"
+                f"({audio_probe_unavailable}) OR ({audio_content_unavailable})))"
             )
             state_expression = (
                 f"CASE WHEN {unavailable_runnable} THEN 'permanent_failed' "
@@ -373,8 +392,10 @@ def _initialize_historical_translation_repairs(
             reason_expression = (
                 f"CASE WHEN {runnable} AND ({source_unavailable}) THEN "
                 "'migration_source_english_unavailable' "
-                f"WHEN {runnable} AND ({audio_unavailable}) THEN "
-                "'migration_audio_snapshot_unavailable' "
+                f"WHEN {runnable} AND ({audio_probe_unavailable}) THEN "
+                "'migration_audio_probe_snapshot_unavailable' "
+                f"WHEN {runnable} AND ({audio_content_unavailable}) THEN "
+                "'migration_audio_content_sha256_unavailable' "
                 "ELSE reason_code END"
             )
             next_attempt_expression = (
@@ -394,13 +415,15 @@ def _initialize_historical_translation_repairs(
                 INSERT INTO historical_translation_repairs (
                   id, batch_id, job_id, movie_code, allowlist_sha256, state,
                   attempt_count, next_attempt_at, reason_code, japanese_sha256,
-                  audio_snapshot_sha256, source_english_sha256, english_sha256,
+                  audio_probe_snapshot_sha256, audio_sha256,
+                  source_english_sha256, english_sha256,
                   created_at, updated_at
                 )
                 SELECT
                   id, batch_id, job_id, movie_code, allowlist_sha256,
                   {state_expression}, attempt_count, {next_attempt_expression},
-                  {reason_expression}, japanese_sha256, {audio_expression},
+                  {reason_expression}, japanese_sha256,
+                  {audio_probe_expression}, {audio_content_expression},
                   {source_expression}, english_sha256, created_at, updated_at
                 FROM {legacy_table}
                 """
@@ -1345,8 +1368,10 @@ class JobStore:
         from orchestrator.historical_batch import (
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
+            _hash_selected_audio,
             _open_allowlist_snapshot,
             _require_allowlist_unchanged,
+            _require_selected_audio_identity,
             _scan_filesystem,
             find_idempotent_historical_enqueue,
         )
@@ -1362,12 +1387,20 @@ class JobStore:
         )
         if existing is not None:
             return existing
-        with exclusive_jobs_root_lock(
-            self.jobs_root_mac,
-            blocking=True,
-        ) as root_lock:
-            with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+        with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+            selected_audio = _hash_selected_audio(self.jobs_root_mac, plan.items)
+            if any(
+                selected_audio.get(item.path_movie_number) is None
+                or selected_audio[item.path_movie_number].sha256 != item.audio_sha256
+                for item in plan.items
+            ):
+                raise ValueError("historical_plan_changed")
+            with exclusive_jobs_root_lock(
+                self.jobs_root_mac,
+                blocking=True,
+            ) as root_lock:
                 filesystem = _scan_filesystem(root_lock, allowlist)
+                _require_selected_audio_identity(filesystem, selected_audio)
                 _require_allowlist_unchanged(allowlist, exact=False)
                 with self.connection() as conn:
                     conn.execute("BEGIN IMMEDIATE")
@@ -1378,6 +1411,7 @@ class JobStore:
                         confirm_plan_sha256=confirm_plan_sha256,
                         filesystem=filesystem,
                         allowlist=allowlist,
+                        selected_audio=selected_audio,
                     )
 
     def prepare_catalog_publication_repair(

@@ -157,6 +157,9 @@ Store repair intent separately from normal job status. Each repair record contai
 - structured reason code without subtitle text;
 - timestamps; and
 - hashes needed to prove Japanese/audio preservation and English publication.
+  Audio preservation specifically uses the true byte-for-byte `audio_sha256`;
+  the bounded `audio_probe_snapshot_sha256` is eligibility/scan identity only
+  and must never be accepted as preservation evidence.
 
 Planning is GET/read-only and prints what would be repaired, quarantined, requeued,
 and overwritten. Applying a plan requires its digest, the same allowlist, and a
@@ -191,7 +194,8 @@ normal jobs.
 
 For each claimed repair:
 
-1. snapshot Japanese SRT and audio hashes;
+1. snapshot the Japanese SRT hash and verify the repair record's true
+   byte-for-byte `audio_sha256` (never the bounded probe fingerprint);
 2. preserve the Japanese SRT and `audio.wav` in place;
 3. move the old English SRT to `rejected/` with a collision-safe name;
 4. translate only from the existing Japanese SRT;
