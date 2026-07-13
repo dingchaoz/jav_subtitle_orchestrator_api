@@ -16,6 +16,15 @@ from orchestrator.subtitle_quality import validate_translation_quality
 from orchestrator.supabase_publisher import build_ai_subtitle_storage_path
 
 
+OPTIONAL_JOB_PROJECTIONS = {
+    "publish_attempt_count": "0 AS publish_attempt_count",
+    "next_publish_attempt_at": "NULL AS next_publish_attempt_at",
+    "catalog_movie_uuid": "NULL AS catalog_movie_uuid",
+    "metadata_status": "NULL AS metadata_status",
+    "metadata_source": "NULL AS metadata_source",
+}
+
+
 @dataclass(frozen=True)
 class CatalogRepairPlan:
     job_id: str
@@ -52,9 +61,20 @@ def plan_catalog_repairs(
     )
     database_uri = f"file:{store.db_path.resolve()}?mode=ro"
     with sqlite3.connect(database_uri, uri=True) as connection:
+        existing_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        optional_projection = [
+            column
+            if column in existing_columns
+            else fallback
+            for column, fallback in OPTIONAL_JOB_PROJECTIONS.items()
+        ]
+        select_projection = ", ".join(
+            ["id", "normalized_movie_number", "status", *optional_projection]
+        )
         rows = connection.execute(
-            "SELECT id, normalized_movie_number, status, catalog_movie_uuid, "
-            "metadata_status, metadata_source FROM jobs "
+            f"SELECT {select_projection} FROM jobs "
             "ORDER BY priority ASC, created_at ASC, "
             "normalized_movie_number ASC, id ASC"
         ).fetchall()
@@ -64,6 +84,8 @@ def plan_catalog_repairs(
         job_id,
         normalized_movie_number,
         status,
+        _publish_attempt_count,
+        _next_publish_attempt_at,
         catalog_movie_uuid,
         metadata_status,
         metadata_source,

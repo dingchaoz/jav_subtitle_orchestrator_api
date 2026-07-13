@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 import requests
@@ -169,6 +170,59 @@ def test_catalog_repair_excludes_verified_ready_publication_but_keeps_legacy_rea
     plans = plan_catalog_repairs(store, allowlist=None, limit=100)
 
     assert [plan.job_id for plan in plans] == [legacy.id]
+
+
+def test_catalog_repair_supports_legacy_database_without_writing(
+    sqlite_path, mac_jobs_root
+):
+    with sqlite3.connect(sqlite_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                movie_number TEXT NOT NULL,
+                normalized_movie_number TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO jobs (
+                id, movie_number, normalized_movie_number, status,
+                priority, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-job",
+                "ABC11",
+                "abc-011",
+                "english_srt_ready",
+                1,
+                "2025-01-01T00:00:00+00:00",
+                "2025-01-01T00:00:00+00:00",
+            ),
+        )
+    paths = _write_subtitles(mac_jobs_root, "abc-011")
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    before_database_files = {
+        path.name: path.read_bytes()
+        for path in sqlite_path.parent.glob(f"{sqlite_path.name}*")
+    }
+
+    plans = plan_catalog_repairs(store, allowlist=None, limit=100)
+
+    assert [plan.job_id for plan in plans] == ["legacy-job"]
+    assert plans[0].current_status == "english_srt_ready"
+    assert plans[0].metadata_path is None
+    assert plans[0].english_srt == str(paths.english_srt_path_mac)
+    assert {
+        path.name: path.read_bytes()
+        for path in sqlite_path.parent.glob(f"{sqlite_path.name}*")
+    } == before_database_files
 
 
 def test_catalog_repair_is_network_database_and_filesystem_read_only(
