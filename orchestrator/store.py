@@ -22,6 +22,8 @@ _VERIFIED_METADATA_SOURCES = frozenset(
 )
 _LOWERCASE_HEX_DIGITS = frozenset("0123456789abcdef")
 MAX_PUBLICATION_CANARY_SRT_BYTES = 32 * 1024 * 1024
+NORMAL_TRANSLATION_ORIGIN = "normal"
+HISTORICAL_TRANSLATION_ORIGIN = "historical"
 
 
 def _validate_expected_sha256(value: str, label: str) -> None:
@@ -295,7 +297,7 @@ class JobStore:
     def initialize(self) -> None:
         with self.connection() as conn:
             conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS jobs (
                   id TEXT PRIMARY KEY,
                   movie_number TEXT NOT NULL,
@@ -307,7 +309,7 @@ class JobStore:
                   translation_attempt_count INTEGER NOT NULL DEFAULT 0,
                   publish_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_publish_attempt_at TEXT,
-                  translation_origin TEXT NOT NULL DEFAULT 'normal',
+                  translation_origin TEXT NOT NULL DEFAULT '{NORMAL_TRANSLATION_ORIGIN}',
                   published_subtitle_id TEXT,
                   published_storage_path TEXT,
                   published_content_sha256 TEXT,
@@ -354,7 +356,9 @@ class JobStore:
                 if column not in columns:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
             durable_state_columns = {
-                "translation_origin": "TEXT NOT NULL DEFAULT 'normal'",
+                "translation_origin": (
+                    f"TEXT NOT NULL DEFAULT '{NORMAL_TRANSLATION_ORIGIN}'"
+                ),
                 "published_subtitle_id": "TEXT",
                 "published_storage_path": "TEXT",
                 "published_content_sha256": "TEXT",
@@ -1785,6 +1789,7 @@ class JobStore:
             JobStatus.TRANSCRIPTION_DONE,
             JobStatus.TRANSLATING,
             JobStatus.PUBLISHING,
+            JobStatus.CATALOG_SYNCING,
         }:
             return SubmitResult(kind="conflict", movie_number=movie_number, job=existing)
         now = utc_now_iso()
@@ -1794,6 +1799,7 @@ class JobStore:
             JobStatus.TRANSCRIPTION_DONE.value,
             JobStatus.TRANSLATING.value,
             JobStatus.PUBLISHING.value,
+            JobStatus.CATALOG_SYNCING.value,
         )
         cursor = conn.execute(
             """
@@ -1801,6 +1807,10 @@ class JobStore:
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
                 error = NULL, translation_attempt_count = 0,
                 publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                translation_origin = ?, published_subtitle_id = NULL,
+                published_storage_path = NULL, published_content_sha256 = NULL,
+                published_file_size = NULL, catalog_sync_attempt_count = 0,
+                next_catalog_sync_attempt_at = NULL,
                 catalog_movie_uuid = NULL, metadata_status = NULL,
                 metadata_source = NULL,
                 metadata_path_mac = NULL, audio_path_mac = NULL,
@@ -1808,9 +1818,15 @@ class JobStore:
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
-              AND status NOT IN (?, ?, ?, ?, ?)
+              AND status NOT IN (?, ?, ?, ?, ?, ?)
             """,
-            (JobStatus.QUEUED.value, now, existing.id, *active_statuses),
+            (
+                JobStatus.QUEUED.value,
+                now,
+                NORMAL_TRANSLATION_ORIGIN,
+                existing.id,
+                *active_statuses,
+            ),
         )
         if cursor.rowcount == 0:
             job = self.get_job(existing.id, conn=conn)

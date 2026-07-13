@@ -97,7 +97,9 @@ def test_initialize_adds_catalog_and_historical_repair_schema(
         "catalog_sync_attempt_count",
         "next_catalog_sync_attempt_at",
     } <= job_columns.keys()
-    assert job_columns["translation_origin"]["dflt_value"] == "'normal'"
+    assert job_columns["translation_origin"]["dflt_value"] == (
+        f"'{store_module.NORMAL_TRANSLATION_ORIGIN}'"
+    )
     assert job_columns["catalog_sync_attempt_count"]["dflt_value"] == "0"
     assert {
         "id",
@@ -136,7 +138,7 @@ def test_job_record_reads_durable_catalog_fields_without_fallbacks(
             "published_file_size = ?, catalog_sync_attempt_count = ?, "
             "next_catalog_sync_attempt_at = ? WHERE id = ?",
             (
-                "historical_repair",
+                store_module.HISTORICAL_TRANSLATION_ORIGIN,
                 "subtitle-uuid",
                 "subtitles/abc-099.srt",
                 "a" * 64,
@@ -149,7 +151,7 @@ def test_job_record_reads_durable_catalog_fields_without_fallbacks(
 
     job = store.get_job(job_id)
 
-    assert job.translation_origin == "historical_repair"
+    assert job.translation_origin == store_module.HISTORICAL_TRANSLATION_ORIGIN
     assert job.published_subtitle_id == "subtitle-uuid"
     assert job.published_storage_path == "subtitles/abc-099.srt"
     assert job.published_content_sha256 == "a" * 64
