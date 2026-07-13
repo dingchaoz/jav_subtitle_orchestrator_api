@@ -311,6 +311,7 @@ class MacTranslationWorker:
                 self.worker_id,
                 lambda path: Path(path).exists(),
             )
+            self.consecutive_quality_failures = 0
             ready_message = f"english_srt_ready {job.id}"
         else:
             updated = self.store.complete_mac_translation_quality(
@@ -319,7 +320,6 @@ class MacTranslationWorker:
                 lambda path: Path(path).exists(),
             )
             ready_message = f"publish_pending {job.id}"
-        self.consecutive_quality_failures = 0
         write_job_snapshot(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -389,7 +389,6 @@ class MacTranslationWorker:
             raise MacPublicationQualityError(
                 "quality_gate_failed:" + ",".join(report.reason_codes)
             )
-        self.consecutive_quality_failures = 0
         published = self.publisher.publish_english_ai(
             job.normalized_movie_number,
             paths.english_srt_path_mac,
@@ -404,6 +403,7 @@ class MacTranslationWorker:
             metadata_status=published.metadata_status,
             metadata_source=published.metadata_source,
         )
+        self.consecutive_quality_failures = 0
         write_job_snapshot(updated)
         _append_job_log_safely(
             paths.job_dir_mac,

@@ -451,6 +451,53 @@ def test_publisher_quality_failure_is_permanent_and_quarantines_english(
     assert worker.consecutive_quality_failures == 1
 
 
+def test_three_publisher_quality_failures_stop_before_claiming_fourth_pending_job(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        quality_failure_limit=3,
+        publisher=RecordingPublisher(
+            events,
+            errors=[
+                SubtitleQualityGateError(["subtitle_changed_after_validation"])
+                for _ in range(3)
+            ],
+        ),
+    )
+    pending_jobs = []
+    for movie in ("abc-031", "abc-032", "abc-033", "abc-034"):
+        job = prepare_transcription_done_job(store, mac_jobs_root, movie=movie)
+        claimed = store.claim_translation_job(job.id, worker.worker_id, 60)
+        assert claimed is not None
+        assert worker._process_claimed_translation(claimed) is True
+        assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+        pending_jobs.append(job)
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert worker.consecutive_quality_failures == 3
+    assert all(
+        store.get_job(job.id).status is JobStatus.FAILED
+        for job in pending_jobs[:3]
+    )
+    fourth = store.get_job(pending_jobs[3].id)
+    assert fourth.status is JobStatus.PUBLISH_PENDING
+    assert fourth.claimed_by is None
+    assert [event[0] for event in events] == ["publish", "publish", "publish"]
+    with pytest.raises(MacTranslationUnhealthyError, match="3 consecutive"):
+        worker.process_one()
+
+
 def test_final_publish_attempt_fails_but_preserves_validated_files(
     sqlite_path, mac_jobs_root
 ):
