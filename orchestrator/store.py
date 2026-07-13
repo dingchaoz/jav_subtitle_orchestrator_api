@@ -1345,6 +1345,8 @@ class JobStore:
         from orchestrator.historical_batch import (
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
+            _open_allowlist_snapshot,
+            _require_allowlist_unchanged,
             _scan_filesystem,
             find_idempotent_historical_enqueue,
         )
@@ -1364,19 +1366,19 @@ class JobStore:
             self.jobs_root_mac,
             blocking=True,
         ) as root_lock:
-            filesystem = _scan_filesystem(
-                root_lock,
-                Path(allowlist_path),
-            )
-            with self.connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                return _enqueue_historical_repairs_transaction(
-                    conn,
-                    plan,
-                    Path(allowlist_path),
-                    confirm_plan_sha256=confirm_plan_sha256,
-                    filesystem=filesystem,
-                )
+            with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+                filesystem = _scan_filesystem(root_lock, allowlist)
+                _require_allowlist_unchanged(allowlist, exact=False)
+                with self.connection() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    return _enqueue_historical_repairs_transaction(
+                        conn,
+                        plan,
+                        Path(allowlist_path),
+                        confirm_plan_sha256=confirm_plan_sha256,
+                        filesystem=filesystem,
+                        allowlist=allowlist,
+                    )
 
     def prepare_catalog_publication_repair(
         self,

@@ -3,7 +3,7 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make historical batch snapshots bounded, transactionally consistent,
-and migration-safe without performing file I/O under a SQLite write lock.
+and migration-safe without performing job-file I/O under a SQLite write lock.
 
 **Architecture:** Hold jobs-root EX while creating a bounded filesystem view,
 then open a short SQLite transaction and build the plan solely from that view
@@ -44,8 +44,9 @@ perform a final parent/target verification in the private plan writer.
 - [x] Add failing instrumentation tests that pause prescan and prove an
   unrelated `BEGIN IMMEDIATE` writer commits without waiting for the five-second
   busy timeout.
-- [x] Add a failing guard test that raises if any file snapshot/stat operation
-  occurs after enqueue starts its SQLite write transaction.
+- [x] Add a failing guard test that raises if any job-file snapshot/stat
+  operation occurs after enqueue starts its SQLite write transaction; permit
+  and measure only the bounded allowlist exact verification.
 - [x] Replace transaction-time `_build_plan` file reads with a root-locked
   `_FilesystemScan` created before `BEGIN`; load jobs and repairs once and build
   only from those immutable in-memory views.
@@ -96,5 +97,6 @@ perform a final parent/target verification in the private plan writer.
   render them without paths or subtitle text.
 - [x] Run historical/store focused tests, then full pytest, compileall, and
   `git diff --check`.
-- [x] Inspect the final diff for file I/O after `BEGIN`, schema false claims,
-  and lock-order regressions; commit only after all checks pass.
+- [x] Inspect the final diff for job-file I/O after `BEGIN`, unbounded allowlist
+  verification, schema false claims, and lock-order regressions; commit only
+  after all checks pass.

@@ -7,6 +7,8 @@ import re
 import sqlite3
 import stat
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
 PLAN_VERSION = 2
 MAX_BATCH_LIMIT = 20
 MAX_ALLOWLIST_BYTES = 1024 * 1024
+MAX_ALLOWLIST_VERIFY_BYTES = MAX_ALLOWLIST_BYTES
 MAX_ALLOWLIST_ENTRIES = 10_000
 MAX_SUBTITLE_BYTES = 32 * 1024 * 1024
 MAX_AUDIO_PROBE_BYTES = 4 * 1024
@@ -235,6 +238,72 @@ class _FilesystemScan:
         for path_movie_number in sorted(self.files_by_path):
             self.files_by_path[path_movie_number].require_unchanged(root_lock)
         root_lock.require_bound()
+
+
+@dataclass(frozen=True, slots=True)
+class _AllowlistSnapshot:
+    absolute_path: str
+    parent: Path
+    basename: str
+    parent_fd: int
+    file_fd: int
+    parent_stat: os.stat_result
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    content: bytes
+    sha256: str
+    movies: tuple[str, ...]
+
+    def require_metadata_unchanged(self) -> None:
+        _require_parent_path_bound(self.parent, self.parent_stat)
+        path_stat = os.stat(
+            self.basename,
+            dir_fd=self.parent_fd,
+            follow_symlinks=False,
+        )
+        opened = os.fstat(self.file_fd)
+        expected = (
+            self.device,
+            self.inode,
+            self.size,
+            self.mtime_ns,
+            self.ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or not stat.S_ISREG(opened.st_mode)
+            or (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_size,
+                path_stat.st_mtime_ns,
+                path_stat.st_ctime_ns,
+            )
+            != expected
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            != expected
+        ):
+            raise OSError("allowlist binding changed")
+
+    def require_exact_unchanged(self) -> None:
+        self.require_metadata_unchanged()
+        content = _pread_exact_regular_file(
+            self.file_fd,
+            self.size,
+            max_bytes=MAX_ALLOWLIST_VERIFY_BYTES,
+        )
+        if content != self.content or hashlib.sha256(content).hexdigest() != self.sha256:
+            raise OSError("allowlist content changed")
+        self.require_metadata_unchanged()
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -721,31 +790,131 @@ def _snapshot_three_job_files(
     )
 
 
-def _read_allowlist(path: Path) -> tuple[tuple[str, ...], str, str]:
+def _pread_exact_regular_file(
+    fd: int,
+    size: int,
+    *,
+    max_bytes: int,
+) -> bytes:
+    if size <= 0 or size > max_bytes:
+        raise OSError("bounded file size invalid")
+    result = bytearray()
+    while len(result) < size:
+        chunk = os.pread(
+            fd,
+            min(64 * 1024, size - len(result)),
+            len(result),
+        )
+        if not chunk:
+            raise OSError("bounded file truncated")
+        result.extend(chunk)
+    if os.pread(fd, 1, size):
+        raise OSError("bounded file grew")
+    return bytes(result)
+
+
+def _parse_allowlist_content(content: bytes) -> tuple[str, ...]:
+    text = content.decode("utf-8")
+    raw_lines = text.splitlines()
+    if not raw_lines or len(raw_lines) > MAX_ALLOWLIST_ENTRIES:
+        raise ValueError
+    movies: list[str] = []
+    seen: set[str] = set()
+    for raw_line in raw_lines:
+        value = raw_line.strip()
+        normalized = normalize_movie_number(value)
+        if not value or normalized is None or normalized in seen:
+            raise ValueError
+        seen.add(normalized)
+        movies.append(normalized)
+    return tuple(sorted(movies))
+
+
+@contextmanager
+def _open_allowlist_snapshot(path: Path) -> Iterator[_AllowlistSnapshot]:
+    absolute = Path(path).absolute()
+    parent = absolute.parent
+    basename = absolute.name
+    parent_fd: int | None = None
+    file_fd: int | None = None
     try:
-        snapshot = _open_stable_regular_file(
-            path,
-            keep_content=True,
+        if not basename or basename in {".", ".."}:
+            raise OSError("unsafe allowlist basename")
+        parent_fd = _open_directory_chain(parent, create=False)
+        parent_stat = os.fstat(parent_fd)
+        path_stat = os.stat(
+            basename,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_size <= 0
+            or path_stat.st_size > MAX_ALLOWLIST_BYTES
+        ):
+            raise OSError("allowlist is not a bounded regular file")
+        file_fd = os.open(
+            basename,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            )
+            != (
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_size,
+                path_stat.st_mtime_ns,
+                path_stat.st_ctime_ns,
+            )
+        ):
+            raise OSError("allowlist changed while opening")
+        content = _pread_exact_regular_file(
+            file_fd,
+            opened.st_size,
             max_bytes=MAX_ALLOWLIST_BYTES,
         )
-        assert snapshot.content is not None
-        text = snapshot.content.decode("utf-8")
-        raw_lines = text.splitlines()
-        if not raw_lines or len(raw_lines) > MAX_ALLOWLIST_ENTRIES:
-            raise ValueError
-        movies: list[str] = []
-        seen: set[str] = set()
-        for raw_line in raw_lines:
-            value = raw_line.strip()
-            normalized = normalize_movie_number(value)
-            if not value or normalized is None or normalized in seen:
-                raise ValueError
-            seen.add(normalized)
-            movies.append(normalized)
-        absolute_path = str(Path(path).absolute())
-        return tuple(sorted(movies)), snapshot.sha256, absolute_path
+        snapshot = _AllowlistSnapshot(
+            absolute_path=str(absolute),
+            parent=parent,
+            basename=basename,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            parent_stat=parent_stat,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            size=opened.st_size,
+            mtime_ns=opened.st_mtime_ns,
+            ctime_ns=opened.st_ctime_ns,
+            content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+            movies=_parse_allowlist_content(content),
+        )
+        snapshot.require_exact_unchanged()
     except (OSError, UnicodeError, ValueError):
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
         raise ValueError("allowlist_invalid") from None
+    try:
+        yield snapshot
+    finally:
+        os.close(file_fd)
+        os.close(parent_fd)
+
+
+def _read_allowlist(path: Path) -> tuple[tuple[str, ...], str, str]:
+    with _open_allowlist_snapshot(path) as snapshot:
+        return snapshot.movies, snapshot.sha256, snapshot.absolute_path
 
 
 def load_repair_allowlist(path: Path) -> frozenset[str]:
@@ -755,12 +924,9 @@ def load_repair_allowlist(path: Path) -> frozenset[str]:
 
 def _scan_filesystem(
     root_lock: JobsRootLock,
-    allowlist_path: Path,
+    allowlist: _AllowlistSnapshot,
 ) -> _FilesystemScan:
-    movies, allowlist_sha256, absolute_allowlist_path = _read_allowlist(
-        allowlist_path
-    )
-    allowed = frozenset(movies)
+    allowed = frozenset(allowlist.movies)
     root_lock.require_bound()
     candidate_paths: list[str] = []
     for name in os.listdir(root_lock.root_fd):
@@ -805,9 +971,9 @@ def _scan_filesystem(
         except (JobFilesLockError, OSError):
             continue
     snapshot = _FilesystemScan(
-        movies=movies,
-        allowlist_sha256=allowlist_sha256,
-        absolute_allowlist_path=absolute_allowlist_path,
+        movies=allowlist.movies,
+        allowlist_sha256=allowlist.sha256,
+        absolute_allowlist_path=allowlist.absolute_path,
         files_by_path=files_by_path,
     )
     try:
@@ -815,6 +981,20 @@ def _scan_filesystem(
     except (JobFilesLockError, OSError):
         raise ValueError("historical_plan_changed") from None
     return snapshot
+
+
+def _require_allowlist_unchanged(
+    allowlist: _AllowlistSnapshot,
+    *,
+    exact: bool,
+) -> None:
+    try:
+        if exact:
+            allowlist.require_exact_unchanged()
+        else:
+            allowlist.require_metadata_unchanged()
+    except OSError:
+        raise ValueError("historical_plan_changed") from None
 
 
 def _read_only_connection(db_path: Path) -> sqlite3.Connection:
@@ -1054,23 +1234,26 @@ def plan_historical_batch(
         store.jobs_root_mac,
         blocking=True,
     ) as root_lock:
-        filesystem = _scan_filesystem(root_lock, Path(allowlist_path))
-        conn = _read_only_connection(store.db_path)
-        try:
-            conn.execute("BEGIN")
-            jobs, repairs = _read_database_snapshot(conn)
-            plan = _build_plan_from_snapshots(
-                filesystem,
-                jobs,
-                repairs,
-                limit=limit,
-            )
-            conn.commit()
-            return plan
-        finally:
-            if conn.in_transaction:
-                conn.rollback()
-            conn.close()
+        with _open_allowlist_snapshot(Path(allowlist_path)) as allowlist:
+            filesystem = _scan_filesystem(root_lock, allowlist)
+            _require_allowlist_unchanged(allowlist, exact=False)
+            conn = _read_only_connection(store.db_path)
+            try:
+                conn.execute("BEGIN")
+                jobs, repairs = _read_database_snapshot(conn)
+                plan = _build_plan_from_snapshots(
+                    filesystem,
+                    jobs,
+                    repairs,
+                    limit=limit,
+                )
+                _require_allowlist_unchanged(allowlist, exact=True)
+                conn.commit()
+                return plan
+            finally:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.close()
 
 
 def render_historical_batch_report(plan: HistoricalBatchPlan) -> str:
@@ -1081,6 +1264,7 @@ def render_historical_batch_report(plan: HistoricalBatchPlan) -> str:
         f"allowlist_entries={plan.allowlist_entry_count} "
         f"scan_entries={plan.scan_entries} "
         f"audio_probe_max_bytes={plan.audio_probe_max_bytes} "
+        f"allowlist_verify_max_bytes={MAX_ALLOWLIST_VERIFY_BYTES} "
         f"eligible_total={plan.eligible_total} selected={len(plan.items)} "
         f"already_repaired={plan.already_repaired} "
         f"ineligible={plan.ineligible} blocked={plan.blocked}"
@@ -1385,6 +1569,7 @@ def _enqueue_historical_repairs_transaction(
     *,
     confirm_plan_sha256: str,
     filesystem: _FilesystemScan,
+    allowlist: _AllowlistSnapshot,
 ) -> list[HistoricalRepairRecord]:
     try:
         _validate_plan_confirmation(
@@ -1405,6 +1590,7 @@ def _enqueue_historical_repairs_transaction(
         )
         if recalculated != plan:
             raise ValueError
+        allowlist.require_exact_unchanged()
         now = utc_now_iso()
         for item in plan.items:
             repair_id = "repair_" + hashlib.sha256(

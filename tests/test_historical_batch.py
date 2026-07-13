@@ -735,6 +735,9 @@ def test_enqueue_performs_no_filesystem_scan_inside_sqlite_write_transaction(
     store = TransactionTrackingStore(sqlite_path, mac_jobs_root, "M:\\")
     real_scan = historical_batch._scan_filesystem
     real_quality = historical_batch.validate_translation_quality_snapshots
+    real_pread = historical_batch.os.pread
+    allowlist_inode = allowlist.stat().st_ino
+    allowlist_bytes_read_in_transaction = [0]
 
     def checked_scan(*args, **kwargs):
         assert write_transaction_active[0] is False
@@ -746,12 +749,23 @@ def test_enqueue_performs_no_filesystem_scan_inside_sqlite_write_transaction(
         assert write_transaction_active[0] is False
         return real_quality(*args, **kwargs)
 
+    def checked_pread(fd, size, offset):
+        content = real_pread(fd, size, offset)
+        if write_transaction_active[0]:
+            assert os.fstat(fd).st_ino == allowlist_inode
+            allowlist_bytes_read_in_transaction[0] += len(content)
+            assert allowlist_bytes_read_in_transaction[0] <= (
+                historical_batch.MAX_ALLOWLIST_VERIFY_BYTES
+            )
+        return content
+
     monkeypatch.setattr(historical_batch, "_scan_filesystem", checked_scan)
     monkeypatch.setattr(
         historical_batch,
         "validate_translation_quality_snapshots",
         checked_quality,
     )
+    monkeypatch.setattr(historical_batch.os, "pread", checked_pread)
 
     records = historical_batch.enqueue_historical_batch(
         store,
@@ -762,6 +776,168 @@ def test_enqueue_performs_no_filesystem_scan_inside_sqlite_write_transaction(
 
     assert len(records) == 1
     assert write_transaction_active[0] is False
+    assert allowlist_bytes_read_in_transaction[0] == len(allowlist.read_bytes())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["replace", "in_place", "parent_swap", "restore_different_inode"],
+)
+def test_enqueue_rejects_allowlist_mutation_after_filesystem_scan(
+    sqlite_path,
+    mac_jobs_root,
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-002")
+    operator_dir = tmp_path / "operator"
+    operator_dir.mkdir()
+    allowlist = operator_dir / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    real_scan = historical_batch._scan_filesystem
+
+    def mutate_after_scan(*args, **kwargs):
+        snapshot = real_scan(*args, **kwargs)
+        if mutation == "replace":
+            replacement = operator_dir / "replacement.txt"
+            replacement.write_text("abc-002\n")
+            os.replace(replacement, allowlist)
+        elif mutation == "in_place":
+            with allowlist.open("r+b") as output:
+                output.seek(0)
+                output.write(b"abc-002\n")
+                output.flush()
+                os.fsync(output.fileno())
+        elif mutation == "parent_swap":
+            moved = tmp_path / "operator-moved"
+            operator_dir.rename(moved)
+            operator_dir.mkdir()
+            allowlist.write_text("abc-001\n")
+        else:
+            changed = operator_dir / "changed.txt"
+            changed.write_text("abc-002\n")
+            os.replace(changed, allowlist)
+            restored = operator_dir / "restored.txt"
+            restored.write_text("abc-001\n")
+            os.replace(restored, allowlist)
+        return snapshot
+
+    monkeypatch.setattr(historical_batch, "_scan_filesystem", mutate_after_scan)
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_enqueue_rejects_allowlist_mutation_inside_write_transaction(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-002")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
+    real_read = historical_batch._read_database_snapshot
+
+    def mutate_after_database_snapshot(conn):
+        snapshot = real_read(conn)
+        with allowlist.open("r+b") as output:
+            output.seek(0)
+            output.write(b"abc-002\n")
+            output.flush()
+            os.fsync(output.fileno())
+        return snapshot
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_read_database_snapshot",
+        mutate_after_database_snapshot,
+    )
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_plan_rejects_allowlist_replacement_after_filesystem_scan(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    real_scan = historical_batch._scan_filesystem
+
+    def replace_after_scan(*args, **kwargs):
+        snapshot = real_scan(*args, **kwargs)
+        replacement = tmp_path / "replacement.txt"
+        replacement.write_text("abc-001\n")
+        os.replace(replacement, allowlist)
+        return snapshot
+
+    monkeypatch.setattr(historical_batch, "_scan_filesystem", replace_after_scan)
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.plan_historical_batch(store, allowlist, limit=1)
+
+
+def test_plan_rejects_allowlist_mutation_during_database_snapshot(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    real_read = historical_batch._read_database_snapshot
+
+    def mutate_during_read(conn):
+        snapshot = real_read(conn)
+        with allowlist.open("r+b") as output:
+            output.seek(0)
+            output.write(b"abc-002\n")
+            output.flush()
+            os.fsync(output.fileno())
+        return snapshot
+
+    monkeypatch.setattr(
+        historical_batch,
+        "_read_database_snapshot",
+        mutate_during_read,
+    )
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        historical_batch.plan_historical_batch(store, allowlist, limit=1)
 
 
 @pytest.mark.parametrize(
@@ -904,6 +1080,7 @@ def test_enqueue_uses_bounded_descriptors_under_low_rlimit(
     report = render_historical_batch_report(plan)
     assert "scan_entries=340" in report
     assert "audio_probe_max_bytes=4096" in report
+    assert "allowlist_verify_max_bytes=1048576" in report
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     target = min(64, hard)
     if target < 48:

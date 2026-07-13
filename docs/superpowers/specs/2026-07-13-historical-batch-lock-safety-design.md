@@ -12,7 +12,9 @@ upload, deletion, and requeue behavior is out of scope.
 Both plan and enqueue use this order:
 
 1. Acquire the jobs-root exclusive cooperative lock.
-2. Read the bounded allowlist and build a complete bounded filesystem view.
+2. Open the bounded allowlist through an `O_NOFOLLOW` directory chain, retain
+   its parent/file descriptors through commit, and build a complete bounded
+   filesystem view from its initial exact bytes.
 3. Fully hash Japanese/English SRT files, each capped by
    `MAX_SUBTITLE_BYTES`.
 4. Validate audio as RIFF/WAVE using bounded positioned reads and seeks. Persist
@@ -20,14 +22,18 @@ Both plan and enqueue use this order:
    size, mtime, validated format/data offsets and sizes, and derived duration,
    but never claims to be an audio content hash.
 5. Recheck the runtime inode/stat bindings.
-6. Only then begin the short SQLite transaction, read jobs and repair rows once,
-   recompute the plan from the prescanned view, and either return or insert.
+6. Revalidate the allowlist path/inode/stat, then begin the short SQLite
+   transaction, read jobs and repair rows once, and recompute the plan from the
+   prescanned view. Immediately before insert, exactly reread and hash only the
+   bounded allowlist through its retained fd.
 7. Commit the SQLite transaction before releasing the jobs-root lock.
 
-No file read, hash, stat, or seek occurs after `BEGIN IMMEDIATE`. Windows/API
-SQLite writers remain unblocked throughout file scanning. Cooperative Mac file
-writers remain blocked by the root lock until the short transaction commits,
-preventing a stale file snapshot from being accepted.
+No job-file read, hash, stat, or seek occurs after `BEGIN IMMEDIATE`; the sole
+exception is the explicitly bounded allowlist exact verification (at most 1
+MiB). Windows/API SQLite writers remain unblocked throughout the full job-file
+scan. Cooperative Mac file writers remain blocked by the root lock until the
+short transaction commits, preventing a stale file snapshot from being
+accepted.
 
 Planning uses the same root-first order and an explicit short read transaction,
 so its jobs and repair rows come from one SQLite snapshot.
@@ -61,8 +67,9 @@ inside the function is closed.
 ## Verification
 
 Tests instrument audio probe reads against a sparse tens-of-gigabytes file,
-prove SQLite writers can commit during the prescan, assert no filesystem calls
-occur inside the write transaction, verify explicit read-snapshot planning,
-exercise real legacy table rebuilds, and trigger the exact parent swap after the
-second binding check. Existing idempotency, tamper rejection, bounded file
-descriptor, lock order, and full test suites remain green.
+prove SQLite writers can commit during the prescan, assert no job-file calls
+occur inside the write transaction, bound the one allowlist reread, verify
+explicit read-snapshot planning, exercise real legacy table rebuilds, and
+trigger the exact parent swap after the second binding check. Existing
+idempotency, tamper rejection, bounded file descriptor, lock order, and full
+test suites remain green.
