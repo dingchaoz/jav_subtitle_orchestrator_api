@@ -2290,6 +2290,197 @@ def test_controller_database_read_failures_are_fixed_safe_hard_pauses(
     assert "secret-path" not in output
 
 
+def test_controller_missing_singleton_after_plan_fails_closed_without_repair_writes(
+    sqlite_path, mac_jobs_root, tmp_path, capsys
+):
+    from orchestrator.__main__ import run_historical_repair_controller_loop
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "secret-path" / "allowlist.txt"
+    allowlist.parent.mkdir()
+    allowlist.write_text("abc-001\n")
+
+    def delete_singleton_before_enqueue():
+        with store.connection() as conn:
+            conn.execute(
+                "DELETE FROM historical_repair_control WHERE singleton = 1"
+            )
+
+    controller = HistoricalRepairController(
+        store,
+        allowlist,
+        before_enqueue=delete_singleton_before_enqueue,
+    )
+
+    code = run_historical_repair_controller_loop(
+        controller,
+        poll_interval_seconds=1,
+        sleep_fn=lambda _: None,
+    )
+
+    assert code == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["reason_code"] == "historical_controller_state_unavailable"
+    assert payload["hard_pause"] is True
+    assert "historical_controller_state_missing" not in output
+    assert "secret-path" not in output
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_controller_plan_phase_missing_singleton_uses_state_unavailable_boundary(
+    sqlite_path, mac_jobs_root, tmp_path, capsys
+):
+    from orchestrator.__main__ import run_historical_repair_controller_loop
+    from orchestrator.historical_batch import (
+        HistoricalControllerStateUnavailable,
+        HistoricalRepairController,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    def delete_singleton_after_identity_pin():
+        with store.connection() as conn:
+            conn.execute(
+                "DELETE FROM historical_repair_control WHERE singleton = 1"
+            )
+        return None
+
+    controller = HistoricalRepairController(
+        store,
+        allowlist,
+        process_health_probe=delete_singleton_after_identity_pin,
+    )
+
+    code = run_historical_repair_controller_loop(
+        controller,
+        poll_interval_seconds=1,
+        sleep_fn=lambda _: None,
+    )
+
+    assert code == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["reason_code"] == "historical_controller_state_unavailable"
+    assert payload["hard_pause"] is True
+    assert "historical_controller_state_missing" not in output
+    with pytest.raises(HistoricalControllerStateUnavailable):
+        store.pin_or_validate_historical_controller_identity(("a" * 64,) * 3)
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+def test_two_controllers_missing_singleton_before_enqueue_fail_without_writes(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import HistoricalRepairController
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    planned = threading.Barrier(2)
+    deleted = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def before_enqueue(delete_control):
+        planned.wait(timeout=5)
+        if delete_control:
+            with store.connection() as conn:
+                conn.execute(
+                    "DELETE FROM historical_repair_control WHERE singleton = 1"
+                )
+        deleted.wait(timeout=5)
+
+    def run_controller(delete_control):
+        try:
+            results.append(
+                HistoricalRepairController(
+                    store,
+                    allowlist,
+                    before_enqueue=lambda: before_enqueue(delete_control),
+                ).run_once()
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=run_controller, args=(index == 0,))
+        for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+    assert all(
+        result.reason_code == "historical_controller_state_unavailable"
+        and result.hard_pause
+        and result.enqueued == 0
+        for result in results
+    )
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("failure_source", ["identity", "lane", "snapshot", "heartbeat"])
+def test_controller_does_not_mask_unrelated_runtime_errors(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, failure_source
+):
+    import orchestrator.historical_batch as historical_batch
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+
+    def programming_error(*_args, **_kwargs):
+        raise RuntimeError("programming defect")
+
+    heartbeat_probe = lambda: None
+    if failure_source == "identity":
+        monkeypatch.setattr(
+            store,
+            "pin_or_validate_historical_controller_identity",
+            programming_error,
+        )
+    elif failure_source == "lane":
+        monkeypatch.setattr(store, "historical_lane_state", programming_error)
+    elif failure_source == "snapshot":
+        monkeypatch.setattr(
+            historical_batch,
+            "_controller_database_snapshot",
+            programming_error,
+        )
+    else:
+        heartbeat_probe = programming_error
+
+    controller = historical_batch.HistoricalRepairController(
+        store,
+        allowlist,
+        worker_health_probe=heartbeat_probe,
+    )
+
+    with pytest.raises(RuntimeError, match="programming defect"):
+        controller.run_once()
+
+
 def test_controller_detects_allowlist_mutation_after_restart_without_writes(
     sqlite_path, mac_jobs_root, tmp_path
 ):

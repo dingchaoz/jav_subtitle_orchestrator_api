@@ -27,6 +27,7 @@ from orchestrator.models import JobStatus
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.paths import normalize_movie_number
 from orchestrator.store import (
+    HistoricalControllerStateUnavailable,
     HistoricalRepairRecord,
     HistoricalRepairState,
     normal_translation_backlog_exists,
@@ -202,10 +203,6 @@ class HistoricalControllerResult:
     plan_sha: str | None
     allowlist_sha: str | None
     counts: Mapping[str, int]
-
-
-class HistoricalControllerStateUnavailable(RuntimeError):
-    """Raised when a controller-only database operation cannot be verified."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1815,7 +1812,9 @@ def _enqueue_historical_repairs_transaction(
                 "WHERE singleton = 1"
             ).fetchone()
             if control is None:
-                raise ValueError("historical_controller_state_missing")
+                raise HistoricalControllerStateUnavailable(
+                    "historical_controller_state_missing"
+                )
             if control["paused"]:
                 reason = control["reason_code"] or "historical_lane_paused"
                 raise ValueError(f"historical_controller_paused:{reason}")
@@ -1894,10 +1893,13 @@ def _enqueue_historical_repairs_transaction(
     except ValueError as exc:
         if str(exc) in {
             "allowlist_changed",
-            "historical_controller_state_missing",
             "waiting_previous_batch",
             "normal_backlog",
         } or str(exc).startswith("historical_controller_paused:"):
+            raise
+        raise ValueError("historical_plan_changed") from None
+    except HistoricalControllerStateUnavailable:
+        if controller_identity is not None:
             raise
         raise ValueError("historical_plan_changed") from None
     except sqlite3.Error:
@@ -1975,7 +1977,9 @@ def _controller_database_snapshot(
             "FROM historical_repair_control WHERE singleton = 1"
         ).fetchone()
         if control is None:
-            raise RuntimeError("historical_controller_state_missing")
+            raise HistoricalControllerStateUnavailable(
+                "historical_controller_state_missing"
+            )
         counts = {key: 0 for key in _CONTROLLER_COUNT_KEYS}
         allowlist_shas: set[str] = set()
         for row in conn.execute(
@@ -2098,7 +2102,7 @@ class HistoricalRepairController:
                 hard_pause=True,
                 allowlist_sha=identity.content_sha256,
             )
-        except Exception:
+        except (HistoricalControllerStateUnavailable, sqlite3.Error):
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2118,7 +2122,7 @@ class HistoricalRepairController:
             )
         try:
             lane = self.store.historical_lane_state()
-        except Exception:
+        except (HistoricalControllerStateUnavailable, sqlite3.Error):
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2136,7 +2140,7 @@ class HistoricalRepairController:
             baseline, repair_counts, repair_allowlist_shas = (
                 _controller_database_snapshot(self.store)
             )
-        except Exception:
+        except (HistoricalControllerStateUnavailable, sqlite3.Error):
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2160,7 +2164,7 @@ class HistoricalRepairController:
             )
         try:
             normal_backlog = self.store.has_normal_translation_backlog()
-        except Exception:
+        except sqlite3.Error:
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2197,7 +2201,7 @@ class HistoricalRepairController:
             )
         try:
             health_reason = self.worker_health_probe()
-        except Exception:
+        except sqlite3.Error:
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2228,7 +2232,7 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
                 counts=repair_counts,
             )
-        except sqlite3.Error:
+        except (HistoricalControllerStateUnavailable, sqlite3.Error):
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",

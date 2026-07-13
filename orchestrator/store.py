@@ -73,6 +73,10 @@ class HistoricalRepairActivationError(RuntimeError):
     """Raised after a historical repair is safely rejected before claim."""
 
 
+class HistoricalControllerStateUnavailable(RuntimeError):
+    """Raised when durable historical-controller state cannot be verified."""
+
+
 def _validate_expected_sha256(value: str, label: str) -> None:
     if (
         not isinstance(value, str)
@@ -310,7 +314,9 @@ def pin_or_validate_historical_controller_identity_conn(
         "WHERE singleton = 1"
     ).fetchone()
     if control is None:
-        raise RuntimeError("historical_controller_state_missing")
+        raise HistoricalControllerStateUnavailable(
+            "historical_controller_state_missing"
+        )
     baseline = (
         control["controller_allowlist_path_sha256"],
         control["controller_allowlist_sha256"],
@@ -2299,7 +2305,10 @@ class JobStore:
             row = conn.execute(
                 "SELECT * FROM historical_repair_control WHERE singleton = 1"
             ).fetchone()
-            assert row is not None
+            if row is None:
+                raise HistoricalControllerStateUnavailable(
+                    "historical_controller_state_missing"
+                )
             return HistoricalLaneState(
                 paused=bool(row["paused"]),
                 reason_code=row["reason_code"],
