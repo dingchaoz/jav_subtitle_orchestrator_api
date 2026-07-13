@@ -12,6 +12,7 @@ CANONICAL_CODE = "roe-291"
 TOKEN = "never-log-this-token"
 ADULT_TEXT = "sensitive-response-subtitle-text"
 CREDENTIAL_URL = f"https://user:{TOKEN}@javsubtitle.example/private"
+SECRET_NETLOC = "private-adult-host.example"
 
 
 def valid_body() -> dict[str, object]:
@@ -280,6 +281,7 @@ def test_malformed_or_mismatched_success_response_is_rejected(_name, mutate):
         "ftp://javsubtitle.example",
         "http://javsubtitle.example",
         f"https://user:{TOKEN}@javsubtitle.example",
+        f"https://user:{TOKEN}@[{SECRET_NETLOC}/{ADULT_TEXT}",
         "https://javsubtitle.example/base",
         "https://javsubtitle.example/path?token=private",
         "https://javsubtitle.example/path#fragment",
@@ -294,7 +296,11 @@ def test_base_url_validation_fails_closed_without_leaking_input(base_url: str):
         CatalogSyncClient(base_url, TOKEN, session=FakeSession())
 
     assert str(raised.value) == "catalog API base URL is invalid"
-    assert TOKEN not in repr(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    for sensitive in (TOKEN, SECRET_NETLOC, ADULT_TEXT):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -329,12 +335,17 @@ def test_timeout_must_be_positive_number(timeout):
 
 def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():
     session = FakeSession()
+    sensitive_movie_code = f"{TOKEN} {SECRET_NETLOC} {ADULT_TEXT}"
 
     with pytest.raises(ValueError) as raised:
         CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session).sync(
-            ADULT_TEXT
+            sensitive_movie_code
         )
 
     assert str(raised.value) == "invalid movie code"
-    assert ADULT_TEXT not in repr(raised.value)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    for sensitive in (TOKEN, SECRET_NETLOC, ADULT_TEXT, sensitive_movie_code):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
     assert session.requests == []

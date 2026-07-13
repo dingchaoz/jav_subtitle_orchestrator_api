@@ -65,10 +65,14 @@ class CatalogSyncClient:
         self.session = session or requests.Session()
 
     def sync(self, movie_code: str) -> CatalogSyncResult:
+        invalid_movie_code = False
         try:
             canonical = canonical_movie_code(movie_code)
         except (AttributeError, TypeError, ValueError):
-            raise ValueError("invalid movie code") from None
+            invalid_movie_code = True
+            canonical = ""
+        if invalid_movie_code:
+            raise ValueError("invalid movie code")
 
         request_failed = False
         try:
@@ -162,12 +166,18 @@ class CatalogSyncClient:
     def _endpoint(base_url: str) -> str:
         if not isinstance(base_url, str) or not base_url or base_url != base_url.strip():
             raise ValueError("catalog API base URL is invalid")
+        parse_failed = False
         try:
             parsed = urlsplit(base_url)
             hostname = parsed.hostname
             has_credentials = parsed.username is not None or parsed.password is not None
         except ValueError:
-            raise ValueError("catalog API base URL is invalid") from None
+            parse_failed = True
+            parsed = None
+            hostname = None
+            has_credentials = True
+        if parse_failed:
+            raise ValueError("catalog API base URL is invalid")
         valid_transport = parsed.scheme == "https" or (
             parsed.scheme == "http" and hostname in _LOCAL_HTTP_HOSTS
         )
