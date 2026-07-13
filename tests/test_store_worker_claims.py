@@ -116,6 +116,286 @@ def test_historical_reset_preserves_windows_attempts_and_paths(
     assert paths.english_srt_path_mac.read_bytes() == english
 
 
+def test_prepare_catalog_publication_preserves_translation_and_artifacts(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-021", priority=100, force=False).job
+    paths = build_job_paths("abc-021", mac_jobs_root, "M:\\")
+    paths.job_dir_mac.mkdir(parents=True, exist_ok=True)
+    audio_before = b"publication-repair-audio"
+    japanese_before = b"1\n00:00:00,000 --> 00:00:01,000\nsource\n"
+    english_before = b"1\n00:00:00,000 --> 00:00:01,000\ntranslated\n"
+    paths.audio_path_mac.write_bytes(audio_before)
+    paths.japanese_srt_path_mac.write_bytes(japanese_before)
+    paths.english_srt_path_mac.write_bytes(english_before)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, attempt_count = 5, "
+            "worker_attempt_count = 2, translation_attempt_count = 3, "
+            "publish_attempt_count = 4, next_publish_attempt_at = ?, "
+            "catalog_movie_uuid = ?, metadata_status = ?, metadata_source = ?, "
+            "error = ?, audio_path_mac = ?, audio_path_windows = ?, "
+            "japanese_srt_path_mac = ?, japanese_srt_path_windows = ?, "
+            "english_srt_path_mac = ?, english_srt_path_windows = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "2026-07-12T12:00:00+00:00",
+                "f1bd9932-5697-4f16-865a-c56edc73d491",
+                "stale",
+                "stale",
+                "publishing: catalog lookup failed",
+                str(paths.audio_path_mac),
+                paths.audio_path_windows,
+                str(paths.japanese_srt_path_mac),
+                paths.japanese_srt_path_windows,
+                "/tmp/stale.English.srt",
+                "M:\\stale\\stale.English.srt",
+                job.id,
+            ),
+        )
+
+    prepared = store.prepare_catalog_publication_repair(
+        job.id,
+        expected_status=JobStatus.FAILED,
+        expected_movie="abc-021",
+    )
+
+    assert prepared.status is JobStatus.PUBLISH_PENDING
+    assert prepared.attempt_count == 5
+    assert prepared.worker_attempt_count == 2
+    assert prepared.translation_attempt_count == 3
+    assert prepared.publish_attempt_count == 0
+    assert prepared.next_publish_attempt_at is None
+    assert prepared.catalog_movie_uuid is None
+    assert prepared.metadata_status is None
+    assert prepared.metadata_source is None
+    assert prepared.claimed_by is None
+    assert prepared.lease_expires_at is None
+    assert prepared.error is None
+    assert prepared.audio_path_mac == str(paths.audio_path_mac)
+    assert prepared.audio_path_windows == paths.audio_path_windows
+    assert prepared.japanese_srt_path_mac == str(paths.japanese_srt_path_mac)
+    assert prepared.japanese_srt_path_windows == paths.japanese_srt_path_windows
+    assert prepared.english_srt_path_mac == str(paths.english_srt_path_mac)
+    assert prepared.english_srt_path_windows == paths.english_srt_path_windows
+    assert paths.audio_path_mac.read_bytes() == audio_before
+    assert paths.japanese_srt_path_mac.read_bytes() == japanese_before
+    assert paths.english_srt_path_mac.read_bytes() == english_before
+
+
+def _prepare_catalog_publication_candidate(
+    store,
+    root: Path,
+    movie: str,
+    *,
+    status: JobStatus = JobStatus.FAILED,
+    claimed_by: str | None = None,
+    catalog_movie_uuid: str | None = None,
+    metadata_status: str | None = None,
+    metadata_source: str | None = None,
+    english_state: str = "present",
+):
+    job = store.submit_job(movie, priority=100, force=False).job
+    paths = build_job_paths(movie, root, "M:\\")
+    paths.job_dir_mac.mkdir(parents=True, exist_ok=True)
+    paths.audio_path_mac.write_bytes(b"synthetic-audio")
+    paths.japanese_srt_path_mac.write_bytes(
+        b"1\n00:00:00,000 --> 00:00:01,000\nsource\n"
+    )
+    if english_state != "missing":
+        english = (
+            b"1\n00:00:00,000 --> 00:00:01,000\ntranslated\n"
+            if english_state == "present"
+            else b""
+        )
+        paths.english_srt_path_mac.write_bytes(english)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = ?, lease_expires_at = ?, "
+            "translation_attempt_count = 3, publish_attempt_count = 4, "
+            "next_publish_attempt_at = ?, catalog_movie_uuid = ?, "
+            "metadata_status = ?, metadata_source = ?, error = ?, "
+            "audio_path_mac = ?, audio_path_windows = ?, "
+            "japanese_srt_path_mac = ?, japanese_srt_path_windows = ?, "
+            "english_srt_path_mac = ?, english_srt_path_windows = ? WHERE id = ?",
+            (
+                status.value,
+                claimed_by,
+                "2026-07-12T12:30:00+00:00" if claimed_by else None,
+                "2026-07-12T12:00:00+00:00",
+                catalog_movie_uuid,
+                metadata_status,
+                metadata_source,
+                "stale repair error",
+                str(paths.audio_path_mac),
+                paths.audio_path_windows,
+                str(paths.japanese_srt_path_mac),
+                paths.japanese_srt_path_windows,
+                str(paths.english_srt_path_mac),
+                paths.english_srt_path_windows,
+                job.id,
+            ),
+        )
+    return job.id, paths
+
+
+def _catalog_artifact_snapshot(paths):
+    return {
+        path: path.read_bytes() if path.exists() else None
+        for path in (
+            paths.audio_path_mac,
+            paths.japanese_srt_path_mac,
+            paths.english_srt_path_mac,
+        )
+    }
+
+
+def test_prepare_catalog_publication_rejects_expected_movie_mismatch_atomically(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-022"
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    with pytest.raises(ValueError, match="movie"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-023",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+def test_prepare_catalog_publication_rejects_claimed_row_atomically(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store,
+        mac_jobs_root,
+        "abc-024",
+        claimed_by="publisher",
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    with pytest.raises(RuntimeError, match="state changed"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-024",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.QUEUED,
+        JobStatus.TRANSCRIPTION_DONE,
+        JobStatus.TRANSLATING,
+        JobStatus.PUBLISHING,
+    ],
+)
+def test_prepare_catalog_publication_rejects_ineligible_status_atomically(
+    sqlite_path, mac_jobs_root, status
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store, mac_jobs_root, "abc-025", status=status
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    with pytest.raises(ValueError, match="status"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=status,
+            expected_movie="abc-025",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+@pytest.mark.parametrize(
+    ("metadata_status", "metadata_source"),
+    [
+        ("complete", "public"),
+        ("partial", "missav"),
+        ("placeholder", "local"),
+        ("complete", "placeholder"),
+    ],
+)
+def test_prepare_catalog_publication_rejects_verified_ready_atomically(
+    sqlite_path,
+    mac_jobs_root,
+    metadata_status,
+    metadata_source,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store,
+        mac_jobs_root,
+        "abc-026",
+        status=JobStatus.ENGLISH_SRT_READY,
+        catalog_movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status=metadata_status,
+        metadata_source=metadata_source,
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    with pytest.raises(ValueError, match="verified publication"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.ENGLISH_SRT_READY,
+            expected_movie="abc-026",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+@pytest.mark.parametrize("english_state", ["missing", "empty"])
+def test_prepare_catalog_publication_rejects_invalid_canonical_english_atomically(
+    sqlite_path, mac_jobs_root, english_state
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store,
+        mac_jobs_root,
+        "abc-027",
+        english_state=english_state,
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    with pytest.raises(FileNotFoundError):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-027",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
 def test_exact_translation_claim_cannot_claim_another_job(
     sqlite_path, mac_jobs_root
 ):

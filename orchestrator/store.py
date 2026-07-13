@@ -12,6 +12,12 @@ from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths, new_job_id, normalize_movie_number
 
 
+_VERIFIED_METADATA_STATUSES = frozenset({"complete", "partial", "placeholder"})
+_VERIFIED_METADATA_SOURCES = frozenset(
+    {"public", "missav", "local", "placeholder"}
+)
+
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -840,6 +846,72 @@ class JobStore:
                 raise RuntimeError(
                     "historical repair state changed before prepare"
                 )
+            prepared = self.get_job(job_id, conn=conn)
+            assert prepared is not None
+            return prepared
+
+    def prepare_catalog_publication_repair(
+        self,
+        job_id: str,
+        *,
+        expected_status: JobStatus,
+        expected_movie: str,
+    ) -> JobRecord:
+        if expected_status not in {
+            JobStatus.FAILED,
+            JobStatus.ENGLISH_SRT_READY,
+        }:
+            raise ValueError("catalog publication status is not eligible")
+        expected_canonical = canonical_movie_code(expected_movie)
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if canonical_movie_code(job.normalized_movie_number) != expected_canonical:
+                raise ValueError("confirmed job movie changed before prepare")
+            if job.status is not expected_status or job.claimed_by is not None:
+                raise RuntimeError("catalog publication state changed before prepare")
+            if (
+                job.status is JobStatus.ENGLISH_SRT_READY
+                and job.catalog_movie_uuid
+                and job.metadata_status in _VERIFIED_METADATA_STATUSES
+                and job.metadata_source in _VERIFIED_METADATA_SOURCES
+            ):
+                raise ValueError("verified publication is not eligible")
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if not paths.english_srt_path_mac.is_file():
+                raise FileNotFoundError(paths.english_srt_path_mac)
+            if paths.english_srt_path_mac.stat().st_size == 0:
+                raise FileNotFoundError(
+                    f"final file empty: {paths.english_srt_path_mac}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                    catalog_movie_uuid = NULL, metadata_status = NULL,
+                    metadata_source = NULL, updated_at = ?, error = NULL,
+                    english_srt_path_mac = ?, english_srt_path_windows = ?
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                """,
+                (
+                    JobStatus.PUBLISH_PENDING.value,
+                    now,
+                    str(paths.english_srt_path_mac),
+                    paths.english_srt_path_windows,
+                    job_id,
+                    expected_status.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("catalog publication state changed before prepare")
             prepared = self.get_job(job_id, conn=conn)
             assert prepared is not None
             return prepared
