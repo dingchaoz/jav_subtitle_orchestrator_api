@@ -123,6 +123,55 @@ def test_load_publish_metadata_ignores_overlong_duration_digits(tmp_path):
     }
 
 
+@pytest.mark.parametrize(
+    ("raw_duration", "expected_minutes"),
+    [("1:00:00", 60), ("00:42:30", 43), ("120 min", 120)],
+)
+def test_load_publish_metadata_normalizes_duration_minutes(
+    tmp_path, raw_duration, expected_minutes
+):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "number": "mist-166",
+                "title": "Local title",
+                "duration": raw_duration,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_publish_metadata(metadata_path, "mist-166")["duration_minutes"] == (
+        expected_minutes
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_duration",
+    ["1:60:00", "00:42:60", "25:00:01", f"{'9' * 5000}:00:00"],
+)
+def test_load_publish_metadata_omits_invalid_colon_duration(
+    tmp_path, raw_duration
+):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "number": "mist-166",
+                "title": "Local title",
+                "duration": raw_duration,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_publish_metadata(metadata_path, "mist-166") == {
+        "number": "mist-166",
+        "title": "Local title",
+    }
+
+
 def test_load_publish_metadata_uses_requested_number_when_number_is_absent(tmp_path):
     metadata_path = tmp_path / "metadata.json"
     metadata_path.write_text(

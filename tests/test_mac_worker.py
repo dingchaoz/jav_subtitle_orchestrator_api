@@ -265,7 +265,8 @@ def prepare_transcription_done_job(store, mac_jobs_root, cue_count=20, movie="kt
     job = store.submit_job(movie, priority=100, force=False).job
     store.mark_audio_ready(job.id)
     claimed = store.claim_next_worker_job("windows-gpu-1", lease_seconds=60)
-    japanese = mac_jobs_root / movie / f"{movie}.Japanese.srt"
+    stored_movie = job.normalized_movie_number
+    japanese = mac_jobs_root / stored_movie / f"{stored_movie}.Japanese.srt"
     japanese.parent.mkdir(parents=True, exist_ok=True)
     blocks = [
         f"{index}\n00:00:{index:02d},000 --> 00:00:{index:02d},900\n日本語{index}\n"
@@ -275,7 +276,7 @@ def prepare_transcription_done_job(store, mac_jobs_root, cue_count=20, movie="kt
     return store.complete_worker_transcription(
         claimed.id,
         "windows-gpu-1",
-        f"M:\\{movie}\\{movie}.Japanese.srt",
+        f"M:\\{stored_movie}\\{stored_movie}.Japanese.srt",
         lambda path: Path(path).exists(),
     )
 

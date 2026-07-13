@@ -111,6 +111,28 @@ class FakeSession:
         raise AssertionError(f"unexpected call: {method} {url}")
 
 
+class CanonicalAliasSession(FakeSession):
+    def request(self, method, url, **kwargs):
+        if (
+            method == "GET"
+            and "/rest/v1/movie_languages" in url
+            and kwargs.get("params", {}).get("select") != "id"
+        ):
+            self.calls.append((method, url, kwargs))
+            return FakeResponse(
+                [
+                    {
+                        "id": "subtitle-uuid",
+                        "movie_id": CATALOG_MOVIE_UUID,
+                        "language": "English_AI",
+                        "file_path": "abc/abc-007/abc-007-English_AI.srt",
+                        "file_size": len(self.uploaded),
+                    }
+                ]
+            )
+        return super().request(method, url, **kwargs)
+
+
 def _write_pair(root: Path, *, bad: bool = False) -> Path:
     japanese = root / "ktb-112.Japanese.srt"
     english = root / "ktb-112.English.srt"
@@ -162,6 +184,53 @@ def test_good_translation_uploads_normally(tmp_path, metadata_source):
     assert result.metadata_source == metadata_source
     assert any("/storage/v1/object/" in call[1] for call in session.calls)
     assert any(call[0] == "POST" and "/movie_languages" in call[1] for call in session.calls)
+
+
+def test_legacy_named_subtitle_pair_publishes_under_canonical_movie_code(tmp_path):
+    english = _write_pair(tmp_path)
+    japanese = english.with_name("ktb-112.Japanese.srt")
+    legacy_english = english.with_name("abc-7.English.srt")
+    legacy_japanese = japanese.with_name("abc-7.Japanese.srt")
+    english.rename(legacy_english)
+    japanese.rename(legacy_japanese)
+    session = CanonicalAliasSession()
+    catalog = RecordingCatalogEnsurer()
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=catalog,
+    )
+
+    result = publisher.publish_english_ai("abc-7", legacy_english)
+
+    assert result.movie_code == "abc-007"
+    assert result.storage_path == "abc/abc-007/abc-007-English_AI.srt"
+    assert catalog.events == [("ensure", "abc-007", tmp_path / "metadata.json")]
+    assert not (tmp_path / "abc-007.Japanese.srt").exists()
+
+
+def test_publish_rejects_unexpected_english_filename_without_path_leak(tmp_path):
+    english = tmp_path / "private-release.srt"
+    english.write_text("private subtitle", encoding="utf-8")
+    session = FakeSession()
+    catalog = RecordingCatalogEnsurer()
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=catalog,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        publisher.publish_english_ai("abc-7", english)
+
+    assert str(exc_info.value) == (
+        "English subtitle filename must end with .English.srt"
+    )
+    assert "private-release" not in str(exc_info.value)
+    assert catalog.events == []
+    assert session.calls == []
 
 
 def test_repaired_subtitle_uses_storage_upsert_and_updates_catalog_row(tmp_path):

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
+from orchestrator.movie_code import canonical_movie_code
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths, new_job_id, normalize_movie_number
 
@@ -1332,7 +1333,23 @@ class JobStore:
             "SELECT * FROM jobs WHERE normalized_movie_number = ?",
             (normalized,),
         ).fetchone()
-        return self._row_to_job(row) if row else None
+        if row is not None:
+            return self._row_to_job(row)
+
+        canonical = canonical_movie_code(normalized)
+        legacy_rows = conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+        for legacy_row in legacy_rows:
+            try:
+                legacy_canonical = canonical_movie_code(
+                    legacy_row["normalized_movie_number"]
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if legacy_canonical == canonical:
+                return self._row_to_job(legacy_row)
+        return None
 
     def _force_reset(
         self,

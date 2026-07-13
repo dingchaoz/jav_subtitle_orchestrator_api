@@ -18,6 +18,7 @@ MetadataSource = Literal["public", "missav", "local", "placeholder"]
 
 METADATA_STATUSES = {"complete", "partial", "placeholder"}
 METADATA_SOURCES = {"public", "missav", "local", "placeholder"}
+DURATION_HMS_RE = re.compile(r"(\d+):([0-5]\d):([0-5]\d)")
 DURATION_NUMBER_RE = re.compile(r"\d+")
 
 
@@ -27,6 +28,31 @@ class MovieCatalogResult:
     canonical_code: str
     metadata_status: MetadataStatus
     metadata_source: MetadataSource
+
+
+def _duration_minutes(raw_duration: str) -> int | None:
+    cleaned = raw_duration.strip()
+    hms_match = DURATION_HMS_RE.fullmatch(cleaned)
+    if hms_match is not None:
+        try:
+            hours, minutes, seconds = (
+                int(part) for part in hms_match.groups()
+            )
+        except (ValueError, OverflowError):
+            return None
+        duration = (hours * 3600 + minutes * 60 + seconds + 59) // 60
+        return duration if 1 <= duration <= 1440 else None
+    if ":" in cleaned:
+        return None
+
+    number_match = DURATION_NUMBER_RE.search(cleaned)
+    if number_match is None:
+        return None
+    try:
+        duration = int(number_match.group())
+    except (ValueError, OverflowError):
+        return None
+    return duration if 1 <= duration <= 1440 else None
 
 
 def load_publish_metadata(path: Path, movie_code: str) -> dict[str, object]:
@@ -68,15 +94,9 @@ def load_publish_metadata(path: Path, movie_code: str) -> dict[str, object]:
 
     raw_duration = payload.get("duration")
     if isinstance(raw_duration, str):
-        match = DURATION_NUMBER_RE.search(raw_duration)
-        if match is not None:
-            try:
-                duration = int(match.group())
-            except (ValueError, OverflowError):
-                pass
-            else:
-                if 1 <= duration <= 1440:
-                    cleaned["duration_minutes"] = duration
+        duration = _duration_minutes(raw_duration)
+        if duration is not None:
+            cleaned["duration_minutes"] = duration
 
     if len(cleaned) == 1:
         return {}

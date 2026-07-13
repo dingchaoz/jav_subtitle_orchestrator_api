@@ -104,8 +104,17 @@ class SupabaseSubtitlePublisher:
         metadata_path: Path | None = None,
     ) -> SupabasePublishResult:
         canonical = canonical_movie_code(movie_code)
+        english_suffix = ".English.srt"
+        if (
+            not english_srt_path.name.endswith(english_suffix)
+            or english_srt_path.name == english_suffix
+        ):
+            raise ValueError(
+                "English subtitle filename must end with .English.srt"
+            )
+        subtitle_basename = english_srt_path.name[: -len(english_suffix)]
         japanese_srt_path = english_srt_path.with_name(
-            f"{canonical}.Japanese.srt"
+            f"{subtitle_basename}.Japanese.srt"
         )
         japanese_before = japanese_srt_path.read_bytes()
         english_before = english_srt_path.read_bytes()

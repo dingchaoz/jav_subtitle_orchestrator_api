@@ -147,6 +147,23 @@ def test_duplicate_submit_returns_existing(sqlite_path, mac_jobs_root):
     assert existing.job.priority == 100
 
 
+def test_submit_finds_legacy_unpadded_normalized_alias(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    created = store.submit_job("abc-7", priority=100, force=False)
+    set_job_fields(
+        sqlite_path,
+        created.job.id,
+        normalized_movie_number="abc-7",
+    )
+
+    existing = store.submit_job("abc-007", priority=10, force=False)
+
+    assert existing.kind == "existing"
+    assert existing.job.id == created.job.id
+    assert existing.job.normalized_movie_number == "abc-7"
+
+
 def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

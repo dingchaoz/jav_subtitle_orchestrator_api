@@ -389,6 +389,11 @@ def test_normalize_movie_number_accepts_id_without_dash():
     assert normalize_movie_number("KTB096") == "ktb-096"
 
 
+@pytest.mark.parametrize("movie_number", ["ABC7", "abc-7", "abc-007"])
+def test_normalize_movie_number_canonicalizes_numeric_padding(movie_number):
+    assert normalize_movie_number(movie_number) == "abc-007"
+
+
 def test_normalize_movie_number_rejects_invalid_ids():
     assert normalize_movie_number("bad id") is None
     assert normalize_movie_number("") is None
