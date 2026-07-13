@@ -71,17 +71,12 @@ class PsProcessInventory:
         return tuple(processes)
 
 
-class TranslationWorkerHealthProbe:
+class TranslationWorkerProcessProbe:
     def __init__(
         self,
-        store,
         process_inventory: ProcessInventory,
-        *,
-        freshness_seconds: int = 60,
     ) -> None:
-        self.store = store
         self.process_inventory = process_inventory
-        self.freshness_seconds = freshness_seconds
 
     def __call__(self) -> str | None:
         try:
@@ -89,23 +84,44 @@ class TranslationWorkerHealthProbe:
                 process.is_translation_worker
                 for process in self.process_inventory.list_processes()
             )
-            now = datetime.now(UTC)
-            fresh_heartbeats = 0
-            for worker in self.store.list_worker_statuses():
-                if worker.role != "mac_translator":
-                    continue
-                try:
-                    age = (
-                        now - datetime.fromisoformat(worker.last_seen_at)
-                    ).total_seconds()
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= age <= self.freshness_seconds:
-                    fresh_heartbeats += 1
         except Exception:
             return "translation_worker_count_mismatch"
-        if process_count != 1 or fresh_heartbeats != 1:
+        if process_count != 1:
             return "translation_worker_count_mismatch"
+        return None
+
+
+class TranslationWorkerHeartbeatProbe:
+    def __init__(
+        self,
+        store,
+        *,
+        expected_worker_id: str,
+        freshness_seconds: int = 60,
+    ) -> None:
+        self.store = store
+        self.expected_worker_id = expected_worker_id
+        self.freshness_seconds = freshness_seconds
+
+    def __call__(self) -> str | None:
+        now = datetime.now(UTC)
+        matches = []
+        for worker in self.store.list_worker_statuses():
+            if (
+                worker.worker_id != self.expected_worker_id
+                or worker.role != "mac_translator"
+            ):
+                continue
+            try:
+                age = (
+                    now - datetime.fromisoformat(worker.last_seen_at)
+                ).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if 0 <= age <= self.freshness_seconds:
+                matches.append(worker)
+        if len(matches) != 1:
+            return "translation_worker_heartbeat_mismatch"
         return None
 
 
@@ -152,9 +168,12 @@ def run_historical_repair_controller(
         allowlist_file,
         initial_batch_size=initial_batch_size,
         batch_size=batch_size,
-        worker_health_probe=TranslationWorkerHealthProbe(
-            store,
+        process_health_probe=TranslationWorkerProcessProbe(
             PsProcessInventory(),
+        ),
+        worker_health_probe=TranslationWorkerHeartbeatProbe(
+            store,
+            expected_worker_id=settings.mac_translation_worker_id,
             freshness_seconds=max(60, min(300, poll_interval_seconds * 3)),
         ),
     )

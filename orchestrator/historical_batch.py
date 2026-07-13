@@ -204,6 +204,10 @@ class HistoricalControllerResult:
     counts: Mapping[str, int]
 
 
+class HistoricalControllerStateUnavailable(RuntimeError):
+    """Raised when a controller-only database operation cannot be verified."""
+
+
 @dataclass(frozen=True, slots=True)
 class _FileSnapshot:
     sha256: str
@@ -1896,7 +1900,11 @@ def _enqueue_historical_repairs_transaction(
         } or str(exc).startswith("historical_controller_paused:"):
             raise
         raise ValueError("historical_plan_changed") from None
-    except (OSError, sqlite3.Error, TypeError):
+    except sqlite3.Error:
+        if controller_identity is not None:
+            raise HistoricalControllerStateUnavailable from None
+        raise ValueError("historical_plan_changed") from None
+    except (OSError, TypeError):
         raise ValueError("historical_plan_changed") from None
 
 
@@ -2046,6 +2054,7 @@ class HistoricalRepairController:
         *,
         initial_batch_size: int = 5,
         batch_size: int = 20,
+        process_health_probe: Callable[[], str | None] | None = None,
         worker_health_probe: Callable[[], str | None] | None = None,
         before_enqueue: Callable[[], None] | None = None,
     ) -> None:
@@ -2065,6 +2074,7 @@ class HistoricalRepairController:
         self.allowlist_path = Path(allowlist_path)
         self.initial_batch_size = initial_batch_size
         self.batch_size = batch_size
+        self.process_health_probe = process_health_probe or (lambda: None)
         self.worker_health_probe = worker_health_probe or (lambda: None)
         self.before_enqueue = before_enqueue or (lambda: None)
 
@@ -2081,13 +2091,6 @@ class HistoricalRepairController:
             self.store.pin_or_validate_historical_controller_identity(
                 identity.as_store_tuple()
             )
-        except (RuntimeError, sqlite3.Error):
-            return _controller_result(
-                action="paused",
-                reason_code="historical_controller_state_unavailable",
-                hard_pause=True,
-                allowlist_sha=identity.content_sha256,
-            )
         except ValueError:
             return _controller_result(
                 action="paused",
@@ -2095,7 +2098,33 @@ class HistoricalRepairController:
                 hard_pause=True,
                 allowlist_sha=identity.content_sha256,
             )
-        lane = self.store.historical_lane_state()
+        except Exception:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
+        try:
+            process_reason = self.process_health_probe()
+        except Exception:
+            process_reason = "translation_worker_count_mismatch"
+        if process_reason is not None:
+            return _controller_result(
+                action="paused",
+                reason_code=process_reason,
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
+        try:
+            lane = self.store.historical_lane_state()
+        except Exception:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+            )
         if lane.paused:
             return _controller_result(
                 action="paused",
@@ -2104,21 +2133,10 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
             )
         try:
-            health_reason = self.worker_health_probe()
-        except Exception:
-            health_reason = "worker_health_probe_failed"
-        if health_reason is not None:
-            return _controller_result(
-                action="paused",
-                reason_code=health_reason,
-                hard_pause=True,
-                allowlist_sha=identity.content_sha256,
-            )
-        try:
             baseline, repair_counts, repair_allowlist_shas = (
                 _controller_database_snapshot(self.store)
             )
-        except (RuntimeError, sqlite3.Error):
+        except Exception:
             return _controller_result(
                 action="paused",
                 reason_code="historical_controller_state_unavailable",
@@ -2140,7 +2158,17 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
                 counts=repair_counts,
             )
-        if self.store.has_normal_translation_backlog():
+        try:
+            normal_backlog = self.store.has_normal_translation_backlog()
+        except Exception:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        if normal_backlog:
             return _controller_result(
                 action="waiting",
                 reason_code="normal_backlog",
@@ -2167,6 +2195,24 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
                 counts=repair_counts,
             )
+        try:
+            health_reason = self.worker_health_probe()
+        except Exception:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        if health_reason is not None:
+            return _controller_result(
+                action="paused",
+                reason_code=health_reason,
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
         limit = (
             self.initial_batch_size
             if repair_counts["total_records"] == 0
@@ -2182,7 +2228,15 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
                 counts=repair_counts,
             )
-        except (JobFilesLockError, OSError, sqlite3.Error):
+        except sqlite3.Error:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                allowlist_sha=identity.content_sha256,
+                counts=repair_counts,
+            )
+        except (JobFilesLockError, OSError):
             return _controller_result(
                 action="paused",
                 reason_code="historical_scan_failed",
@@ -2240,6 +2294,15 @@ class HistoricalRepairController:
                 self.allowlist_path,
                 identity,
             )
+        except HistoricalControllerStateUnavailable:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
         except ValueError as exc:
             reason = str(exc)
             if reason == "normal_backlog":
@@ -2272,7 +2335,16 @@ class HistoricalRepairController:
                 allowlist_sha=identity.content_sha256,
                 counts=counts,
             )
-        except (JobFilesLockError, OSError, sqlite3.Error):
+        except sqlite3.Error:
+            return _controller_result(
+                action="paused",
+                reason_code="historical_controller_state_unavailable",
+                hard_pause=True,
+                plan_sha=plan.plan_sha256,
+                allowlist_sha=identity.content_sha256,
+                counts=counts,
+            )
+        except (JobFilesLockError, OSError):
             return _controller_result(
                 action="paused",
                 reason_code="historical_enqueue_failed",
