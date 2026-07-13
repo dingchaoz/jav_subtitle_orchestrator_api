@@ -14,6 +14,33 @@ Version 1 target:
 - Windows NVIDIA laptop polls the Mac API, reads audio over SMB, writes Japanese SRT, and hands the job back as `transcription_done`.
 - SQLite stores queue state for one or many movie IDs.
 
+## Metadata-resilient publication
+
+After Windows transcription, the Mac publication path is:
+
+```text
+transcription_done
+→ translating
+→ quality gate
+→ publish_pending
+→ publishing
+→ ensure public.movies (MissAV/local metadata or code-only placeholder)
+→ upsert the English_AI SRT in Storage
+→ upsert and verify movie_languages
+→ english_srt_ready
+```
+
+A code-only `placeholder` catalog row is a successful publication result, not a
+translation failure. It has a stable movie UUID and can be enriched later without
+changing subtitle ownership. Publication retries preserve the quality-approved
+English SRT and audio instead of translating again.
+
+The repository migration and worker flow do not imply that the migration has been
+deployed. Production RPC behavior remains unverified until the Task 10 deployment
+and one-canary gate is explicitly approved and completed. See the
+[Mac setup and deployment runbook](docs/setup/mac.md) for failure semantics,
+dry-run planning, and approval boundaries.
+
 ## Version 1 Run Commands
 
 Mac API:

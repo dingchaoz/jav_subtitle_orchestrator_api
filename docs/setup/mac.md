@@ -25,12 +25,16 @@ TRANSLATELOCALLY_MODEL=ja-en-tiny
 MAC_TRANSLATION_WORKER_ID=mac-translation-1
 MAC_TRANSLATION_LEASE_SECONDS=1800
 MAX_TRANSLATION_ATTEMPTS=3
+MAX_PUBLISH_ATTEMPTS=10
+MAC_PUBLISH_RETRY_SECONDS=30
 MAC_TRANSLATION_POLL_INTERVAL_SECONDS=10
 TRANSLATION_QUALITY_FAILURE_LIMIT=3
+MAC_TRANSLATION_PUBLISH_ENABLED=false
 SUBTITLE_AUDIT_VISIBILITY_ENABLED=true
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=replace-with-server-side-key
 SUPABASE_SUBTITLE_BUCKET=subtitles
+SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
 LOCAL_AUDIT_TIMEOUT_SECONDS=30
 SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 ```
@@ -76,7 +80,43 @@ source .venv/bin/activate
 python -m orchestrator mac-translation-worker
 ```
 
-It claims only `transcription_done`, writes English on the Mac/SMB job path, runs the quality gate, and exposes only passing files as `english_srt_ready`.
+The normal state flow is:
+
+```text
+transcription_done
+→ translating
+→ quality gate
+→ publish_pending
+→ publishing
+→ ensure public.movies (MissAV/local metadata or code-only placeholder)
+→ upsert the English_AI SRT in Storage
+→ upsert and verify movie_languages
+→ english_srt_ready
+```
+
+`english_srt_ready` means both publication and verification completed. A
+`metadata_status=placeholder` result is successful: when neither usable local
+metadata nor a MissAV catalog match is available, the RPC creates a code-only
+`public.movies` row, publication continues, and later metadata enrichment keeps
+the same stable movie UUID.
+
+Failure handling is separated by stage:
+
+- A translation quality failure is permanent. The rejected English SRT is retained
+  under `rejected/`, audio is kept, and neither catalog resolution nor Storage is
+  called.
+- Missing or unusable metadata does not reject a quality-approved translation. A
+  code-only placeholder is used and publication continues.
+- A transient Supabase failure returns the job to `publish_pending` using the
+  independent publication retry counter. The validated English SRT and audio stay
+  in place, and the worker does not translate again. After
+  `MAX_PUBLISH_ATTEMPTS`, the job becomes `failed` while retaining those files.
+- A Storage or `movie_languages` verification failure never marks the job
+  `english_srt_ready`; it follows the same bounded publication retry behavior.
+
+`MAX_PUBLISH_ATTEMPTS` bounds publication attempts independently of translation.
+`MAC_PUBLISH_RETRY_SECONDS` controls the delay before a pending publication may be
+claimed again.
 
 ## Historical repair planning (dry-run only)
 
@@ -94,6 +134,23 @@ Each line identifies the job and movie, preserves the Japanese SRT, names the
 planned `rejected/` quarantine path for the old English SRT, and states whether a
 later authorized repair would requeue or overwrite. There is no apply mode and no
 `force=True` path in this command.
+
+## Catalog publication repair planning (dry-run only)
+
+Use the catalog planner to identify quality-approved local subtitle pairs that a
+later, separately approved operation could publish. Always provide both an explicit
+comma-separated allowlist and a small limit:
+
+```bash
+python -m orchestrator plan-catalog-repairs \
+  --allowlist abc-001,abc-002 \
+  --limit 2
+```
+
+The report is labeled `DRY RUN` and names the expected metadata source and exact
+deterministic Storage path. The command performs no HTTP request, database write,
+file move, deletion, requeue, catalog mutation, or Storage upsert/overwrite. It has
+no apply mode and does not invoke `force=True`.
 
 ## Historical English_AI read-only audit
 
@@ -129,7 +186,25 @@ overwrite, or requeue anything.
 
 ## One-job historical repair canary
 
-Enable verified server-side publication only on the production Mac:
+### Deployment approval gate
+
+The repository contains the reviewed migration for the catalog RPC, but this
+runbook does **not** state or assume that it has been deployed. Production behavior
+of the RPC is unverified until Task 10. Before changing production, stop and obtain
+explicit approval for this ordered sequence:
+
+1. Apply only the reviewed migration, then verify RPC privileges and behavior.
+2. Run exactly one approved canary and verify its stable catalog UUID, Storage hash,
+   `movie_languages` row, unchanged Japanese/audio inputs, and final job status.
+3. Report the canary result and stop. Any additional canary or batch requires a
+   separate approval; migration approval and one-canary approval never authorize a
+   batch.
+
+Do not enable publication, restart a production worker, apply the migration, or use
+the catalog repair report as execution authorization before that gate is approved.
+
+After migration deployment and one-canary execution are explicitly approved,
+enable verified server-side publication only on the production Mac:
 
 ```text
 MAC_TRANSLATION_PUBLISH_ENABLED=true
@@ -166,9 +241,11 @@ The one-shot worker runs startup smoke and can claim only that exact ID. It move
 the old English SRT into `rejected/`, retains it, preserves Japanese SRT and any
 preexisting `audio.wav`, and preserves audio absence when historical cleanup already
 removed it. It translates, runs the pair quality gate, upserts Supabase, and verifies
-Storage SHA-256 plus catalog metadata before marking ready. A quality failure never
-uploads and is permanent. A transient publishing failure returns to
-`transcription_done` under the bounded translation retry counter.
+Storage SHA-256 plus the `movie_languages` catalog record before marking ready. A
+quality failure never creates catalog data or uploads and is permanent. A transient
+publishing or verification failure returns to `publish_pending` under the bounded,
+independent publication retry counter; it never triggers retranslation. A
+code-only placeholder catalog result is allowed and successful.
 
 After local, Supabase, CDN, and `https://javsubtitle.com` verification succeeds,
 restart the normal `mac-translation-worker`. This procedure authorizes one canary
