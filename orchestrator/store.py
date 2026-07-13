@@ -1199,6 +1199,30 @@ class JobStore:
             assert prepared is not None
             return prepared
 
+    def enqueue_historical_repairs(
+        self,
+        plan: object,
+        allowlist_path: Path,
+        *,
+        confirm_plan_sha256: str,
+    ) -> list[HistoricalRepairRecord]:
+        from orchestrator.historical_batch import (
+            HistoricalBatchPlan,
+            _enqueue_historical_repairs_transaction,
+        )
+
+        if not isinstance(plan, HistoricalBatchPlan):
+            raise ValueError("historical_plan_changed")
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return _enqueue_historical_repairs_transaction(
+                self,
+                conn,
+                plan,
+                Path(allowlist_path),
+                confirm_plan_sha256=confirm_plan_sha256,
+            )
+
     def prepare_catalog_publication_repair(
         self,
         job_id: str,

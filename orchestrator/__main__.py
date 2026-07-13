@@ -288,6 +288,54 @@ def run_plan_historical_repairs(
     print(render_repair_report(plans))
 
 
+def run_plan_historical_repair_batch(
+    *, allowlist_file: Path, limit: int, output: Path
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_batch import (
+        plan_historical_batch,
+        render_historical_batch_report,
+        write_private_plan,
+    )
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plan = plan_historical_batch(store, allowlist_file, limit=limit)
+    write_private_plan(output, plan)
+    print(render_historical_batch_report(plan))
+
+
+def run_enqueue_historical_repair_batch(
+    *,
+    allowlist_file: Path,
+    plan_file: Path,
+    confirm_plan_sha256: str,
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        read_private_plan,
+    )
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plan = read_private_plan(plan_file)
+    records = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist_file,
+        confirm_plan_sha256=confirm_plan_sha256,
+    )
+    identifiers = ",".join(record.id for record in records) or "none"
+    print(
+        f"enqueued=true batch_id={plan.batch_id} "
+        f"plan_sha256={plan.plan_sha256} count={len(records)} "
+        f"repair_ids={identifiers}"
+    )
+
+
 def run_plan_catalog_repairs(
     *, allowlist: set[str] | None, limit: int
 ) -> None:
@@ -548,6 +596,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="only inspect these movie numbers",
     )
     repair_parser.add_argument("--limit", type=int, default=100)
+    batch_plan = subcommands.add_parser("plan-historical-repair-batch")
+    batch_plan.add_argument("--allowlist-file", type=Path, required=True)
+    batch_plan.add_argument("--limit", type=int, choices=range(1, 21), required=True)
+    batch_plan.add_argument("--output", type=Path, required=True)
+    batch_enqueue = subcommands.add_parser("enqueue-historical-repair-batch")
+    batch_enqueue.add_argument("--allowlist-file", type=Path, required=True)
+    batch_enqueue.add_argument("--plan-file", type=Path, required=True)
+    batch_enqueue.add_argument("--confirm-plan-sha256", required=True)
     catalog_repair_parser = subcommands.add_parser(
         "plan-catalog-repairs",
         help="print a read-only catalog publication repair plan",
@@ -616,6 +672,18 @@ def main() -> None:
         run_plan_historical_repairs(
             allowlist=set(args.allowlist) if args.allowlist else None,
             limit=args.limit,
+        )
+    elif args.command == "plan-historical-repair-batch":
+        run_plan_historical_repair_batch(
+            allowlist_file=args.allowlist_file,
+            limit=args.limit,
+            output=args.output,
+        )
+    elif args.command == "enqueue-historical-repair-batch":
+        run_enqueue_historical_repair_batch(
+            allowlist_file=args.allowlist_file,
+            plan_file=args.plan_file,
+            confirm_plan_sha256=args.confirm_plan_sha256,
         )
     elif args.command == "plan-catalog-repairs":
         run_plan_catalog_repairs(
