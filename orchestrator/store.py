@@ -2,7 +2,7 @@ import hashlib
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -673,6 +673,7 @@ class JobStore:
         expected_job_dir_windows: str,
         expected_audio_path_mac: str,
         expected_audio_path_windows: str,
+        audio_snapshot_check: Callable[[], None],
     ) -> JobRecord:
         now = utc_now_iso()
         with self.connection() as conn:
@@ -714,6 +715,7 @@ class JobStore:
                 if paths.metadata_path_mac.exists()
                 else None
             )
+            audio_snapshot_check()
             cursor = conn.execute(
                 """
                 UPDATE jobs

@@ -256,6 +256,50 @@ def test_post_move_cas_rejects_movie_path_race_and_rerun_reuses_final(
     assert store.get_job(job.id).status is JobStatus.AUDIO_READY
 
 
+def test_post_validation_final_replacement_cannot_be_marked_audio_ready(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, job, paths, _staged, digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    replacement = tmp_path / "replacement.wav"
+    replacement.write_bytes(b"unvalidated replacement")
+    replacement_digest = hashlib.sha256(replacement.read_bytes()).hexdigest()
+    original_finalize = store.finalize_interrupted_audio
+
+    def finalize_after_replacement(job_id: str, **kwargs):
+        os.replace(replacement, paths.audio_path_mac)
+        return original_finalize(job_id, **kwargs)
+
+    monkeypatch.setattr(
+        store,
+        "finalize_interrupted_audio",
+        finalize_after_replacement,
+    )
+
+    with pytest.raises(
+        AudioRecoveryError,
+        match="^audio_recovery_state_changed$",
+    ):
+        recover_interrupted_audio(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=digest,
+        )
+
+    refreshed = store.get_job(job.id)
+    assert refreshed is not None
+    assert refreshed.status is JobStatus.DOWNLOADING_AUDIO
+    assert hashlib.sha256(paths.audio_path_mac.read_bytes()).hexdigest() == (
+        replacement_digest
+    )
+    assert not replacement.exists()
+
+
 def test_audio_directory_symlink_loop_is_a_safe_unchanging_error(
     sqlite_path: Path,
     mac_jobs_root: Path,

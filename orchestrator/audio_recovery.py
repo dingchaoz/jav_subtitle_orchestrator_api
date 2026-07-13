@@ -6,6 +6,7 @@ import sqlite3
 import stat
 import struct
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +78,8 @@ def validate_pcm_wav(
     path: Path,
     *,
     expected_sha256: str,
+    _while_open: Callable[[_ValidatedPcmWav, int, os.stat_result], None]
+    | None = None,
 ) -> _ValidatedPcmWav:
     """Validate one immutable, canonical PCM WAV snapshot without exposing content."""
     if not _valid_expected_sha256(expected_sha256):
@@ -185,13 +188,16 @@ def validate_pcm_wav(
             or not _same_snapshot(after, current_path_stat)
         ):
             raise AudioRecoveryError("audio_snapshot_changed")
-        return _ValidatedPcmWav(
+        validated = _ValidatedPcmWav(
             sha256=sha256,
             size_bytes=before.st_size,
             duration_seconds=duration_seconds,
             device=before.st_dev,
             inode=before.st_ino,
         )
+        if _while_open is not None:
+            _while_open(validated, descriptor, after)
+        return validated
     except AudioRecoveryError:
         raise
     except (AttributeError, MemoryError, OSError, RuntimeError, struct.error, wave.Error):
@@ -228,6 +234,51 @@ def _require_path_matches_validation(
         != (validated.device, validated.inode)
     ):
         raise AudioRecoveryError("audio_snapshot_changed")
+
+
+def _require_open_final_snapshot(
+    final_path: Path,
+    descriptor: int,
+    validated_snapshot: os.stat_result,
+) -> None:
+    directory_descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(
+            final_path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened_directory = os.fstat(directory_descriptor)
+        path_directory = final_path.parent.lstat()
+        if (
+            stat.S_ISLNK(path_directory.st_mode)
+            or not stat.S_ISDIR(path_directory.st_mode)
+            or not stat.S_ISDIR(opened_directory.st_mode)
+            or (path_directory.st_dev, path_directory.st_ino)
+            != (opened_directory.st_dev, opened_directory.st_ino)
+        ):
+            raise AudioRecoveryError("audio_snapshot_changed")
+        basename_snapshot = os.stat(
+            final_path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        opened_snapshot = os.fstat(descriptor)
+        current_path_directory = final_path.parent.lstat()
+        if (
+            not stat.S_ISREG(basename_snapshot.st_mode)
+            or not _same_snapshot(validated_snapshot, opened_snapshot)
+            or not _same_snapshot(opened_snapshot, basename_snapshot)
+            or (current_path_directory.st_dev, current_path_directory.st_ino)
+            != (opened_directory.st_dev, opened_directory.st_ino)
+        ):
+            raise AudioRecoveryError("audio_snapshot_changed")
+    except AudioRecoveryError:
+        raise
+    except (OSError, RuntimeError):
+        raise AudioRecoveryError("audio_snapshot_changed") from None
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
 
 
 def _require_exact_job(
@@ -315,12 +366,8 @@ def recover_interrupted_audio(
         raise AudioRecoveryError("audio_unavailable") from None
 
     reused_final = final_exists
-    if final_exists:
-        validated = validate_pcm_wav(
-            final_path,
-            expected_sha256=expected_sha256,
-        )
-    else:
+    moved_staged = False
+    if not final_exists:
         try:
             expected_staged_directory = paths.job_dir_mac.resolve(strict=True) / "audio"
         except (OSError, RuntimeError):
@@ -335,20 +382,18 @@ def recover_interrupted_audio(
             os.replace(staged_path, final_path)
         except OSError:
             raise AudioRecoveryError("audio_move_failed") from None
-        try:
-            validated = validate_pcm_wav(
-                final_path,
-                expected_sha256=expected_sha256,
-            )
-        except AudioRecoveryError:
-            try:
-                if not staged_path.exists() and final_path.exists():
-                    os.replace(final_path, staged_path)
-            except OSError:
-                pass
-            raise
+        moved_staged = True
 
-    try:
+    final_validation_complete = False
+    finalized: JobRecord | None = None
+
+    def finalize_while_snapshot_open(
+        _validated: _ValidatedPcmWav,
+        descriptor: int,
+        validated_snapshot: os.stat_result,
+    ) -> None:
+        nonlocal final_validation_complete, finalized
+        final_validation_complete = True
         finalized = store.finalize_interrupted_audio(
             job_id,
             expected_movie_code=movie_code,
@@ -356,9 +401,32 @@ def recover_interrupted_audio(
             expected_job_dir_windows=paths.job_dir_windows,
             expected_audio_path_mac=str(paths.audio_path_mac),
             expected_audio_path_windows=paths.audio_path_windows,
+            audio_snapshot_check=lambda: _require_open_final_snapshot(
+                final_path,
+                descriptor,
+                validated_snapshot,
+            ),
         )
+
+    try:
+        validated = validate_pcm_wav(
+            final_path,
+            expected_sha256=expected_sha256,
+            _while_open=finalize_while_snapshot_open,
+        )
+    except AudioRecoveryError:
+        if not final_validation_complete:
+            if moved_staged:
+                try:
+                    if not staged_path.exists() and final_path.exists():
+                        os.replace(final_path, staged_path)
+                except OSError:
+                    pass
+            raise
+        raise AudioRecoveryError("audio_recovery_state_changed") from None
     except (KeyError, RuntimeError, sqlite3.Error):
         raise AudioRecoveryError("audio_recovery_state_changed") from None
+    assert finalized is not None
     return AudioRecoveryReceipt(
         job_id=finalized.id,
         movie_code=movie_code,
