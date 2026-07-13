@@ -120,6 +120,8 @@ def prepare_catalog_publication_canary(
         paths.english_srt_path_mac,
         "english",
     )
+    japanese_before = paths.japanese_srt_path_mac.read_bytes()
+    english_before = paths.english_srt_path_mac.read_bytes()
     report = validate_translation_quality(
         paths.japanese_srt_path_mac,
         paths.english_srt_path_mac,
@@ -128,8 +130,13 @@ def prepare_catalog_publication_canary(
         reason_codes = ",".join(report.reason_codes) or "unknown"
         raise ValueError(f"quality_gate_failed:{reason_codes}")
 
-    with paths.english_srt_path_mac.open("rb") as english_file:
-        english_sha256 = hashlib.file_digest(english_file, "sha256").hexdigest()
+    japanese_snapshot = paths.japanese_srt_path_mac.read_bytes()
+    english_snapshot = paths.english_srt_path_mac.read_bytes()
+    if japanese_snapshot != japanese_before or english_snapshot != english_before:
+        raise ValueError(
+            "quality_gate_failed:subtitle_changed_during_validation"
+        )
+    english_sha256 = hashlib.sha256(english_snapshot).hexdigest()
 
     allowlist_after_validation = load_repair_allowlist(allowlist_path)
     if requested not in allowlist_after_validation:

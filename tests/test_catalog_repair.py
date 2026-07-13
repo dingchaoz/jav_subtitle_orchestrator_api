@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 import requests
 
+import orchestrator.catalog_repair as catalog_repair
 from orchestrator.__main__ import build_parser
 from orchestrator.catalog_repair import (
     CatalogPublicationCanaryReceipt,
@@ -784,3 +785,53 @@ def test_prepare_catalog_publication_canary_rechecks_allowlist_before_mutation(
     _assert_canary_failure_is_atomic(
         store, job.id, paths, row_before, files_before
     )
+
+
+@pytest.mark.parametrize("changed_language", ["english", "japanese"])
+def test_prepare_catalog_publication_canary_rejects_subtitle_changed_during_quality(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, changed_language
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-040")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-040")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+    changed_bytes = b"changed while the quality gate was returning\n"
+    changed_path = getattr(paths, f"{changed_language}_srt_path_mac")
+    real_validate = catalog_repair.validate_translation_quality
+
+    def validate_then_change(japanese_path, english_path):
+        report = real_validate(japanese_path, english_path)
+        assert report.passed is True
+        changed_path.write_bytes(changed_bytes)
+        return report
+
+    def unexpected_prepare(*args, **kwargs):
+        raise AssertionError("changed subtitle reached store transition")
+
+    monkeypatch.setattr(
+        catalog_repair,
+        "validate_translation_quality",
+        validate_then_change,
+    )
+    monkeypatch.setattr(
+        store,
+        "prepare_catalog_publication_repair",
+        unexpected_prepare,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^quality_gate_failed:subtitle_changed_during_validation$",
+    ):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-040",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    assert store.get_job(job.id) == row_before
+    expected_files = {**files_before, changed_language: changed_bytes}
+    assert _canary_files_snapshot(paths) == expected_files
