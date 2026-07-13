@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 import requests
 
@@ -50,6 +50,8 @@ class CatalogSyncError(RuntimeError):
 
 
 class CatalogSyncClient:
+    public_visibility_verification_enabled = True
+
     def __init__(
         self,
         base_url: str,
@@ -76,7 +78,6 @@ class CatalogSyncClient:
         movie_code: str,
         *,
         expected_subtitle_id: str,
-        expected_storage_path: str,
         expected_content_sha256: str,
     ) -> CatalogSyncResult:
         invalid_movie_code = False
@@ -90,8 +91,6 @@ class CatalogSyncClient:
         if (
             not isinstance(expected_subtitle_id, str)
             or not expected_subtitle_id
-            or not isinstance(expected_storage_path, str)
-            or not expected_storage_path
             or not isinstance(expected_content_sha256, str)
             or len(expected_content_sha256) != 64
             or any(char not in "0123456789abcdef" for char in expected_content_sha256)
@@ -182,7 +181,6 @@ class CatalogSyncClient:
         self._verify_public_visibility(
             canonical,
             expected_subtitle_id=expected_subtitle_id,
-            expected_storage_path=expected_storage_path,
             expected_content_sha256=expected_content_sha256,
         )
 
@@ -232,12 +230,12 @@ class CatalogSyncClient:
         canonical: str,
         *,
         expected_subtitle_id: str,
-        expected_storage_path: str,
         expected_content_sha256: str,
     ) -> None:
         try:
             response = self.session.get(
-                f"{self.base_url}/api/movie/{quote(canonical, safe='')}",
+                f"{self.base_url}/api/movie/{quote(canonical, safe='')}?"
+                f"{urlencode({'cacheNonce': expected_content_sha256})}",
                 timeout=self.timeout_seconds,
                 allow_redirects=False,
             )
@@ -263,14 +261,6 @@ class CatalogSyncClient:
             if isinstance(row, dict) and row.get("id") == expected_subtitle_id
         ]
         if len(matching) != 1:
-            raise CatalogSyncError("public_visibility_mismatch")
-        row = matching[0]
-        public_hash = row.get("srtHash")
-        if (
-            row.get("storagePath") != expected_storage_path
-            or public_hash is not None
-            and public_hash != expected_content_sha256
-        ):
             raise CatalogSyncError("public_visibility_mismatch")
 
     @staticmethod

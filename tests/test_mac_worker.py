@@ -320,6 +320,8 @@ class RecordingPublisher:
 
 
 class RecordingCatalogSync:
+    public_visibility_verification_enabled = True
+
     def __init__(self, events=None, *, errors=None):
         self.events = events if events is not None else []
         self.errors = iter(errors or [])
@@ -343,6 +345,8 @@ class RecordingCatalogSync:
 
 
 class ReclaimingCatalogSync:
+    public_visibility_verification_enabled = True
+
     def __init__(self, store, job_id, *, fail=False):
         self.store = store
         self.job_id = job_id
@@ -548,7 +552,10 @@ def test_historical_repair_fails_closed_without_publication_pipeline(sqlite_path
     assert store.get_historical_repair(job.id).state is HistoricalRepairState.PENDING
     status = store.get_worker_status("mac-translation-1")
     assert status is not None
-    assert status.last_error == "historical_publication_unconfigured"
+    assert status.last_error == "publication_configuration_missing"
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == "publication_configuration_missing"
 
 
 def test_good_historical_repair_uploads_catalogs_and_marks_success(sqlite_path, mac_jobs_root):
@@ -672,6 +679,9 @@ def test_good_historical_quality_pass_resets_durable_failure_streak(
     assert worker.process_one() is True
 
     assert store.get_job(good.id).status is JobStatus.PUBLISH_PENDING
+    assert store.historical_lane_state().consecutive_quality_failures == 1
+    assert worker.process_one() is True
+    assert store.get_job(good.id).status is JobStatus.CATALOG_SYNC_PENDING
     assert store.historical_lane_state().consecutive_quality_failures == 0
 
 
@@ -800,6 +810,99 @@ def test_historical_catalog_exhaustion_is_terminal_without_reupload(
     assert [event[0] for event in events] == ["translate", "publish", "catalog"]
 
 
+def test_historical_catalog_auth_failure_pauses_lane_before_exhaustion(
+    sqlite_path, mac_jobs_root
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-149")
+    second, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-150")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_catalog_sync_attempts=1,
+        catalog_sync_retry_seconds=0,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=[CatalogSyncError("catalog_auth_failed")],
+        ),
+    )
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    lane = store.historical_lane_state()
+    assert lane.paused is True
+    assert lane.reason_code == "catalog_auth_failed"
+    assert store.get_historical_repair(second.id).state is HistoricalRepairState.PENDING
+
+    normal = prepare_transcription_done_job(store, mac_jobs_root, movie="new-149")
+    assert worker.process_one() is True
+    assert store.get_job(normal.id).status is JobStatus.PUBLISH_PENDING
+
+
+@pytest.mark.parametrize("stage", ["publication", "catalog"])
+def test_historical_terminal_stage_rolls_back_job_if_repair_update_fails(
+    sqlite_path, mac_jobs_root, stage
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-151")
+    publication_errors = [RuntimeError("offline")] if stage == "publication" else []
+    catalog_errors = (
+        [CatalogSyncError("catalog_sync_failed")] if stage == "catalog" else []
+    )
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        max_publish_attempts=1,
+        max_catalog_sync_attempts=1,
+        publisher=RecordingPublisher(errors=publication_errors),
+        catalog_sync_client=RecordingCatalogSync(errors=catalog_errors),
+    )
+    assert worker.process_one() is True
+    if stage == "catalog":
+        assert worker.process_one() is True
+    with store.connection() as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER reject_historical_terminal
+            BEFORE UPDATE OF state ON historical_translation_repairs
+            WHEN NEW.state = 'permanent_failed'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected repair failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected repair failure"):
+        worker.process_one()
+
+    current = store.get_job(job.id)
+    expected = (
+        JobStatus.PUBLISHING
+        if stage == "publication"
+        else JobStatus.CATALOG_SYNCING
+    )
+    assert current.status is expected
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+
+
 def test_catalog_completion_atomically_marks_historical_success(
     sqlite_path, mac_jobs_root, monkeypatch
 ):
@@ -890,6 +993,44 @@ def test_historical_quarantine_never_overwrites_preexisting_collision(sqlite_pat
     ]
     assert len(old_copies) == 1
     assert paths.english_srt_path_mac.exists()
+
+
+def test_historical_collision_copy_is_discovered_on_retry(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-148")
+    repair = store.get_historical_repair(job.id)
+    canonical = store.historical_source_quarantine_path(repair)
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_bytes(b"unrelated canonical collision")
+    worker = MacTranslationWorker(
+        store,
+        PartialFailingMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+
+    assert worker.process_one() is True
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RETRY_WAIT
+    worker.translator = DiverseMacTranslator()
+
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert canonical.read_bytes() == b"unrelated canonical collision"
+    preserved = [
+        path
+        for path in canonical.parent.glob("*.srt")
+        if hashlib.sha256(path.read_bytes()).hexdigest()
+        == repair.source_english_sha256
+    ]
+    assert len(preserved) == 1
+    assert "collision" in preserved[0].name
 
 
 def test_historical_quarantine_resumes_after_link_before_unlink_crash(
@@ -1091,7 +1232,6 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     assert catalog.receipts == [
         {
             "expected_subtitle_id": published.published_subtitle_id,
-            "expected_storage_path": published.published_storage_path,
             "expected_content_sha256": published.published_content_sha256,
         }
     ]
@@ -1338,6 +1478,40 @@ def test_historical_publisher_quality_quarantine_is_deterministic_no_clobber(
     ]
     assert len(candidate_copies) == 1
     assert "collision" in candidate_copies[0].name
+
+
+def test_historical_publisher_quality_failures_accumulate_across_restarts(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    for movie in ("old-161", "old-162", "old-163"):
+        enqueue_historical_worker_job(store, mac_jobs_root, movie)
+
+    for index in range(1, 4):
+        worker = MacTranslationWorker(
+            store,
+            DiverseMacTranslator(),
+            max_translation_attempts=3,
+            worker_id=f"mac-restart-{index}",
+            lease_seconds=60,
+            quality_failure_limit=3,
+            publisher=RecordingPublisher(
+                errors=[
+                    SubtitleQualityGateError(
+                        ["subtitle_changed_after_validation"]
+                    )
+                ]
+            ),
+            catalog_sync_client=RecordingCatalogSync(),
+        )
+        assert worker.process_one() is True
+        assert worker.process_one() is True
+
+    lane = store.historical_lane_state()
+    assert lane.consecutive_quality_failures == 3
+    assert lane.paused is True
+    assert lane.reason_code == "quality_failure_limit"
 
 
 def test_three_publisher_quality_failures_stop_before_claiming_fourth_pending_job(

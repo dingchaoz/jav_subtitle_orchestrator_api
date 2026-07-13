@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from orchestrator.paths import build_job_paths
 from orchestrator.store import (
     HISTORICAL_TRANSLATION_ORIGIN,
     NORMAL_TRANSLATION_ORIGIN,
+    HistoricalRepairActivationError,
     HistoricalRepairState,
     JobStore,
     StageLeaseLostError,
@@ -353,8 +355,8 @@ def test_normal_arriving_after_historical_file_check_still_wins_transaction(
     assert normal is not None
     real_validate = store._validate_historical_source_files
 
-    def validate_then_arrive(repair):
-        real_validate(repair)
+    def validate_then_arrive(repair, job_fd):
+        real_validate(repair, job_fd)
         with store.connection() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ? WHERE id = ?",
@@ -406,7 +408,7 @@ def test_invalid_files_are_not_rejected_if_normal_work_arrives_before_transactio
     normal = store.submit_job("new-206", priority=100, force=False).job
     assert normal is not None
 
-    def fail_after_normal_arrives(_repair):
+    def fail_after_normal_arrives(_repair, _job_fd):
         with store.connection() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ? WHERE id = ?",
@@ -419,3 +421,115 @@ def test_invalid_files_are_not_rejected_if_normal_work_arrives_before_transactio
     assert store.claim_next_historical_repair("mac-1", 60) is None
     assert store.get_job(historical.id).status is JobStatus.ENGLISH_SRT_READY
     assert store.get_historical_repair(historical.id).state is HistoricalRepairState.PENDING
+
+
+def test_activation_rejects_symlinked_rejected_directory(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _repair_candidate(store, mac_jobs_root, "old-207")
+    repair = store.get_historical_repair(job.id)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / store.historical_source_quarantine_path(repair).name
+    outside_file.write_bytes(paths.english_srt_path_mac.read_bytes())
+    paths.english_srt_path_mac.unlink()
+    (paths.job_dir_mac / "rejected").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        HistoricalRepairActivationError,
+        match="preservation_hash_changed",
+    ):
+        store.claim_next_historical_repair("mac-1", 60)
+
+    assert outside_file.exists()
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.PERMANENT_FAILED
+
+
+def test_quality_terminal_and_counter_rollback_together_on_injected_failure(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-208")
+    claimed = store.claim_next_historical_repair("mac-1", 60)
+    assert claimed is not None
+    with store.connection() as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER reject_quality_terminal
+            BEFORE UPDATE OF state ON historical_translation_repairs
+            WHEN NEW.state = 'permanent_failed'
+            BEGIN
+              SELECT RAISE(ABORT, 'injected quality failure');
+            END
+            """
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected quality failure"):
+        store.fail_historical_translation_permanent(
+            job.id,
+            "mac-1",
+            lease_token=claimed.stage_lease_token,
+            reason_code="quality_gate_failed:collapsed_output",
+            quality_failure_limit=3,
+        )
+
+    assert store.get_job(job.id).status is JobStatus.TRANSLATING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert store.historical_lane_state().consecutive_quality_failures == 0
+
+
+def test_reconciler_unblocks_legacy_running_failed_repair(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-209")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "publishing: transient legacy failure",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+    repair = store.get_historical_repair(job.id)
+    assert repair.state is HistoricalRepairState.RETRY_WAIT
+    assert repair.reason_code == "orphaned_running_reconciled"
+    assert store.claim_next_historical_repair("mac-1", 60) is not None
+
+
+def test_paused_lane_blocks_inflight_historical_claim(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _repair_candidate(store, mac_jobs_root, "old-210")
+    claimed = store.claim_next_historical_repair("setup", 60)
+    assert claimed is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = NULL, "
+            "lease_expires_at = NULL, stage_lease_token = NULL, "
+            "english_srt_path_mac = ? WHERE id = ?",
+            (JobStatus.PUBLISH_PENDING.value, str(paths.english_srt_path_mac), job.id),
+        )
+    store.pause_historical_lane("publication_configuration_missing")
+
+    assert store.claim_inflight_historical_stage("mac-1", 60) is None
+    assert store.claim_publication_job(
+        "mac-1",
+        60,
+        job_id=job.id,
+        origin=HISTORICAL_TRANSLATION_ORIGIN,
+    ) is None
+    assert store.claim_publication_job(
+        "mac-1", 60, job_id=job.id
+    ) is None

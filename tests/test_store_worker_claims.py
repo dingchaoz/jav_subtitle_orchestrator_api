@@ -233,7 +233,7 @@ def test_claim_next_download_job_is_atomic_and_ordered(sqlite_path, mac_jobs_roo
     assert second_claim.status == JobStatus.DOWNLOADING_METADATA
 
 
-def test_historical_reset_preserves_windows_attempts_and_paths(
+def test_legacy_historical_reset_is_disabled_and_preserves_job(
     sqlite_path, mac_jobs_root
 ):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
@@ -260,21 +260,13 @@ def test_historical_reset_preserves_windows_attempts_and_paths(
             ),
         )
 
-    reset = store.prepare_historical_translation_repair(
-        job.id, expected_status=JobStatus.ENGLISH_SRT_READY
-    )
+    before = store.get_job(job.id)
+    with pytest.raises(RuntimeError, match="legacy_historical_prepare_disabled"):
+        store.prepare_historical_translation_repair(
+            job.id, expected_status=JobStatus.ENGLISH_SRT_READY
+        )
 
-    assert reset.status is JobStatus.TRANSCRIPTION_DONE
-    assert reset.worker_attempt_count == 2
-    assert reset.translation_attempt_count == 0
-    assert reset.publish_attempt_count == 0
-    assert reset.next_publish_attempt_at is None
-    assert reset.catalog_movie_uuid is None
-    assert reset.metadata_status is None
-    assert reset.metadata_source is None
-    assert reset.audio_path_mac == str(paths.audio_path_mac)
-    assert reset.japanese_srt_path_mac == str(paths.japanese_srt_path_mac)
-    assert reset.english_srt_path_mac is None
+    assert store.get_job(job.id) == before
     assert paths.audio_path_mac.read_bytes() == b"synthetic-audio"
     assert paths.japanese_srt_path_mac.read_bytes() == japanese
     assert paths.english_srt_path_mac.read_bytes() == english

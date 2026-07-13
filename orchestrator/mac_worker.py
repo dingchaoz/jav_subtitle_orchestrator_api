@@ -187,10 +187,6 @@ class MacTranslationWorker:
         max_catalog_sync_attempts: int = 10,
         catalog_sync_retry_seconds: int = 30,
     ) -> None:
-        if (publisher is None) != (catalog_sync_client is None):
-            raise ValueError(
-                "publisher and catalog sync client must be configured together"
-            )
         self.store = store
         self.translator = translator
         self.max_translation_attempts = max_translation_attempts
@@ -201,6 +197,15 @@ class MacTranslationWorker:
         self.max_publish_attempts = max_publish_attempts
         self.publish_retry_seconds = publish_retry_seconds
         self.catalog_sync_client = catalog_sync_client
+        self.publication_pipeline_configured = bool(
+            publisher is not None
+            and catalog_sync_client is not None
+            and getattr(
+                catalog_sync_client,
+                "public_visibility_verification_enabled",
+                False,
+            )
+        )
         self.max_catalog_sync_attempts = max_catalog_sync_attempts
         self.catalog_sync_retry_seconds = catalog_sync_retry_seconds
         self.consecutive_quality_failures = 0
@@ -225,6 +230,7 @@ class MacTranslationWorker:
                 "Mac translation worker stopped after "
                 f"{self.consecutive_quality_failures} consecutive quality failures"
             )
+        self.store.reconcile_orphaned_historical_repairs()
         self.store.recover_expired_translation_leases(self.max_translation_attempts)
         self.store.recover_expired_publication_leases(
             self.max_publish_attempts,
@@ -234,11 +240,28 @@ class MacTranslationWorker:
             self.max_catalog_sync_attempts,
             self.catalog_sync_retry_seconds,
         )
+        if (
+            self.store.has_due_historical_repair()
+            and not self.publication_pipeline_configured
+        ):
+            lane = self.store.historical_lane_state()
+            if (
+                not lane.paused
+                or lane.reason_code != "publication_configuration_missing"
+            ):
+                self.store.pause_historical_lane(
+                    "publication_configuration_missing"
+                )
+        lane = self.store.historical_lane_state()
         ready_historical = self.store.find_historical_ready_to_finalize()
-        if ready_historical is not None:
+        if (
+            ready_historical is not None
+            and self.publication_pipeline_configured
+            and not lane.paused
+        ):
             self._finalize_ready_historical(ready_historical)
             return True
-        if self.publisher is not None:
+        if self.publication_pipeline_configured:
             inflight = self.store.claim_inflight_historical_stage(
                 self.worker_id,
                 self.lease_seconds,
@@ -260,12 +283,8 @@ class MacTranslationWorker:
             return self._process_claimed_translation(job)
         lane = self.store.historical_lane_state()
         if not lane.paused and not self.store.has_claimable_normal_work():
-            if self.publisher is None:
-                error = (
-                    "historical_publication_unconfigured"
-                    if self.store.has_due_historical_repair()
-                    else None
-                )
+            if not self.publication_pipeline_configured:
+                error = "publication_configuration_missing"
                 self._record_idle(error=error)
                 return False
             try:
@@ -278,6 +297,12 @@ class MacTranslationWorker:
                 return True
             if job is not None:
                 return self._process_claimed_translation(job)
+        if (
+            lane.paused
+            and lane.reason_code == "publication_configuration_missing"
+        ):
+            self._record_idle(error="publication_configuration_missing")
+            return False
         self._record_idle()
         return False
 
@@ -324,7 +349,7 @@ class MacTranslationWorker:
                     f"exact job {job_id} is not claimable for translation"
                 )
             self._process_claimed_translation(job)
-            if self.publisher is None:
+            if not self.publication_pipeline_configured:
                 return True
             current = self.store.get_job(job_id)
             if current is None or current.status is not JobStatus.PUBLISH_PENDING:
@@ -338,7 +363,7 @@ class MacTranslationWorker:
                 f"{current.status.value}"
             )
 
-        if self.publisher is None:
+        if not self.publication_pipeline_configured:
             raise RuntimeError(
                 f"exact job {job_id} requires a publisher from stage publish_pending"
             )
@@ -347,6 +372,7 @@ class MacTranslationWorker:
                 self.worker_id,
                 self.lease_seconds,
                 job_id=job_id,
+                origin=current.translation_origin,
             )
             if publication is None:
                 raise RuntimeError(
@@ -360,6 +386,7 @@ class MacTranslationWorker:
             self.worker_id,
             self.lease_seconds,
             job_id=job_id,
+            origin=current.translation_origin,
         )
         if catalog_job is None:
             raise RuntimeError(f"exact job {job_id} is not claimable for catalog sync")
@@ -454,45 +481,34 @@ class MacTranslationWorker:
             blocking=True,
         ) as files_lock:
             quarantine = self.store.historical_source_quarantine_path(repair)
-            if quarantine.exists():
-                if paths.english_srt_path_mac.exists():
-                    current_hash = self._sha256_file_at(
-                        files_lock.job_fd,
-                        paths.english_srt_path_mac.name,
-                    )
-                    if current_hash == repair.source_english_sha256:
-                        desired_name = quarantine.name
-                        expected_hash = repair.source_english_sha256
-                    else:
-                        desired_name = (
-                            f"{paths.english_srt_path_mac.stem}."
-                            f"rejected-interrupted-{repair.id}-"
-                            f"{current_hash[:12]}.srt"
-                        )
-                        expected_hash = current_hash
-                    self._historical_quarantine_locked(
-                        files_lock,
-                        paths.english_srt_path_mac.name,
-                        desired_name,
-                        expected_sha256=expected_hash,
-                    )
-            elif paths.english_srt_path_mac.exists():
-                source_hash = self._sha256_file_at(
+            preserved_name = self.store.find_historical_source_quarantine_name(
+                repair, files_lock.job_fd
+            )
+            try:
+                current_hash = self._sha256_file_at(
                     files_lock.job_fd,
                     paths.english_srt_path_mac.name,
                 )
-                if source_hash != repair.source_english_sha256:
+            except OSError:
+                current_hash = None
+            if current_hash is not None:
+                if current_hash == repair.source_english_sha256:
+                    desired_name = quarantine.name
+                elif preserved_name is not None:
+                    desired_name = (
+                        f"{paths.english_srt_path_mac.stem}."
+                        f"rejected-interrupted-{repair.id}-"
+                        f"{current_hash[:12]}.srt"
+                    )
+                else:
                     raise RuntimeError("historical_source_english_changed")
                 self._historical_quarantine_locked(
                     files_lock,
                     paths.english_srt_path_mac.name,
-                    quarantine.name,
-                    expected_sha256=repair.source_english_sha256,
+                    desired_name,
+                    expected_sha256=current_hash,
                 )
-            elif (
-                not quarantine.exists()
-                or self.store._sha256_regular_file(quarantine) != repair.source_english_sha256
-            ):
+            elif preserved_name is None:
                 raise RuntimeError("historical_source_english_missing")
             _append_job_log_safely(
                 paths.job_dir_mac,
@@ -509,27 +525,40 @@ class MacTranslationWorker:
             )
             self._write_quality_log(paths.job_dir_mac, report)
             if not report.passed:
-                candidate_sha256 = None
-                if paths.english_srt_path_mac.exists():
-                    candidate_sha256 = self._sha256_file_at(
-                        files_lock.job_fd,
-                        paths.english_srt_path_mac.name,
-                    )
-                    self._historical_quarantine_locked(
-                        files_lock,
-                        paths.english_srt_path_mac.name,
-                        f"{paths.english_srt_path_mac.stem}."
-                        f"rejected-quality-{repair.id}-"
-                        f"{candidate_sha256[:12]}.srt",
-                        expected_sha256=candidate_sha256,
-                    )
-                quality_error = MacTranslationQualityError(
-                    "quality_gate_failed:" + ",".join(report.reason_codes)
+                candidate_sha256 = self._sha256_file_at(
+                    files_lock.job_fd,
+                    paths.english_srt_path_mac.name,
                 )
-                quality_error.candidate_sha256 = candidate_sha256
-                raise quality_error
-            lane = self.store.reset_historical_quality_failures()
-            self.historical_quality_failures = lane.consecutive_quality_failures
+                self._require_historical_preservation_locked(repair, paths)
+                reason_code = "quality_gate_failed:" + ",".join(
+                    report.reason_codes
+                )
+                outcome = self.store.fail_historical_translation_permanent(
+                    job.id,
+                    self.worker_id,
+                    lease_token=job.stage_lease_token,
+                    reason_code=reason_code,
+                    english_sha256=candidate_sha256,
+                    quality_failure_limit=self.quality_failure_limit,
+                )
+                self.historical_quality_failures = (
+                    outcome.consecutive_quality_failures
+                )
+                self._historical_quarantine_locked(
+                    files_lock,
+                    paths.english_srt_path_mac.name,
+                    f"{paths.english_srt_path_mac.stem}."
+                    f"rejected-quality-{repair.id}-"
+                    f"{candidate_sha256[:12]}.srt",
+                    expected_sha256=candidate_sha256,
+                )
+                _write_job_snapshot_safely(outcome.job)
+                _append_job_log_safely(
+                    paths.job_dir_mac,
+                    "mac-translation.log",
+                    f"failed {job.id}: {reason_code}",
+                )
+                return
             self._require_historical_preservation_locked(repair, paths)
             updated = self.store.complete_mac_translation_quality(
                 job.id,
@@ -677,23 +706,26 @@ class MacTranslationWorker:
                 self._require_historical_preservation_locked(repair, paths)
         except Exception:
             reason_code = "preservation_hash_changed"
-            return self.store.mark_historical_permanent_failure(
+            outcome = self.store.fail_historical_translation_permanent(
                 job.id,
-                reason_code,
-                worker_id=self.worker_id,
+                self.worker_id,
                 lease_token=job.stage_lease_token,
+                reason_code=reason_code,
             )
+            return outcome.job
         if isinstance(exc, MacTranslationQualityError):
-            updated = self.store.mark_historical_permanent_failure(
+            outcome = self.store.fail_historical_translation_permanent(
                 job.id,
-                reason_code,
-                getattr(exc, "candidate_sha256", None),
-                worker_id=self.worker_id,
+                self.worker_id,
                 lease_token=job.stage_lease_token,
+                reason_code=reason_code,
+                english_sha256=getattr(exc, "candidate_sha256", None),
+                quality_failure_limit=self.quality_failure_limit,
             )
-            lane = self.store.record_historical_quality_failure(self.quality_failure_limit)
-            self.historical_quality_failures = lane.consecutive_quality_failures
-            return updated
+            self.historical_quality_failures = (
+                outcome.consecutive_quality_failures
+            )
+            return outcome.job
         return self.store.mark_historical_retry(
             job.id,
             reason_code,
@@ -730,7 +762,7 @@ class MacTranslationWorker:
             raise MacTranslationQualityError(
                 "quality_gate_failed:" + ",".join(report.reason_codes)
             )
-        if self.publisher is None:
+        if not self.publication_pipeline_configured:
             updated = self.store.complete_mac_translation(
                 job.id,
                 self.worker_id,
@@ -778,23 +810,73 @@ class MacTranslationWorker:
                 )
                 return True
             publisher_quality_failure = isinstance(exc, SubtitleQualityGateError)
-            permanent = publisher_quality_failure or isinstance(
+            quality_failure = publisher_quality_failure or isinstance(
                 exc, MacPublicationQualityError
             )
+            preservation_failure = str(exc) == "preservation_hash_changed"
+            permanent = quality_failure or preservation_failure
             historical = job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN
             safe_error = str(exc) if permanent else "publication_failed"
             if permanent and not historical:
                 self.consecutive_quality_failures += 1
-            if publisher_quality_failure:
+            if publisher_quality_failure and not historical:
                 paths = build_job_paths(
                     job.normalized_movie_number,
                     self.store.jobs_root_mac,
                     self.store.jobs_root_windows,
                 )
+                self._quarantine(paths.english_srt_path_mac, "quality")
+            try:
                 if historical:
-                    repair = self.store.get_historical_repair(job.id)
-                    if repair is None:
-                        raise RuntimeError("historical_repair_missing")
+                    outcome = self.store.fail_historical_publication(
+                        job.id,
+                        self.worker_id,
+                        safe_error,
+                        lease_token=job.stage_lease_token,
+                        max_publish_attempts=self.max_publish_attempts,
+                        retry_seconds=self.publish_retry_seconds,
+                        permanent=permanent,
+                        quality_failure_limit=(
+                            self.quality_failure_limit
+                            if quality_failure
+                            else None
+                        ),
+                    )
+                    updated = outcome.job
+                    self.historical_quality_failures = (
+                        outcome.consecutive_quality_failures
+                    )
+                else:
+                    updated = self.store.fail_publication(
+                        job.id,
+                        self.worker_id,
+                        safe_error,
+                        max_publish_attempts=self.max_publish_attempts,
+                        retry_seconds=self.publish_retry_seconds,
+                        permanent=permanent,
+                        lease_token=job.stage_lease_token,
+                    )
+            except StageLeaseLostError:
+                error = "publishing: publication_lease_lost"
+                _append_job_log_safely(
+                    Path(job.job_dir_mac),
+                    "mac-translation.log",
+                    f"publication_lease_lost {job.id}",
+                )
+                return True
+            if historical and quality_failure:
+                repair = self.store.get_historical_repair(job.id)
+                if repair is None:
+                    raise RuntimeError("historical_repair_missing")
+                paths = build_job_paths(
+                    job.normalized_movie_number,
+                    self.store.jobs_root_mac,
+                    self.store.jobs_root_windows,
+                )
+                quarantine_stage = (
+                    "publisher" if publisher_quality_failure else "publication"
+                )
+                try:
                     with exclusive_job_files_lock(
                         self.store.jobs_root_mac,
                         job.normalized_movie_number,
@@ -808,36 +890,16 @@ class MacTranslationWorker:
                             files_lock,
                             paths.english_srt_path_mac.name,
                             f"{paths.english_srt_path_mac.stem}."
-                            f"rejected-quality-publisher-{repair.id}-"
+                            f"rejected-quality-{quarantine_stage}-{repair.id}-"
                             f"{candidate_hash[:12]}.srt",
                             expected_sha256=candidate_hash,
                         )
-                else:
-                    self._quarantine(paths.english_srt_path_mac, "quality")
-            try:
-                updated = self.store.fail_publication(
-                    job.id,
-                    self.worker_id,
-                    safe_error,
-                    max_publish_attempts=self.max_publish_attempts,
-                    retry_seconds=self.publish_retry_seconds,
-                    permanent=permanent,
-                    lease_token=job.stage_lease_token,
-                )
-            except StageLeaseLostError:
-                error = "publishing: publication_lease_lost"
-                _append_job_log_safely(
-                    Path(job.job_dir_mac),
-                    "mac-translation.log",
-                    f"publication_lease_lost {job.id}",
-                )
-                return True
-            if historical and updated.status is JobStatus.FAILED:
-                reason_code = safe_error if permanent else "publication_attempts_exhausted"
-                updated = self._finish_historical_failure(job, reason_code)
-                if permanent:
-                    lane = self.store.record_historical_quality_failure(self.quality_failure_limit)
-                    self.historical_quality_failures = lane.consecutive_quality_failures
+                except Exception:
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"quality_quarantine_failed {job.id}",
+                    )
             _write_job_snapshot_safely(updated)
             _append_job_log_safely(
                 Path(job.job_dir_mac),
@@ -862,7 +924,7 @@ class MacTranslationWorker:
                 self.store.jobs_root_mac,
                 job.normalized_movie_number,
                 blocking=True,
-            ) as files_lock:
+            ):
                 self._require_historical_preservation_locked(repair, paths)
                 report = validate_translation_quality(
                     paths.japanese_srt_path_mac,
@@ -870,18 +932,6 @@ class MacTranslationWorker:
                 )
                 self._write_quality_log(paths.job_dir_mac, report)
                 if not report.passed:
-                    candidate_hash = self._sha256_file_at(
-                        files_lock.job_fd,
-                        paths.english_srt_path_mac.name,
-                    )
-                    self._historical_quarantine_locked(
-                        files_lock,
-                        paths.english_srt_path_mac.name,
-                        f"{paths.english_srt_path_mac.stem}."
-                        f"rejected-quality-publication-{repair.id}-"
-                        f"{candidate_hash[:12]}.srt",
-                        expected_sha256=candidate_hash,
-                    )
                     raise MacPublicationQualityError(
                         "quality_gate_failed:" + ",".join(report.reason_codes)
                     )
@@ -917,6 +967,8 @@ class MacTranslationWorker:
         )
         if job.translation_origin == NORMAL_TRANSLATION_ORIGIN:
             self.consecutive_quality_failures = 0
+        else:
+            self.historical_quality_failures = 0
         _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -937,11 +989,13 @@ class MacTranslationWorker:
             pass
         error: str | None = None
         try:
+            historical = (
+                job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN
+            )
             try:
                 result = self.catalog_sync_client.sync(
                     job.normalized_movie_number,
                     expected_subtitle_id=job.published_subtitle_id,
-                    expected_storage_path=job.published_storage_path,
                     expected_content_sha256=job.published_content_sha256,
                 )
             except Exception as exc:
@@ -950,14 +1004,29 @@ class MacTranslationWorker:
                 )
                 error = f"catalog_sync: {reason_code}"
                 try:
-                    updated = self.store.fail_catalog_sync(
-                        job.id,
-                        self.worker_id,
-                        reason_code,
-                        lease_token=job.catalog_lease_token,
-                        max_catalog_sync_attempts=self.max_catalog_sync_attempts,
-                        retry_seconds=self.catalog_sync_retry_seconds,
-                    )
+                    if historical:
+                        outcome = self.store.fail_historical_catalog_sync(
+                            job.id,
+                            self.worker_id,
+                            reason_code,
+                            lease_token=job.catalog_lease_token,
+                            max_catalog_sync_attempts=(
+                                self.max_catalog_sync_attempts
+                            ),
+                            retry_seconds=self.catalog_sync_retry_seconds,
+                        )
+                        updated = outcome.job
+                    else:
+                        updated = self.store.fail_catalog_sync(
+                            job.id,
+                            self.worker_id,
+                            reason_code,
+                            lease_token=job.catalog_lease_token,
+                            max_catalog_sync_attempts=(
+                                self.max_catalog_sync_attempts
+                            ),
+                            retry_seconds=self.catalog_sync_retry_seconds,
+                        )
                 except CatalogLeaseLostError:
                     error = "catalog_sync: catalog_lease_lost"
                     _append_job_log_safely(
@@ -966,14 +1035,6 @@ class MacTranslationWorker:
                         f"catalog_lease_lost {job.id}",
                     )
                 else:
-                    if (
-                        job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN
-                        and updated.status is JobStatus.FAILED
-                    ):
-                        updated = self._finish_historical_failure(
-                            job,
-                            reason_code,
-                        )
                     _write_job_snapshot_safely(updated)
                     _append_job_log_safely(
                         Path(job.job_dir_mac),
@@ -981,9 +1042,6 @@ class MacTranslationWorker:
                         f"catalog_sync_failed {job.id} reason_code={reason_code}",
                     )
             else:
-                historical = (
-                    job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN
-                )
                 if historical:
                     repair = self.store.get_historical_repair(job.id)
                     paths = build_job_paths(
@@ -1053,8 +1111,6 @@ class MacTranslationWorker:
                                 job.id,
                                 job.published_content_sha256,
                             )
-                        lane = self.store.reset_historical_quality_failures()
-                        self.historical_quality_failures = lane.consecutive_quality_failures
                     _write_job_snapshot_safely(updated)
                     _append_job_log_safely(
                         Path(job.job_dir_mac),
@@ -1072,33 +1128,6 @@ class MacTranslationWorker:
         finally:
             self._record_idle(error=error)
         return True
-
-    def _finish_historical_failure(
-        self,
-        job: JobRecord,
-        reason_code: str,
-    ):
-        repair = self.store.get_historical_repair(job.id)
-        if repair is None:
-            raise RuntimeError("historical_repair_missing")
-        paths = build_job_paths(
-            job.normalized_movie_number,
-            self.store.jobs_root_mac,
-            self.store.jobs_root_windows,
-        )
-        try:
-            with exclusive_job_files_lock(
-                self.store.jobs_root_mac,
-                job.normalized_movie_number,
-                blocking=True,
-            ):
-                self._require_historical_preservation_locked(repair, paths)
-        except Exception:
-            reason_code = "preservation_hash_changed"
-        self.store.mark_historical_permanent_failure(job.id, reason_code)
-        refreshed = self.store.get_job(job.id)
-        assert refreshed is not None
-        return refreshed
 
     def _write_quality_log(self, job_dir: Path, report: QualityReport) -> None:
         payload = report.as_dict()

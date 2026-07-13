@@ -10,7 +10,6 @@ from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, Catal
 
 CANONICAL_CODE = "roe-291"
 SUBTITLE_ID = "00000000-0000-0000-0000-000000000002"
-STORAGE_PATH = "roe/roe-291/roe-291-English_AI.srt"
 CONTENT_SHA256 = "a" * 64
 TOKEN = "never-log-this-token"
 ADULT_TEXT = "sensitive-response-subtitle-text"
@@ -39,14 +38,18 @@ def valid_body() -> dict[str, object]:
     }
 
 
-def valid_public_body(*, srt_hash: str | None = CONTENT_SHA256) -> dict[str, object]:
+def valid_public_body() -> dict[str, object]:
     return {
         "canonicalCode": CANONICAL_CODE,
         "subtitles": [
             {
                 "id": SUBTITLE_ID,
-                "storagePath": STORAGE_PATH,
-                "srtHash": srt_hash,
+                "lang": "English_AI",
+                "label": "English AI",
+                "languageTag": "en",
+                "vttUrlSigned": "https://signed.example/subtitle.vtt",
+                "expiresAt": "2026-07-13T22:00:00Z",
+                "expiresIn": 3600,
             }
         ],
     }
@@ -104,7 +107,6 @@ def sync(client: CatalogSyncClient, movie_code: str = CANONICAL_CODE):
     return client.sync(
         movie_code,
         expected_subtitle_id=SUBTITLE_ID,
-        expected_storage_path=STORAGE_PATH,
         expected_content_sha256=CONTENT_SHA256,
     )
 
@@ -170,7 +172,8 @@ def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
             },
         ),
         (
-            f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}",
+            f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}"
+            f"?cacheNonce={CONTENT_SHA256}",
             {"timeout": 17, "allow_redirects": False},
         ),
     ]
@@ -391,15 +394,15 @@ def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():
     assert session.requests == []
 
 
-@pytest.mark.parametrize("srt_hash", [None, CONTENT_SHA256])
-def test_public_movie_verification_accepts_expected_subtitle_and_nullable_hash(srt_hash):
-    session = FakeSession(public_response=FakeResponse(body=valid_public_body(srt_hash=srt_hash)))
+def test_public_movie_verification_accepts_real_public_subtitle_shape():
+    session = FakeSession(public_response=FakeResponse(body=valid_public_body()))
 
     result = sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
 
     assert result.canonical_code == CANONICAL_CODE
     assert session.requests[-1] == (
-        f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}",
+        f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}"
+        f"?cacheNonce={CONTENT_SHA256}",
         {"timeout": 30, "allow_redirects": False},
     )
 
@@ -413,8 +416,8 @@ def test_public_movie_verification_accepts_expected_subtitle_and_nullable_hash(s
             {
                 "canonicalCode": CANONICAL_CODE,
                 "subtitles": [
-                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": None},
-                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": None},
+                    {"id": SUBTITLE_ID},
+                    {"id": SUBTITLE_ID},
                 ],
             },
             "public_visibility_mismatch",
@@ -422,20 +425,9 @@ def test_public_movie_verification_accepts_expected_subtitle_and_nullable_hash(s
         (
             {
                 "canonicalCode": CANONICAL_CODE,
-                "subtitles": [
-                    {"id": SUBTITLE_ID, "storagePath": "wrong/path.srt", "srtHash": None}
-                ],
+                "subtitles": "not-an-array",
             },
-            "public_visibility_mismatch",
-        ),
-        (
-            {
-                "canonicalCode": CANONICAL_CODE,
-                "subtitles": [
-                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": "b" * 64}
-                ],
-            },
-            "public_visibility_mismatch",
+            "public_visibility_response_invalid",
         ),
         ([], "public_visibility_response_invalid"),
     ],

@@ -111,7 +111,7 @@ def test_selector_matches_legacy_unpadded_alias_and_preserves_paths(
 
 
 @pytest.mark.parametrize("movie", ["abc-7", "abc-007"])
-def test_prepare_matches_legacy_alias_and_resets_only_translation(
+def test_legacy_prepare_alias_is_disabled_without_mutation(
     sqlite_path, mac_jobs_root, tmp_path, movie
 ):
     from orchestrator.historical_repair import prepare_historical_repair_canary
@@ -130,19 +130,17 @@ def test_prepare_matches_legacy_alias_and_resets_only_translation(
     japanese_before = paths.japanese_srt_path_mac.read_bytes()
     audio_before = paths.audio_path_mac.read_bytes()
 
-    prepared = prepare_historical_repair_canary(
-        store,
-        allowlist,
-        movie=movie,
-        limit=1,
-        confirm_job_id=job.id,
-    )
+    before = store.get_job(job.id)
+    with pytest.raises(RuntimeError, match="legacy_historical_prepare_disabled"):
+        prepare_historical_repair_canary(
+            store,
+            allowlist,
+            movie=movie,
+            limit=1,
+            confirm_job_id=job.id,
+        )
 
-    assert prepared.normalized_movie_number == "abc-7"
-    assert prepared.status is JobStatus.TRANSCRIPTION_DONE
-    assert prepared.worker_attempt_count == 2
-    assert prepared.translation_attempt_count == 0
-    assert prepared.english_srt_path_mac is None
+    assert store.get_job(job.id) == before
     assert paths.english_srt_path_mac.exists()
     assert paths.japanese_srt_path_mac.read_bytes() == japanese_before
     assert paths.audio_path_mac.read_bytes() == audio_before
@@ -262,7 +260,7 @@ def test_prepare_requires_exact_limit_and_job_confirmation(
     assert paths.audio_path_mac.read_bytes() == before["audio"]
 
 
-def test_prepare_resets_only_selected_translation_stage(
+def test_legacy_prepare_selected_stage_is_disabled_without_mutation(
     sqlite_path, mac_jobs_root, tmp_path
 ):
     from orchestrator.historical_repair import prepare_historical_repair_canary
@@ -281,18 +279,17 @@ def test_prepare_resets_only_selected_translation_stage(
     japanese_hash = paths.japanese_srt_path_mac.read_bytes()
     audio_hash = paths.audio_path_mac.read_bytes()
 
-    prepared = prepare_historical_repair_canary(
-        store,
-        allowlist,
-        movie="abc-001",
-        limit=1,
-        confirm_job_id=job.id,
-    )
+    before = store.get_job(job.id)
+    with pytest.raises(RuntimeError, match="legacy_historical_prepare_disabled"):
+        prepare_historical_repair_canary(
+            store,
+            allowlist,
+            movie="abc-001",
+            limit=1,
+            confirm_job_id=job.id,
+        )
 
-    assert prepared.status is JobStatus.TRANSCRIPTION_DONE
-    assert prepared.worker_attempt_count == 2
-    assert prepared.translation_attempt_count == 0
-    assert prepared.english_srt_path_mac is None
+    assert store.get_job(job.id) == before
     assert paths.english_srt_path_mac.exists()
     assert paths.japanese_srt_path_mac.read_bytes() == japanese_hash
     assert paths.audio_path_mac.read_bytes() == audio_hash
