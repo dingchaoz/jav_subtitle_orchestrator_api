@@ -104,6 +104,25 @@ def test_load_publish_metadata_drops_invalid_optional_values(tmp_path):
     assert load_publish_metadata(metadata_path, "mist-166") == {}
 
 
+def test_load_publish_metadata_ignores_overlong_duration_digits(tmp_path):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "number": "mist-166",
+                "title": "Local title",
+                "duration": "9" * 5000,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_publish_metadata(metadata_path, "mist-166") == {
+        "number": "mist-166",
+        "title": "Local title",
+    }
+
+
 def test_load_publish_metadata_uses_requested_number_when_number_is_absent(tmp_path):
     metadata_path = tmp_path / "metadata.json"
     metadata_path.write_text(

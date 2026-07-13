@@ -70,9 +70,13 @@ def load_publish_metadata(path: Path, movie_code: str) -> dict[str, object]:
     if isinstance(raw_duration, str):
         match = DURATION_NUMBER_RE.search(raw_duration)
         if match is not None:
-            duration = int(match.group())
-            if 1 <= duration <= 1440:
-                cleaned["duration_minutes"] = duration
+            try:
+                duration = int(match.group())
+            except (ValueError, OverflowError):
+                pass
+            else:
+                if 1 <= duration <= 1440:
+                    cleaned["duration_minutes"] = duration
 
     if len(cleaned) == 1:
         return {}
