@@ -1509,6 +1509,78 @@ def test_expired_catalog_sync_lease_uses_only_catalog_counter(
     assert recovered.error == "catalog_sync: catalog_sync_lease_expired"
 
 
+def test_migrated_null_catalog_token_expired_lease_recovers(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-033")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-033/abc-033-English_AI.srt",
+        content_sha256="3" * 64,
+        file_size=333,
+    )
+    expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = ?, lease_expires_at = ? "
+            "WHERE id = ?",
+            (JobStatus.CATALOG_SYNCING.value, "legacy-worker", expired, receipt.id),
+        )
+        conn.execute("ALTER TABLE jobs DROP COLUMN catalog_lease_token")
+
+    store.initialize()
+    migrated = store.get_job(receipt.id)
+    assert migrated.status is JobStatus.CATALOG_SYNCING
+    assert migrated.catalog_lease_token is None
+
+    assert store.recover_expired_catalog_sync_leases(3, 0) == 1
+    recovered = store.get_job(receipt.id)
+    assert recovered.status is JobStatus.CATALOG_SYNC_PENDING
+    assert recovered.claimed_by is None
+    assert recovered.catalog_sync_attempt_count == 1
+
+
+def test_catalog_recovery_includes_lease_expiring_exactly_now(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-034")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-034/abc-034-English_AI.srt",
+        content_sha256="4" * 64,
+        file_size=444,
+    )
+    syncing = store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id)
+    fixed_now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    store.force_lease_expiry_for_test(syncing.id, fixed_now.isoformat())
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz):
+            return fixed_now
+
+    monkeypatch.setattr(store_module, "datetime", FixedDatetime)
+
+    assert store.recover_expired_catalog_sync_leases(3, 0) == 1
+    assert store.get_job(receipt.id).status is JobStatus.CATALOG_SYNC_PENDING
+
+
 def test_catalog_fencing_rejects_stale_same_worker_complete_and_fail(
     sqlite_path, mac_jobs_root
 ):

@@ -10,7 +10,7 @@ from orchestrator.job_logs import append_job_log
 from orchestrator.job_snapshot import write_job_snapshot
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
-from orchestrator.store import JobRecord, JobStore
+from orchestrator.store import CatalogLeaseLostError, JobRecord, JobStore
 from orchestrator.subtitle_quality import (
     QualityReport,
     SubtitleQualityGateError,
@@ -484,50 +484,71 @@ class MacTranslationWorker:
             pass
         error: str | None = None
         try:
-            result = self.catalog_sync_client.sync(job.normalized_movie_number)
-            updated = self.store.complete_catalog_sync(
-                job.id,
-                self.worker_id,
-                lease_token=job.catalog_lease_token,
-                canonical_code=result.canonical_code,
-                d1_rows_updated=result.d1_rows_updated,
-                subtitle_count=result.subtitle_count,
-                kv_keys_deleted=result.kv_keys_deleted,
-            )
-            _write_job_snapshot_safely(updated)
-            _append_job_log_safely(
-                Path(job.job_dir_mac),
-                "mac-translation.log",
-                f"catalog_sync_verified {job.id} code={result.canonical_code} "
-                f"d1_rows={result.d1_rows_updated} "
-                f"subtitle_count={result.subtitle_count}",
-            )
-            _append_job_log_safely(
-                Path(job.job_dir_mac),
-                "mac-translation.log",
-                f"english_srt_ready {job.id}",
-            )
-        except Exception as exc:
-            reason_code = (
-                exc.reason_code
-                if isinstance(exc, CatalogSyncError)
-                else "catalog_sync_failed"
-            )
-            error = f"catalog_sync: {reason_code}"
-            updated = self.store.fail_catalog_sync(
-                job.id,
-                self.worker_id,
-                reason_code,
-                lease_token=job.catalog_lease_token,
-                max_catalog_sync_attempts=self.max_catalog_sync_attempts,
-                retry_seconds=self.catalog_sync_retry_seconds,
-            )
-            _write_job_snapshot_safely(updated)
-            _append_job_log_safely(
-                Path(job.job_dir_mac),
-                "mac-translation.log",
-                f"catalog_sync_failed {job.id} reason_code={reason_code}",
-            )
+            try:
+                result = self.catalog_sync_client.sync(job.normalized_movie_number)
+            except Exception as exc:
+                reason_code = (
+                    exc.reason_code
+                    if isinstance(exc, CatalogSyncError)
+                    else "catalog_sync_failed"
+                )
+                error = f"catalog_sync: {reason_code}"
+                try:
+                    updated = self.store.fail_catalog_sync(
+                        job.id,
+                        self.worker_id,
+                        reason_code,
+                        lease_token=job.catalog_lease_token,
+                        max_catalog_sync_attempts=self.max_catalog_sync_attempts,
+                        retry_seconds=self.catalog_sync_retry_seconds,
+                    )
+                except CatalogLeaseLostError:
+                    error = "catalog_sync: catalog_lease_lost"
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"catalog_lease_lost {job.id}",
+                    )
+                else:
+                    _write_job_snapshot_safely(updated)
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"catalog_sync_failed {job.id} reason_code={reason_code}",
+                    )
+            else:
+                try:
+                    updated = self.store.complete_catalog_sync(
+                        job.id,
+                        self.worker_id,
+                        lease_token=job.catalog_lease_token,
+                        canonical_code=result.canonical_code,
+                        d1_rows_updated=result.d1_rows_updated,
+                        subtitle_count=result.subtitle_count,
+                        kv_keys_deleted=result.kv_keys_deleted,
+                    )
+                except CatalogLeaseLostError:
+                    error = "catalog_sync: catalog_lease_lost"
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"catalog_lease_lost {job.id}",
+                    )
+                else:
+                    _write_job_snapshot_safely(updated)
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"catalog_sync_verified {job.id} "
+                        f"code={result.canonical_code} "
+                        f"d1_rows={result.d1_rows_updated} "
+                        f"subtitle_count={result.subtitle_count}",
+                    )
+                    _append_job_log_safely(
+                        Path(job.job_dir_mac),
+                        "mac-translation.log",
+                        f"english_srt_ready {job.id}",
+                    )
         finally:
             self._record_idle(error=error)
         return True

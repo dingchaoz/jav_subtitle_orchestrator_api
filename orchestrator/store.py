@@ -36,6 +36,10 @@ _CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
 )
 
 
+class CatalogLeaseLostError(PermissionError):
+    """Raised when a catalog mutation no longer owns its fenced lease."""
+
+
 def _validate_expected_sha256(value: str, label: str) -> None:
     if (
         not isinstance(value, str)
@@ -1748,7 +1752,9 @@ class JobStore:
                 or not job.lease_expires_at
                 or job.lease_expires_at <= now
             ):
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+                raise CatalogLeaseLostError(
+                    f"job {job_id} catalog lease is no longer owned"
+                )
             attempts = job.catalog_sync_attempt_count + 1
             exhausted = attempts >= max_catalog_sync_attempts
             next_status = JobStatus.FAILED if exhausted else JobStatus.CATALOG_SYNC_PENDING
@@ -1782,7 +1788,9 @@ class JobStore:
                 ),
             )
             if cursor.rowcount != 1:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+                raise CatalogLeaseLostError(
+                    f"job {job_id} catalog lease is no longer owned"
+                )
             failed = self.get_job(job_id, conn=conn)
             assert failed is not None
             return failed
@@ -1830,7 +1838,9 @@ class JobStore:
                 or not job.lease_expires_at
                 or job.lease_expires_at <= now
             ):
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+                raise CatalogLeaseLostError(
+                    f"job {job_id} catalog lease is no longer owned"
+                )
             if canonical_movie_code(job.normalized_movie_number) != canonical:
                 raise ValueError("catalog canonical code does not match job")
             _validate_verified_supabase_receipt(
@@ -1864,7 +1874,9 @@ class JobStore:
                 ),
             )
             if cursor.rowcount != 1:
-                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+                raise CatalogLeaseLostError(
+                    f"job {job_id} catalog lease is no longer owned"
+                )
             completed = self.get_job(job_id, conn=conn)
             assert completed is not None
             return completed
@@ -1884,7 +1896,7 @@ class JobStore:
                 SELECT id, claimed_by, catalog_lease_token,
                        catalog_sync_attempt_count FROM jobs
                 WHERE status = ? AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at < ?
+                  AND lease_expires_at <= ?
                 """,
                 (JobStatus.CATALOG_SYNCING.value, now),
             ).fetchall()
@@ -1909,7 +1921,7 @@ class JobStore:
                         lease_expires_at = NULL, catalog_lease_token = NULL,
                         updated_at = ?, error = ?
                     WHERE id = ? AND status = ? AND claimed_by = ?
-                      AND catalog_lease_token = ?
+                      AND catalog_lease_token IS ?
                     """,
                     (
                         next_status.value,

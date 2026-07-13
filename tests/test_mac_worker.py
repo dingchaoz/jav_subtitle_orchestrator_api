@@ -1,4 +1,6 @@
 import hashlib
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -320,6 +322,40 @@ class RecordingCatalogSync:
         error = next(self.errors, None)
         if error is not None:
             raise error
+        return SimpleNamespace(
+            canonical_code=movie,
+            d1_rows_updated=1,
+            subtitle_count=1,
+            kv_keys_deleted=(
+                f"movie:full:{movie}",
+                f"movie:light:{movie}",
+            ),
+        )
+
+
+class ReclaimingCatalogSync:
+    def __init__(self, store, job_id, *, fail=False):
+        self.store = store
+        self.job_id = job_id
+        self.fail = fail
+        self.reclaimed = None
+
+    def sync(self, movie):
+        from orchestrator.catalog_sync import CatalogSyncError
+
+        expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(
+            microsecond=0
+        ).isoformat()
+        self.store.force_lease_expiry_for_test(self.job_id, expired)
+        assert self.store.recover_expired_catalog_sync_leases(3, 0) == 1
+        self.reclaimed = self.store.claim_catalog_sync_job(
+            "replacement-worker",
+            60,
+            job_id=self.job_id,
+        )
+        assert self.reclaimed is not None
+        if self.fail:
+            raise CatalogSyncError("catalog_fetch_failed")
         return SimpleNamespace(
             canonical_code=movie,
             d1_rows_updated=1,
@@ -1081,6 +1117,109 @@ def test_catalog_snapshot_failure_keeps_ready_and_worker_continues(
     ).read_text(encoding="utf-8")
     assert worker.process_one() is True
     assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
+
+
+@pytest.mark.parametrize("catalog_fails", [False, True])
+def test_catalog_worker_safely_yields_when_lease_is_recovered_and_reclaimed(
+    sqlite_path, mac_jobs_root, catalog_fails
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-035")
+    setup = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="setup-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert setup.process_one() is True
+    assert setup.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+
+    catalog = ReclaimingCatalogSync(store, job.id, fail=catalog_fails)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="lease-losing-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=catalog,
+        catalog_sync_retry_seconds=0,
+    )
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.claimed_by == "replacement-worker"
+    assert current.catalog_lease_token == catalog.reclaimed.catalog_lease_token
+    assert current.catalog_sync_attempt_count == 1
+    log = (
+        mac_jobs_root / "abc-035" / "logs" / "mac-translation.log"
+    ).read_text(encoding="utf-8")
+    assert "catalog_lease_lost" in log
+    assert catalog.reclaimed.catalog_lease_token not in log
+
+
+@pytest.mark.parametrize("database_failure_stage", ["complete", "fail"])
+def test_catalog_worker_does_not_swallow_unknown_database_errors(
+    sqlite_path, mac_jobs_root, monkeypatch, database_failure_stage
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-036")
+    setup = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="setup-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert setup.process_one() is True
+    assert setup.process_one() is True
+    catalog = RecordingCatalogSync(
+        errors=(
+            [CatalogSyncError("catalog_fetch_failed")]
+            if database_failure_stage == "fail"
+            else None
+        )
+    )
+    method_name = (
+        "complete_catalog_sync"
+        if database_failure_stage == "complete"
+        else "fail_catalog_sync"
+    )
+    monkeypatch.setattr(
+        store,
+        method_name,
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database unavailable")
+        ),
+    )
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="database-error-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=catalog,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        worker.process_one()
+
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.claimed_by == "database-error-worker"
 
 
 def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
