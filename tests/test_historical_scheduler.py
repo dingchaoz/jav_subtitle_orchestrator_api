@@ -4,7 +4,9 @@ import hashlib
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -142,6 +144,131 @@ def test_historical_claim_atomically_activates_exact_job(
     assert repair is not None
     assert repair.state is HistoricalRepairState.RUNNING
     assert repair.attempt_count == 1
+
+
+def test_normal_translation_claim_blocks_historical_translate_locally_slot(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    historical, _ = _repair_candidate(store, mac_jobs_root, "old-301")
+    normal = store.submit_job("new-301", priority=100, force=False).job
+    assert normal is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, normal.id),
+        )
+
+    claimed = store.claim_next_translation_job("mac-normal", 60)
+
+    assert claimed is not None and claimed.id == normal.id
+    assert store.claim_next_historical_repair("mac-history", 60) is None
+    assert store.get_job(historical.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_historical_translation_claim_blocks_normal_translate_locally_slot(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    historical, _ = _repair_candidate(store, mac_jobs_root, "old-302")
+    claimed = store.claim_next_historical_repair("mac-history", 60)
+    assert claimed is not None and claimed.id == historical.id
+    normal = store.submit_job("new-302", priority=100, force=False).job
+    assert normal is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, normal.id),
+        )
+
+    assert store.claim_next_translation_job("mac-normal", 60) is None
+    assert store.get_job(normal.id).status is JobStatus.TRANSCRIPTION_DONE
+
+
+def test_simultaneous_normal_and_historical_claims_take_one_global_slot(
+    sqlite_path, mac_jobs_root
+):
+    setup_store = _store(sqlite_path, mac_jobs_root)
+    _repair_candidate(setup_store, mac_jobs_root, "old-303")
+    normal = setup_store.submit_job("new-303", priority=100, force=False).job
+    assert normal is not None
+    with setup_store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, normal.id),
+        )
+    barrier = Barrier(2)
+
+    def claim_normal():
+        store = _store(sqlite_path, mac_jobs_root)
+        barrier.wait()
+        return store.claim_next_translation_job("mac-normal", 60)
+
+    def claim_historical():
+        store = _store(sqlite_path, mac_jobs_root)
+        barrier.wait()
+        return store.claim_next_historical_repair("mac-history", 60)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(lambda fn: fn(), (claim_normal, claim_historical)))
+
+    assert sum(claim is not None for claim in claims) == 1
+    with setup_store.connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = ?",
+            (JobStatus.TRANSLATING.value,),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_expired_translation_still_blocks_slot_until_recovered(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [
+        store.submit_job(movie, priority=100, force=False).job
+        for movie in ("new-304", "new-305")
+    ]
+    assert all(job is not None for job in jobs)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id IN (?, ?)",
+            (JobStatus.TRANSCRIPTION_DONE.value, jobs[0].id, jobs[1].id),
+        )
+    first = store.claim_next_translation_job("mac-normal", 60)
+    assert first is not None
+    expired = (datetime.now(UTC) - timedelta(seconds=1)).replace(
+        microsecond=0
+    ).isoformat()
+    store.force_lease_expiry_for_test(first.id, expired)
+
+    assert store.claim_next_translation_job("mac-other", 60) is None
+    assert store.recover_expired_translation_leases(3) == 1
+    assert store.claim_next_translation_job("mac-other", 60) is not None
+
+
+@pytest.mark.parametrize("busy_status", [JobStatus.PUBLISHING, JobStatus.CATALOG_SYNCING])
+def test_non_translation_stage_does_not_consume_translate_locally_slot(
+    sqlite_path, mac_jobs_root, busy_status
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    suffix = "306" if busy_status is JobStatus.PUBLISHING else "307"
+    busy = store.submit_job(f"busy-{suffix}", 100, False).job
+    normal = store.submit_job(f"normal-{suffix}", 100, False).job
+    assert busy is not None and normal is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (busy_status.value, busy.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, normal.id),
+        )
+
+    claimed = store.claim_next_translation_job("mac-normal", 60)
+
+    assert claimed is not None and claimed.id == normal.id
 
 
 @pytest.mark.parametrize(
@@ -505,6 +632,64 @@ def test_reconciler_fails_closed_for_unknown_running_failed_repair(
     assert repair.state is HistoricalRepairState.PERMANENT_FAILED
     assert repair.reason_code == "historical_orphaned_terminal_state"
     assert store.claim_next_historical_repair("mac-1", 60) is None
+
+
+def test_reconciler_requeues_only_explicit_translation_lease_orphan(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-324")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs "
+            "SET state = ?, attempt_count = 1 WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "translating: translation_lease_expired",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+
+    repair = store.get_historical_repair(job.id)
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert repair.state is HistoricalRepairState.RETRY_WAIT
+    assert repair.reason_code == "historical_orphaned_transient_retry"
+
+
+def test_reconciler_fails_closed_for_ambiguous_orphan_stage(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, _ = _repair_candidate(store, mac_jobs_root, "old-325")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = ?, error = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                HISTORICAL_TRANSLATION_ORIGIN,
+                "translation_lease_expired; publication lease expired",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+
+    repair = store.get_historical_repair(job.id)
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "historical_orphaned_terminal_state"
 
 
 def test_reconciler_preserves_receipts_for_exhausted_publication_orphan(

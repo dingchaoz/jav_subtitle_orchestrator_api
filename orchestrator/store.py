@@ -1321,6 +1321,12 @@ class JobStore:
         lease_token = uuid4().hex
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            translating = conn.execute(
+                "SELECT 1 FROM jobs WHERE status = ? LIMIT 1",
+                (JobStatus.TRANSLATING.value,),
+            ).fetchone()
+            if translating is not None:
+                return None
             row = conn.execute(
                 """
                 SELECT * FROM jobs
@@ -1750,8 +1756,8 @@ class JobStore:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT r.job_id, r.attempt_count, j.error,
-                       j.publish_attempt_count, j.catalog_sync_attempt_count
+                SELECT r.job_id AS repair_job_id,
+                       r.attempt_count AS repair_attempt_count, j.*
                 FROM historical_translation_repairs AS r
                 JOIN jobs AS j ON j.id = r.job_id
                 WHERE r.state = ? AND j.status = ? AND j.claimed_by IS NULL
@@ -1765,28 +1771,130 @@ class JobStore:
             ).fetchall()
             for row in rows:
                 error = row["error"] or ""
-                translation_retry = (
-                    "translation_lease_expired" in error
-                    and row["attempt_count"] < max_translation_attempts
-                )
-                publication_retry = (
+                quality_failure = "quality_gate_failed:" in error
+                preservation_failure = "preservation_hash_changed" in error
+                translation_marker = "translation_lease_expired" in error
+                publication_marker = (
                     "publication lease expired" in error
+                    or "publication_lease_expired" in error
+                )
+                catalog_marker = "catalog_sync_lease_expired" in error
+                stage_count = sum(
+                    (translation_marker, publication_marker, catalog_marker)
+                )
+                stage = None
+                if not quality_failure and not preservation_failure and stage_count == 1:
+                    if translation_marker:
+                        stage = "translation"
+                    elif publication_marker:
+                        stage = "publication"
+                    else:
+                        stage = "catalog"
+
+                catalog_receipt_valid = False
+                if stage == "catalog":
+                    try:
+                        _validate_verified_supabase_receipt(
+                            movie_code=row["normalized_movie_number"],
+                            movie_uuid=row["catalog_movie_uuid"],
+                            metadata_status=row["metadata_status"],
+                            metadata_source=row["metadata_source"],
+                            subtitle_id=row["published_subtitle_id"],
+                            storage_path=row["published_storage_path"],
+                            content_sha256=row["published_content_sha256"],
+                            file_size=row["published_file_size"],
+                        )
+                    except ValueError:
+                        pass
+                    else:
+                        catalog_receipt_valid = True
+
+                translation_retry = (
+                    stage == "translation"
+                    and row["repair_attempt_count"] < max_translation_attempts
+                )
+                publication_resume = (
+                    stage == "publication"
                     and row["publish_attempt_count"] < max_publish_attempts
                 )
-                catalog_retry = (
-                    "catalog_sync_lease_expired" in error
+                catalog_resume = (
+                    stage == "catalog"
+                    and catalog_receipt_valid
                     and row["catalog_sync_attempt_count"]
                     < max_catalog_sync_attempts
                 )
-                transient_retry = (
-                    translation_retry or publication_retry or catalog_retry
-                )
-                quality_failure = "quality_gate_failed:" in error
-                preservation_failure = "preservation_hash_changed" in error
-                if transient_retry:
+                if translation_retry:
                     state = HistoricalRepairState.RETRY_WAIT
                     next_attempt_at = now
                     reason_code = "historical_orphaned_transient_retry"
+                elif publication_resume:
+                    job_cursor = conn.execute(
+                        """
+                        UPDATE jobs SET status = ?, updated_at = ?
+                        WHERE id = ? AND status = ? AND claimed_by IS NULL
+                          AND translation_origin = ?
+                        """,
+                        (
+                            JobStatus.PUBLISH_PENDING.value,
+                            now,
+                            row["repair_job_id"],
+                            JobStatus.FAILED.value,
+                            HISTORICAL_TRANSLATION_ORIGIN,
+                        ),
+                    )
+                    repair_cursor = conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET reason_code = ?, updated_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            "historical_orphaned_publication_resume",
+                            now,
+                            row["repair_job_id"],
+                            HistoricalRepairState.RUNNING.value,
+                        ),
+                    )
+                    if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "historical_orphaned_publication_state_changed"
+                        )
+                    reconciled += 1
+                    continue
+                elif catalog_resume:
+                    job_cursor = conn.execute(
+                        """
+                        UPDATE jobs SET status = ?, updated_at = ?
+                        WHERE id = ? AND status = ? AND claimed_by IS NULL
+                          AND translation_origin = ?
+                        """,
+                        (
+                            JobStatus.CATALOG_SYNC_PENDING.value,
+                            now,
+                            row["repair_job_id"],
+                            JobStatus.FAILED.value,
+                            HISTORICAL_TRANSLATION_ORIGIN,
+                        ),
+                    )
+                    repair_cursor = conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET reason_code = ?, updated_at = ?
+                        WHERE job_id = ? AND state = ?
+                        """,
+                        (
+                            "historical_orphaned_catalog_resume",
+                            now,
+                            row["repair_job_id"],
+                            HistoricalRepairState.RUNNING.value,
+                        ),
+                    )
+                    if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "historical_orphaned_catalog_state_changed"
+                        )
+                    reconciled += 1
+                    continue
                 else:
                     state = HistoricalRepairState.PERMANENT_FAILED
                     next_attempt_at = None
@@ -1796,13 +1904,24 @@ class JobStore:
                         )[1]
                     elif preservation_failure:
                         reason_code = "preservation_hash_changed"
+                    elif stage == "translation":
+                        reason_code = "translation_attempts_exhausted"
                     elif (
+                        stage == "publication"
+                        and row["publish_attempt_count"] >= max_publish_attempts
+                    ) or (
                         row["publish_attempt_count"]
                         >= max_publish_attempts
                         or "publication_attempts_exhausted" in error
                     ):
                         reason_code = "publication_attempts_exhausted"
+                    elif stage == "catalog" and not catalog_receipt_valid:
+                        reason_code = "catalog_receipt_invalid"
                     elif (
+                        stage == "catalog"
+                        and row["catalog_sync_attempt_count"]
+                        >= max_catalog_sync_attempts
+                    ) or (
                         row["catalog_sync_attempt_count"]
                         >= max_catalog_sync_attempts
                         or "catalog_sync_attempts_exhausted" in error
@@ -1822,7 +1941,7 @@ class JobStore:
                         next_attempt_at,
                         reason_code,
                         now,
-                        row["job_id"],
+                        row["repair_job_id"],
                         HistoricalRepairState.RUNNING.value,
                     ),
                 )
@@ -1830,7 +1949,7 @@ class JobStore:
                 if (
                     cursor.rowcount == 1
                     and quality_failure
-                    and not transient_retry
+                    and not translation_retry
                 ):
                     self._increment_historical_quality_failure_conn(
                         conn, quality_failure_limit, now
@@ -1838,7 +1957,7 @@ class JobStore:
                 elif (
                     cursor.rowcount == 1
                     and preservation_failure
-                    and not transient_retry
+                    and not translation_retry
                 ):
                     self._pause_historical_preservation_conn(conn, now)
         return reconciled
@@ -1900,6 +2019,12 @@ class JobStore:
                     "SELECT paused FROM historical_repair_control WHERE singleton = 1"
                 ).fetchone()
                 if control is None or control["paused"]:
+                    return None
+                translating = conn.execute(
+                    "SELECT 1 FROM jobs WHERE status = ? LIMIT 1",
+                    (JobStatus.TRANSLATING.value,),
+                ).fetchone()
+                if translating is not None:
                     return None
                 running = conn.execute(
                     "SELECT 1 FROM historical_translation_repairs WHERE state = ? LIMIT 1",

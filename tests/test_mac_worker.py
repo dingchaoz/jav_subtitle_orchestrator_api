@@ -590,6 +590,190 @@ def test_good_historical_repair_uploads_catalogs_and_marks_success(sqlite_path, 
     assert hashlib.sha256(paths.japanese_srt_path_mac.read_bytes()).hexdigest() == japanese_before
 
 
+def test_publication_orphan_resumes_publisher_without_retranslation(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-321")
+    setup_events = []
+    setup_worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(setup_events),
+        max_translation_attempts=3,
+        worker_id="mac-setup",
+        lease_seconds=60,
+        publisher=RecordingPublisher(setup_events),
+        catalog_sync_client=RecordingCatalogSync(setup_events),
+    )
+    assert setup_worker.process_one() is True
+    assert [event[0] for event in setup_events] == ["translate"]
+    due = (datetime.now(UTC) - timedelta(minutes=1)).replace(
+        microsecond=0
+    ).isoformat()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = NULL, "
+            "lease_expires_at = NULL, stage_lease_token = NULL, error = ?, "
+            "publish_attempt_count = 1, next_publish_attempt_at = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "publishing: publication lease expired",
+                due,
+                job.id,
+            ),
+        )
+    before = store.get_job(job.id)
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+
+    resumed = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    assert resumed.status is JobStatus.PUBLISH_PENDING
+    assert repair.state is HistoricalRepairState.RUNNING
+    assert resumed.publish_attempt_count == before.publish_attempt_count == 1
+    assert resumed.next_publish_attempt_at == before.next_publish_attempt_at == due
+    assert resumed.english_srt_path_mac == before.english_srt_path_mac
+    assert resumed.published_subtitle_id == before.published_subtitle_id
+    assert paths.english_srt_path_mac.exists()
+
+    events = []
+    restarted = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-restarted",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert restarted.process_one() is True
+    assert [event[0] for event in events] == ["publish"]
+    published = store.get_job(job.id)
+    assert published.status is JobStatus.CATALOG_SYNC_PENDING
+    assert published.publish_attempt_count == 1
+
+
+def test_catalog_orphan_resumes_catalog_without_translation_or_reupload(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-322")
+    setup_events = []
+    setup_worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(setup_events),
+        max_translation_attempts=3,
+        worker_id="mac-setup",
+        lease_seconds=60,
+        publisher=RecordingPublisher(setup_events),
+        catalog_sync_client=RecordingCatalogSync(setup_events),
+    )
+    assert setup_worker.process_one() is True
+    assert setup_worker.process_one() is True
+    assert [event[0] for event in setup_events] == ["translate", "publish"]
+    due = (datetime.now(UTC) - timedelta(minutes=1)).replace(
+        microsecond=0
+    ).isoformat()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = NULL, "
+            "lease_expires_at = NULL, catalog_lease_token = NULL, error = ?, "
+            "catalog_sync_attempt_count = 1, next_catalog_sync_attempt_at = ? "
+            "WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "catalog_sync: catalog_sync_lease_expired",
+                due,
+                job.id,
+            ),
+        )
+    before = store.get_job(job.id)
+    receipt = (
+        before.catalog_movie_uuid,
+        before.metadata_status,
+        before.metadata_source,
+        before.published_subtitle_id,
+        before.published_storage_path,
+        before.published_content_sha256,
+        before.published_file_size,
+    )
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+
+    resumed = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    assert resumed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert repair.state is HistoricalRepairState.RUNNING
+    assert resumed.catalog_sync_attempt_count == before.catalog_sync_attempt_count == 1
+    assert resumed.next_catalog_sync_attempt_at == due
+    assert (
+        resumed.catalog_movie_uuid,
+        resumed.metadata_status,
+        resumed.metadata_source,
+        resumed.published_subtitle_id,
+        resumed.published_storage_path,
+        resumed.published_content_sha256,
+        resumed.published_file_size,
+    ) == receipt
+
+    events = []
+    restarted = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-restarted",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert restarted.process_one() is True
+    assert [event[0] for event in events] == ["catalog"]
+    cataloged = store.get_job(job.id)
+    assert cataloged.status is JobStatus.ENGLISH_SRT_READY
+    assert cataloged.catalog_sync_attempt_count == 1
+
+
+def test_catalog_orphan_with_invalid_receipt_fails_closed(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-323")
+    setup_worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-setup",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert setup_worker.process_one() is True
+    assert setup_worker.process_one() is True
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = NULL, "
+            "lease_expires_at = NULL, catalog_lease_token = NULL, error = ?, "
+            "published_storage_path = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "catalog_sync: catalog_sync_lease_expired",
+                "wrong/path.srt",
+                job.id,
+            ),
+        )
+
+    assert store.reconcile_orphaned_historical_repairs() == 1
+
+    repair = store.get_historical_repair(job.id)
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert store.claim_catalog_sync_job("mac-restarted", 60, job_id=job.id) is None
+
+
 def test_bad_historical_candidate_is_permanent_rejected_and_never_published(
     sqlite_path, mac_jobs_root
 ):
