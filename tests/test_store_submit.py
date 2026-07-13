@@ -66,6 +66,54 @@ def test_initialize_closes_connection(sqlite_path, mac_jobs_root):
     assert_connection_closed(store.connections[0])
 
 
+def test_initialize_adds_publication_columns_to_legacy_database(
+    sqlite_path, mac_jobs_root
+):
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY,
+              movie_number TEXT NOT NULL,
+              normalized_movie_number TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL,
+              priority INTEGER NOT NULL DEFAULT 100,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              worker_attempt_count INTEGER NOT NULL DEFAULT 0,
+              translation_attempt_count INTEGER NOT NULL DEFAULT 0,
+              claimed_by TEXT,
+              lease_expires_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              error TEXT,
+              job_dir_mac TEXT NOT NULL,
+              job_dir_windows TEXT NOT NULL,
+              metadata_path_mac TEXT,
+              audio_path_mac TEXT,
+              audio_path_windows TEXT,
+              japanese_srt_path_mac TEXT,
+              japanese_srt_path_windows TEXT,
+              english_srt_path_mac TEXT,
+              english_srt_path_windows TEXT
+            )
+            """
+        )
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        columns = {
+            row[1]: (row[2].upper(), row[3], row[4])
+            for row in conn.execute("PRAGMA table_info(jobs)")
+        }
+    assert columns["publish_attempt_count"] == ("INTEGER", 1, "0")
+    assert columns["next_publish_attempt_at"] == ("TEXT", 0, None)
+    assert columns["catalog_movie_uuid"] == ("TEXT", 0, None)
+    assert columns["metadata_status"] == ("TEXT", 0, None)
+    assert columns["metadata_source"] == ("TEXT", 0, None)
+
+
 def test_submit_job_closes_connection_after_write(sqlite_path, mac_jobs_root):
     store = TrackingJobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -108,6 +156,11 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
         created.job.id,
         status=JobStatus.FAILED.value,
         translation_attempt_count=2,
+        publish_attempt_count=2,
+        next_publish_attempt_at="2026-07-12T12:00:00+00:00",
+        catalog_movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
         claimed_by="worker-1",
         lease_expires_at="2026-07-04T12:00:00+00:00",
         error="transcription failed",
@@ -129,6 +182,11 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
     assert result.job.lease_expires_at is None
     assert result.job.error is None
     assert result.job.translation_attempt_count == 0
+    assert result.job.publish_attempt_count == 0
+    assert result.job.next_publish_attempt_at is None
+    assert result.job.catalog_movie_uuid is None
+    assert result.job.metadata_status is None
+    assert result.job.metadata_source is None
     assert result.job.metadata_path_mac is None
     assert result.job.audio_path_mac is None
     assert result.job.audio_path_windows is None
@@ -145,6 +203,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
         JobStatus.TRANSCRIBING,
         JobStatus.TRANSCRIPTION_DONE,
         JobStatus.TRANSLATING,
+        JobStatus.PUBLISHING,
     ],
 )
 def test_force_submit_returns_conflict_for_active_worker_statuses(

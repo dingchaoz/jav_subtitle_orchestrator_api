@@ -11,6 +11,8 @@ def test_job_statuses_match_design_spec_order():
         "transcribing",
         "transcription_done",
         "translating",
+        "publish_pending",
+        "publishing",
         "english_srt_ready",
         "failed",
         "cancelled",

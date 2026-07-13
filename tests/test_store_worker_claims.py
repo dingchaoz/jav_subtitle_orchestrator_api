@@ -3,6 +3,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
@@ -37,6 +39,21 @@ def _write_historical_files(root: Path, movie: str):
     return paths, japanese, english
 
 
+def _prepare_publication_job(store, root: Path, movie: str, *, worker_id="mac-quality"):
+    transcription = _prepare_translation_job(store, root, movie)
+    claimed = store.claim_translation_job(transcription.id, worker_id, lease_seconds=60)
+    paths = build_job_paths(movie, root, "M:\\")
+    paths.english_srt_path_mac.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\ntranslated\n",
+        encoding="utf-8",
+    )
+    return store.complete_mac_translation_quality(
+        claimed.id,
+        worker_id,
+        lambda path: Path(path).exists(),
+    )
+
+
 def test_claim_next_download_job_is_atomic_and_ordered(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -62,10 +79,16 @@ def test_historical_reset_preserves_windows_attempts_and_paths(
     with store.connection() as conn:
         conn.execute(
             "UPDATE jobs SET status = ?, worker_attempt_count = 2, "
-            "translation_attempt_count = 2, audio_path_mac = ?, "
+            "translation_attempt_count = 2, publish_attempt_count = 2, "
+            "next_publish_attempt_at = ?, catalog_movie_uuid = ?, "
+            "metadata_status = ?, metadata_source = ?, audio_path_mac = ?, "
             "japanese_srt_path_mac = ?, english_srt_path_mac = ? WHERE id = ?",
             (
                 JobStatus.ENGLISH_SRT_READY.value,
+                "2026-07-12T12:00:00+00:00",
+                "f1bd9932-5697-4f16-865a-c56edc73d491",
+                "complete",
+                "public",
                 str(paths.audio_path_mac),
                 str(paths.japanese_srt_path_mac),
                 str(paths.english_srt_path_mac),
@@ -80,6 +103,11 @@ def test_historical_reset_preserves_windows_attempts_and_paths(
     assert reset.status is JobStatus.TRANSCRIPTION_DONE
     assert reset.worker_attempt_count == 2
     assert reset.translation_attempt_count == 0
+    assert reset.publish_attempt_count == 0
+    assert reset.next_publish_attempt_at is None
+    assert reset.catalog_movie_uuid is None
+    assert reset.metadata_status is None
+    assert reset.metadata_source is None
     assert reset.audio_path_mac == str(paths.audio_path_mac)
     assert reset.japanese_srt_path_mac == str(paths.japanese_srt_path_mac)
     assert reset.english_srt_path_mac is None
@@ -196,6 +224,250 @@ def test_worker_complete_requires_final_files(sqlite_path, mac_jobs_root):
     assert completed.english_srt_path_windows == "M:\\ktb-096\\ktb-096.English.srt"
     assert completed.claimed_by is None
     assert completed.lease_expires_at is None
+
+
+def test_translation_quality_success_moves_to_publish_pending_and_preserves_counters(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    transcription = _prepare_translation_job(store, mac_jobs_root, "abc-010")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET translation_attempt_count = 2, publish_attempt_count = 1 "
+            "WHERE id = ?",
+            (transcription.id,),
+        )
+    claimed = store.claim_translation_job(
+        transcription.id, "mac-quality", lease_seconds=60
+    )
+    paths = build_job_paths("abc-010", mac_jobs_root, "M:\\")
+    paths.english_srt_path_mac.write_text("valid", encoding="utf-8")
+
+    completed = store.complete_mac_translation_quality(
+        claimed.id, "mac-quality", lambda path: Path(path).exists()
+    )
+
+    assert completed.status is JobStatus.PUBLISH_PENDING
+    assert completed.translation_attempt_count == 2
+    assert completed.publish_attempt_count == 1
+    assert completed.english_srt_path_mac == str(paths.english_srt_path_mac)
+    assert completed.english_srt_path_windows == paths.english_srt_path_windows
+    assert completed.claimed_by is None
+    assert completed.lease_expires_at is None
+    assert completed.error is None
+
+
+def test_translation_quality_rejects_empty_english_file_without_partial_update(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    transcription = _prepare_translation_job(store, mac_jobs_root, "abc-011")
+    claimed = store.claim_translation_job(
+        transcription.id, "mac-quality", lease_seconds=60
+    )
+    paths = build_job_paths("abc-011", mac_jobs_root, "M:\\")
+    paths.english_srt_path_mac.write_bytes(b"")
+
+    with pytest.raises(FileNotFoundError, match="empty"):
+        store.complete_mac_translation_quality(
+            claimed.id, "mac-quality", lambda path: Path(path).exists()
+        )
+
+    unchanged = store.get_job(claimed.id)
+    assert unchanged.status is JobStatus.TRANSLATING
+    assert unchanged.claimed_by == "mac-quality"
+    assert unchanged.english_srt_path_mac is None
+
+
+def test_publication_claim_respects_retry_time_and_exact_job(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    future_job = _prepare_publication_job(store, mac_jobs_root, "abc-012")
+    ready_job = _prepare_publication_job(store, mac_jobs_root, "abc-013")
+    future = (datetime.now(UTC) + timedelta(hours=1)).replace(microsecond=0).isoformat()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET next_publish_attempt_at = ?, priority = 1 WHERE id = ?",
+            (future, future_job.id),
+        )
+
+    assert store.claim_publication_job(
+        "publisher", 60, job_id=future_job.id
+    ) is None
+    exact = store.claim_publication_job("publisher", 60, job_id=ready_job.id)
+
+    assert exact.id == ready_job.id
+    assert exact.status is JobStatus.PUBLISHING
+    assert exact.claimed_by == "publisher"
+    assert store.get_job(future_job.id).status is JobStatus.PUBLISH_PENDING
+
+
+def test_publication_failure_uses_independent_counter_and_preserves_english(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-014")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+
+    failed = store.fail_publication(
+        claimed.id,
+        "publisher",
+        "catalog unavailable",
+        max_publish_attempts=3,
+        retry_seconds=120,
+    )
+
+    assert failed.status is JobStatus.PUBLISH_PENDING
+    assert failed.publish_attempt_count == 1
+    assert failed.translation_attempt_count == 0
+    assert failed.next_publish_attempt_at is not None
+    assert failed.next_publish_attempt_at > failed.updated_at
+    assert failed.error == "publishing: catalog unavailable"
+    assert failed.english_srt_path_mac == pending.english_srt_path_mac
+    assert failed.english_srt_path_windows == pending.english_srt_path_windows
+    assert failed.claimed_by is None
+
+
+def test_publication_final_attempt_fails_job(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-015")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+
+    failed = store.fail_publication(
+        claimed.id,
+        "publisher",
+        "catalog unavailable",
+        max_publish_attempts=1,
+        retry_seconds=120,
+    )
+
+    assert failed.status is JobStatus.FAILED
+    assert failed.publish_attempt_count == 1
+    assert failed.translation_attempt_count == 0
+    assert failed.next_publish_attempt_at is None
+
+
+def test_publication_success_is_only_from_claim_and_records_catalog_metadata(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-016")
+    movie_uuid = "f1bd9932-5697-4f16-865a-c56edc73d491"
+
+    with pytest.raises(PermissionError):
+        store.complete_publication(
+            pending.id,
+            "publisher",
+            movie_uuid=movie_uuid,
+            metadata_status="placeholder",
+            metadata_source="placeholder",
+        )
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    completed = store.complete_publication(
+        claimed.id,
+        "publisher",
+        movie_uuid=movie_uuid,
+        metadata_status="placeholder",
+        metadata_source="placeholder",
+    )
+
+    assert completed.status is JobStatus.ENGLISH_SRT_READY
+    assert completed.catalog_movie_uuid == movie_uuid
+    assert completed.metadata_status == "placeholder"
+    assert completed.metadata_source == "placeholder"
+    assert completed.next_publish_attempt_at is None
+    assert completed.error is None
+    assert completed.claimed_by is None
+    assert completed.lease_expires_at is None
+
+
+@pytest.mark.parametrize(
+    ("movie_uuid", "metadata_status", "metadata_source"),
+    [
+        ("not-a-uuid", "complete", "public"),
+        ("f1bd9932-5697-4f16-865a-c56edc73d491", "unknown", "public"),
+        ("f1bd9932-5697-4f16-865a-c56edc73d491", "complete", "unknown"),
+    ],
+)
+def test_publication_success_rejects_invalid_catalog_values_atomically(
+    sqlite_path,
+    mac_jobs_root,
+    movie_uuid,
+    metadata_status,
+    metadata_source,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-017")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+
+    with pytest.raises(ValueError):
+        store.complete_publication(
+            claimed.id,
+            "publisher",
+            movie_uuid=movie_uuid,
+            metadata_status=metadata_status,
+            metadata_source=metadata_source,
+        )
+
+    unchanged = store.get_job(claimed.id)
+    assert unchanged.status is JobStatus.PUBLISHING
+    assert unchanged.claimed_by == "publisher"
+    assert unchanged.catalog_movie_uuid is None
+
+
+def test_expired_publication_lease_uses_publication_counter(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-018")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
+    store.force_lease_expiry_for_test(claimed.id, expired)
+
+    recovered = store.recover_expired_publication_leases(
+        max_publish_attempts=3, retry_seconds=30
+    )
+
+    assert recovered == 1
+    refreshed = store.get_job(claimed.id)
+    assert refreshed.status is JobStatus.PUBLISH_PENDING
+    assert refreshed.publish_attempt_count == 1
+    assert refreshed.translation_attempt_count == 0
+    assert refreshed.next_publish_attempt_at is not None
+    assert refreshed.error == "publishing: publication lease expired"
+    assert refreshed.english_srt_path_mac == pending.english_srt_path_mac
+
+
+def test_publication_failure_rejects_wrong_worker_without_partial_update(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-019")
+    claimed = store.claim_publication_job("publisher", 60, job_id=pending.id)
+
+    with pytest.raises(PermissionError):
+        store.fail_publication(
+            claimed.id,
+            "intruder",
+            "bad",
+            max_publish_attempts=3,
+            retry_seconds=30,
+        )
+
+    unchanged = store.get_job(claimed.id)
+    assert unchanged.status is JobStatus.PUBLISHING
+    assert unchanged.publish_attempt_count == 0
+    assert unchanged.claimed_by == "publisher"
 
 
 def test_expired_worker_lease_returns_job_to_audio_ready(sqlite_path, mac_jobs_root):

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths, new_job_id, normalize_movie_number
@@ -24,6 +25,11 @@ class JobRecord:
     attempt_count: int
     worker_attempt_count: int
     translation_attempt_count: int
+    publish_attempt_count: int
+    next_publish_attempt_at: str | None
+    catalog_movie_uuid: str | None
+    metadata_status: str | None
+    metadata_source: str | None
     claimed_by: str | None
     lease_expires_at: str | None
     created_at: str
@@ -103,6 +109,11 @@ class JobStore:
                   attempt_count INTEGER NOT NULL DEFAULT 0,
                   worker_attempt_count INTEGER NOT NULL DEFAULT 0,
                   translation_attempt_count INTEGER NOT NULL DEFAULT 0,
+                  publish_attempt_count INTEGER NOT NULL DEFAULT 0,
+                  next_publish_attempt_at TEXT,
+                  catalog_movie_uuid TEXT,
+                  metadata_status TEXT,
+                  metadata_source TEXT,
                   claimed_by TEXT,
                   lease_expires_at TEXT,
                   created_at TEXT NOT NULL,
@@ -129,6 +140,16 @@ class JobStore:
                     "ALTER TABLE jobs ADD COLUMN translation_attempt_count "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            publication_columns = {
+                "publish_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "next_publish_attempt_at": "TEXT",
+                "catalog_movie_uuid": "TEXT",
+                "metadata_status": "TEXT",
+                "metadata_source": "TEXT",
+            }
+            for column, definition in publication_columns.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created "
                 "ON jobs(status, priority, created_at)"
@@ -172,6 +193,8 @@ class JobStore:
                 INSERT INTO jobs (
                   id, movie_number, normalized_movie_number, status, priority,
                   attempt_count, worker_attempt_count, translation_attempt_count,
+                  publish_attempt_count, next_publish_attempt_at, catalog_movie_uuid,
+                  metadata_status, metadata_source,
                   claimed_by, lease_expires_at,
                   created_at, updated_at, error, job_dir_mac, job_dir_windows,
                   metadata_path_mac, audio_path_mac, audio_path_windows,
@@ -179,7 +202,8 @@ class JobStore:
                   english_srt_path_mac, english_srt_path_windows
                 )
                 VALUES (
-                  ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL, ?, ?, NULL, ?, ?,
+                  ?, ?, ?, ?, ?, 0, 0, 0, 0, NULL, NULL, NULL, NULL,
+                  NULL, NULL, ?, ?, NULL, ?, ?,
                   NULL, NULL, NULL, NULL, NULL, NULL, NULL
                 )
                 """,
@@ -797,7 +821,10 @@ class JobStore:
                 """
                 UPDATE jobs
                 SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
-                    translation_attempt_count = 0, updated_at = ?, error = NULL,
+                    translation_attempt_count = 0, publish_attempt_count = 0,
+                    next_publish_attempt_at = NULL, catalog_movie_uuid = NULL,
+                    metadata_status = NULL, metadata_source = NULL,
+                    updated_at = ?, error = NULL,
                     english_srt_path_mac = NULL, english_srt_path_windows = NULL
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
                 """,
@@ -857,6 +884,257 @@ class JobStore:
             completed = self.get_job(job_id, conn=conn)
             assert completed is not None
             return completed
+
+    def complete_mac_translation_quality(
+        self,
+        job_id: str,
+        worker_id: str,
+        final_file_exists,
+    ) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status != JobStatus.TRANSLATING or job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            if not final_file_exists(str(paths.english_srt_path_mac)):
+                raise FileNotFoundError(paths.english_srt_path_mac)
+            if paths.english_srt_path_mac.stat().st_size == 0:
+                raise FileNotFoundError(f"final file empty: {paths.english_srt_path_mac}")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL,
+                    english_srt_path_mac = ?, english_srt_path_windows = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.PUBLISH_PENDING.value,
+                    now,
+                    str(paths.english_srt_path_mac),
+                    paths.english_srt_path_windows,
+                    job_id,
+                    JobStatus.TRANSLATING.value,
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def claim_publication_job(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        job_id: str | None = None,
+    ) -> JobRecord | None:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            parameters: list[str] = [JobStatus.PUBLISH_PENDING.value, now]
+            job_filter = ""
+            if job_id is not None:
+                job_filter = " AND id = ?"
+                parameters.append(job_id)
+            row = conn.execute(
+                f"""
+                SELECT id FROM jobs
+                WHERE status = ? AND claimed_by IS NULL
+                  AND (next_publish_attempt_at IS NULL OR next_publish_attempt_at <= ?)
+                  {job_filter}
+                ORDER BY priority ASC, created_at ASC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, claimed_by = ?, lease_expires_at = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                  AND (next_publish_attempt_at IS NULL OR next_publish_attempt_at <= ?)
+                """,
+                (
+                    JobStatus.PUBLISHING.value,
+                    worker_id,
+                    lease,
+                    now,
+                    row["id"],
+                    JobStatus.PUBLISH_PENDING.value,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self.get_job(row["id"], conn=conn)
+
+    def fail_publication(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        *,
+        max_publish_attempts: int,
+        retry_seconds: int,
+    ) -> JobRecord:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            attempts = job.publish_attempt_count + 1
+            exhausted = attempts >= max_publish_attempts
+            next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
+            next_attempt_at = (
+                None
+                if exhausted
+                else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+            )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, publish_attempt_count = ?, next_publish_attempt_at = ?,
+                    claimed_by = NULL, lease_expires_at = NULL, updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                """,
+                (
+                    next_status.value,
+                    attempts,
+                    next_attempt_at,
+                    now,
+                    f"publishing: {error}",
+                    job_id,
+                    JobStatus.PUBLISHING.value,
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            failed = self.get_job(job_id, conn=conn)
+            assert failed is not None
+            return failed
+
+    def complete_publication(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        movie_uuid: str,
+        metadata_status: str,
+        metadata_source: str,
+    ) -> JobRecord:
+        if metadata_status not in {"complete", "partial", "placeholder"}:
+            raise ValueError(f"invalid metadata status: {metadata_status}")
+        if metadata_source not in {"public", "missav", "local", "placeholder"}:
+            raise ValueError(f"invalid metadata source: {metadata_source}")
+        if not movie_uuid:
+            raise ValueError("movie UUID must not be empty")
+        try:
+            UUID(movie_uuid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid movie UUID: {movie_uuid}") from exc
+
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status != JobStatus.PUBLISHING or job.claimed_by != worker_id:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, catalog_movie_uuid = ?, metadata_status = ?,
+                    metadata_source = ?, next_publish_attempt_at = NULL,
+                    claimed_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    movie_uuid,
+                    metadata_status,
+                    metadata_source,
+                    now,
+                    job_id,
+                    JobStatus.PUBLISHING.value,
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError(f"job {job_id} is not claimed by {worker_id}")
+            completed = self.get_job(job_id, conn=conn)
+            assert completed is not None
+            return completed
+
+    def recover_expired_publication_leases(
+        self,
+        max_publish_attempts: int,
+        retry_seconds: int,
+    ) -> int:
+        now_dt = datetime.now(UTC).replace(microsecond=0)
+        now = now_dt.isoformat()
+        recovered = 0
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id, claimed_by, publish_attempt_count FROM jobs
+                WHERE status = ? AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (JobStatus.PUBLISHING.value, now),
+            ).fetchall()
+            for row in rows:
+                attempts = row["publish_attempt_count"] + 1
+                exhausted = attempts >= max_publish_attempts
+                next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
+                next_attempt_at = (
+                    None
+                    if exhausted
+                    else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+                )
+                cursor = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, publish_attempt_count = ?,
+                        next_publish_attempt_at = ?, claimed_by = NULL,
+                        lease_expires_at = NULL, updated_at = ?, error = ?
+                    WHERE id = ? AND status = ? AND claimed_by = ?
+                    """,
+                    (
+                        next_status.value,
+                        attempts,
+                        next_attempt_at,
+                        now,
+                        "publishing: publication lease expired",
+                        row["id"],
+                        JobStatus.PUBLISHING.value,
+                        row["claimed_by"],
+                    ),
+                )
+                recovered += cursor.rowcount
+        return recovered
 
     def fail_mac_translation(
         self,
@@ -1066,6 +1344,7 @@ class JobStore:
             JobStatus.TRANSCRIBING,
             JobStatus.TRANSCRIPTION_DONE,
             JobStatus.TRANSLATING,
+            JobStatus.PUBLISHING,
         }:
             return SubmitResult(kind="conflict", movie_number=movie_number, job=existing)
         now = utc_now_iso()
@@ -1074,18 +1353,22 @@ class JobStore:
             JobStatus.TRANSCRIBING.value,
             JobStatus.TRANSCRIPTION_DONE.value,
             JobStatus.TRANSLATING.value,
+            JobStatus.PUBLISHING.value,
         )
         cursor = conn.execute(
             """
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
                 error = NULL, translation_attempt_count = 0,
+                publish_attempt_count = 0, next_publish_attempt_at = NULL,
+                catalog_movie_uuid = NULL, metadata_status = NULL,
+                metadata_source = NULL,
                 metadata_path_mac = NULL, audio_path_mac = NULL,
                 audio_path_windows = NULL, japanese_srt_path_mac = NULL,
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
-              AND status NOT IN (?, ?, ?, ?)
+              AND status NOT IN (?, ?, ?, ?, ?)
             """,
             (JobStatus.QUEUED.value, now, existing.id, *active_statuses),
         )
@@ -1105,6 +1388,11 @@ class JobStore:
             attempt_count=row["attempt_count"],
             worker_attempt_count=row["worker_attempt_count"],
             translation_attempt_count=row["translation_attempt_count"],
+            publish_attempt_count=row["publish_attempt_count"],
+            next_publish_attempt_at=row["next_publish_attempt_at"],
+            catalog_movie_uuid=row["catalog_movie_uuid"],
+            metadata_status=row["metadata_status"],
+            metadata_source=row["metadata_source"],
             claimed_by=row["claimed_by"],
             lease_expires_at=row["lease_expires_at"],
             created_at=row["created_at"],
