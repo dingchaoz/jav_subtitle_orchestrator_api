@@ -141,6 +141,20 @@ def prepare_catalog_publication_canary(
     allowlist_after_validation = load_repair_allowlist(allowlist_path)
     if requested not in allowlist_after_validation:
         raise RuntimeError("allowlist changed before prepare")
+    try:
+        japanese_before_transition = paths.japanese_srt_path_mac.read_bytes()
+        english_before_transition = paths.english_srt_path_mac.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            "quality_gate_failed:subtitle_changed_after_validation"
+        ) from exc
+    if (
+        japanese_before_transition != japanese_snapshot
+        or english_before_transition != english_snapshot
+    ):
+        raise ValueError(
+            "quality_gate_failed:subtitle_changed_after_validation"
+        )
     prepared = store.prepare_catalog_publication_repair(
         prior.id,
         expected_status=prior.status,

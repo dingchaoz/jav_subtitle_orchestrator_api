@@ -835,3 +835,57 @@ def test_prepare_catalog_publication_canary_rejects_subtitle_changed_during_qual
     assert store.get_job(job.id) == row_before
     expected_files = {**files_before, changed_language: changed_bytes}
     assert _canary_files_snapshot(paths) == expected_files
+
+
+@pytest.mark.parametrize("changed_language", ["english", "japanese"])
+def test_prepare_catalog_publication_canary_rejects_subtitle_changed_before_transition(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, changed_language
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-041")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-041")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+    changed_bytes = b"changed after validation while rechecking allowlist\n"
+    changed_path = getattr(paths, f"{changed_language}_srt_path_mac")
+    real_load_allowlist = catalog_repair.load_repair_allowlist
+    allowlist_reads = 0
+
+    def load_then_change(path):
+        nonlocal allowlist_reads
+        loaded = real_load_allowlist(path)
+        allowlist_reads += 1
+        if allowlist_reads == 2:
+            changed_path.write_bytes(changed_bytes)
+        return loaded
+
+    def unexpected_prepare(*args, **kwargs):
+        raise AssertionError("changed subtitle reached store transition")
+
+    monkeypatch.setattr(
+        catalog_repair,
+        "load_repair_allowlist",
+        load_then_change,
+    )
+    monkeypatch.setattr(
+        store,
+        "prepare_catalog_publication_repair",
+        unexpected_prepare,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^quality_gate_failed:subtitle_changed_after_validation$",
+    ):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-041",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    assert allowlist_reads == 2
+    assert store.get_job(job.id) == row_before
+    expected_files = {**files_before, changed_language: changed_bytes}
+    assert _canary_files_snapshot(paths) == expected_files
