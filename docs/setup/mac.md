@@ -212,6 +212,12 @@ have been confirmed:
   checkout, not an older running process or an unreviewed local change.
 - `python -m orchestrator mac-translation-smoke-test` has passed in that checkout
   with the production runtime configuration.
+- Before preparation, identify the single ordinary
+  `python -m orchestrator mac-translation-worker` process, stop that process, and
+  confirm that no ordinary translation worker remains running. If the unique
+  process cannot be identified, or zero ordinary translation workers cannot be
+  confirmed after stopping it, do not prepare the canary. Do not stop the API,
+  downloader, Windows worker, Cloudflare tunnel, or unrelated processes.
 
 If any condition is not satisfied, do not prepare the canary. In particular,
 `MAC_TRANSLATION_PUBLISH_ENABLED=false` is the default: with publication disabled,
@@ -245,10 +251,19 @@ claim only the confirmed job ID. Verify the local Japanese and audio hashes rema
 unchanged, the accepted English file remains in place, the remote English hash and
 catalog record are verified, and the final state is `english_srt_ready`.
 
-Stop after this job and report its evidence. Preparing or publishing a second job
-requires new explicit approval and a new exact-job invocation. This command has no
-automatic selector, `--force`, or batch mode; one-job approval never authorizes a
-batch, bulk overwrite, requeue, or `audio.wav` deletion.
+Only after the one-shot process exits and every local, Supabase, catalog, Storage,
+and hash verification succeeds may the ordinary translation worker be restored.
+Confirm again that no ordinary translation worker is running, then start exactly
+one `python -m orchestrator mac-translation-worker` process from the reviewed
+production checkout and confirm there is no duplicate. Leave the API, downloader,
+Windows worker, and Cloudflare tunnel running throughout this isolation and
+restore sequence.
+
+Stop the canary procedure after this job and report its evidence. Preparing or
+publishing a second job requires new explicit approval and a new exact-job
+invocation. This command has no automatic selector, `--force`, or batch mode;
+one-job approval never authorizes a batch, bulk overwrite, requeue, or `audio.wav`
+deletion.
 
 ## One-job historical repair canary
 
