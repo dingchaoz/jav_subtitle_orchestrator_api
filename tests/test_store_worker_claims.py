@@ -42,6 +42,7 @@ def test_historical_repair_state_and_record_contract():
         "reason_code",
         "japanese_sha256",
         "audio_sha256",
+        "source_english_sha256",
         "english_sha256",
         "created_at",
         "updated_at",
@@ -58,6 +59,7 @@ def test_historical_repair_state_and_record_contract():
         "reason_code": str | None,
         "japanese_sha256": str,
         "audio_sha256": str | None,
+        "source_english_sha256": str,
         "english_sha256": str | None,
         "created_at": str,
         "updated_at": str,
@@ -114,10 +116,12 @@ def test_initialize_adds_catalog_and_historical_repair_schema(
         "reason_code",
         "japanese_sha256",
         "audio_sha256",
+        "source_english_sha256",
         "english_sha256",
         "created_at",
         "updated_at",
     } <= repair_columns.keys()
+    assert repair_columns["source_english_sha256"]["notnull"] == 1
     assert any(
         row["table"] == "jobs" and row["from"] == "job_id" and row["to"] == "id"
         for row in repair_foreign_keys

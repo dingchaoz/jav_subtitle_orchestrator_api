@@ -1021,6 +1021,7 @@ def _row_to_repair(row: sqlite3.Row) -> HistoricalRepairRecord:
         reason_code=row["reason_code"],
         japanese_sha256=row["japanese_sha256"],
         audio_sha256=row["audio_sha256"],
+        source_english_sha256=row["source_english_sha256"],
         english_sha256=row["english_sha256"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -1072,7 +1073,7 @@ def _exact_existing_records(
             or row["allowlist_sha256"] != plan.allowlist_sha256
             or row["japanese_sha256"] != item.japanese_sha256
             or row["audio_sha256"] != item.audio_sha256
-            or row["english_sha256"] != item.english_sha256
+            or row["source_english_sha256"] != item.english_sha256
         ):
             raise ValueError("historical_plan_changed")
     return [_row_to_repair(row) for row in rows]
@@ -1144,8 +1145,9 @@ def _enqueue_historical_repairs_transaction(
                 INSERT INTO historical_translation_repairs (
                   id, batch_id, job_id, movie_code, allowlist_sha256, state,
                   attempt_count, next_attempt_at, reason_code, japanese_sha256,
-                  audio_sha256, english_sha256, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?)
+                  audio_sha256, source_english_sha256, english_sha256,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, NULL, ?, ?)
                 """,
                 (
                     repair_id,

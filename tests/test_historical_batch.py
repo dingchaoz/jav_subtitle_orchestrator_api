@@ -366,6 +366,8 @@ def test_enqueue_inserts_pending_without_mutating_job_and_is_idempotent(
     assert first[0].job_id == job.id
     assert first[0].movie_code == "abc-001"
     assert first[0].state is HistoricalRepairState.PENDING
+    assert first[0].source_english_sha256 == plan.items[0].english_sha256
+    assert first[0].english_sha256 is None
     assert store.get_job(job.id) == before_job
     assert _tree_snapshot(mac_jobs_root) == before_files
     with store.connection() as conn:
@@ -430,6 +432,125 @@ def test_idempotent_replay_ignores_current_job_allowlist_and_files(
     assert sqlite_path.read_bytes() == before
     assert not paths.english_srt_path_mac.exists()
     assert (rejected / "old-English.srt").exists()
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "reason_code"),
+    [
+        (HistoricalRepairState.SUCCEEDED, None),
+        (HistoricalRepairState.PERMANENT_FAILED, "quality_gate_failed:known_bad"),
+    ],
+)
+def test_terminal_replay_uses_immutable_source_hash_and_performs_zero_writes(
+    sqlite_path,
+    mac_jobs_root,
+    tmp_path,
+    terminal_state,
+    reason_code,
+):
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _, paths = _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    first = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+    result_english_sha256 = "f" * 64
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ?, "
+            "attempt_count = 1, updated_at = 'running' WHERE id = ?",
+            (HistoricalRepairState.RUNNING.value, first[0].id),
+        )
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ?, "
+            "english_sha256 = ?, reason_code = ?, updated_at = 'terminal' "
+            "WHERE id = ?",
+            (
+                terminal_state.value,
+                result_english_sha256,
+                reason_code,
+                first[0].id,
+            ),
+        )
+    paths.english_srt_path_mac.unlink()
+    allowlist.write_text("changed-999\n")
+    before = sqlite_path.read_bytes()
+
+    replayed = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+
+    assert replayed[0].state is terminal_state
+    assert replayed[0].source_english_sha256 == plan.items[0].english_sha256
+    assert replayed[0].english_sha256 == result_english_sha256
+    assert replayed[0].reason_code == reason_code
+    assert sqlite_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered"),
+    [
+        ("id", "repair_" + "0" * 32),
+        ("batch_id", "batch_" + "0" * 32),
+        ("job_id", "use_second_job"),
+        ("movie_code", "tampered-999"),
+        ("allowlist_sha256", "0" * 64),
+        ("source_english_sha256", "0" * 64),
+    ],
+)
+def test_idempotent_replay_rejects_tampered_immutable_identity(
+    sqlite_path,
+    mac_jobs_root,
+    tmp_path,
+    field,
+    tampered,
+):
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    second, _ = _job(store, mac_jobs_root, "abc-002")
+    assert second is not None
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    records = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+    if tampered == "use_second_job":
+        tampered = second.id
+    with store.connection() as conn:
+        conn.execute(
+            f"UPDATE historical_translation_repairs SET {field} = ? WHERE id = ?",
+            (tampered, records[0].id),
+        )
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
 
 
 def test_enqueue_uses_bounded_descriptors_under_low_rlimit(

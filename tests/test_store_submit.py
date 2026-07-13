@@ -186,6 +186,78 @@ def test_initialize_migrates_legacy_row_idempotently(
     assert foreign_key_violations == []
 
 
+def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ABC-001", priority=100, force=False).job
+    assert job is not None
+    legacy_english_sha256 = "e" * 64
+    with store.connection() as conn:
+        conn.execute("DROP TABLE historical_translation_repairs")
+        conn.execute(
+            """
+            CREATE TABLE historical_translation_repairs (
+              id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+              movie_code TEXT NOT NULL,
+              allowlist_sha256 TEXT NOT NULL,
+              state TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT,
+              reason_code TEXT,
+              japanese_sha256 TEXT NOT NULL,
+              audio_sha256 TEXT,
+              english_sha256 TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO historical_translation_repairs (
+              id, batch_id, job_id, movie_code, allowlist_sha256, state,
+              japanese_sha256, audio_sha256, english_sha256, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "repair_legacy",
+                "batch_legacy",
+                job.id,
+                "abc-001",
+                "a" * 64,
+                "succeeded",
+                "j" * 64,
+                "b" * 64,
+                legacy_english_sha256,
+                "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:00:00+00:00",
+            ),
+        )
+
+    store.initialize()
+    store.initialize()
+
+    with store.connection() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(historical_translation_repairs)"
+            ).fetchall()
+        }
+        repair = conn.execute(
+            "SELECT source_english_sha256, english_sha256 "
+            "FROM historical_translation_repairs WHERE id = 'repair_legacy'"
+        ).fetchone()
+
+    assert "source_english_sha256" in columns
+    assert repair["source_english_sha256"] == legacy_english_sha256
+    assert repair["english_sha256"] == legacy_english_sha256
+
+
 def test_submit_job_closes_connection_after_write(sqlite_path, mac_jobs_root):
     store = TrackingJobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

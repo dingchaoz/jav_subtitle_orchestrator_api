@@ -259,6 +259,7 @@ class HistoricalRepairRecord:
     reason_code: str | None
     japanese_sha256: str
     audio_sha256: str | None
+    source_english_sha256: str
     english_sha256: str | None
     created_at: str
     updated_at: str
@@ -465,12 +466,29 @@ class JobStore:
                   reason_code TEXT,
                   japanese_sha256 TEXT NOT NULL,
                   audio_sha256 TEXT,
+                  source_english_sha256 TEXT NOT NULL,
                   english_sha256 TEXT,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 )
                 """
             )
+            repair_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(historical_translation_repairs)"
+                ).fetchall()
+            }
+            if "source_english_sha256" not in repair_columns:
+                conn.execute(
+                    "ALTER TABLE historical_translation_repairs "
+                    "ADD COLUMN source_english_sha256 TEXT"
+                )
+                conn.execute(
+                    "UPDATE historical_translation_repairs "
+                    "SET source_english_sha256 = english_sha256 "
+                    "WHERE source_english_sha256 IS NULL"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS "
                 "idx_historical_translation_repairs_state_created_at "
