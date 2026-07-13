@@ -2743,6 +2743,12 @@ class JobStore:
         lease_token = uuid4().hex
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            translating = conn.execute(
+                "SELECT 1 FROM jobs WHERE status = ? LIMIT 1",
+                (JobStatus.TRANSLATING.value,),
+            ).fetchone()
+            if translating is not None:
+                return None
             cursor = conn.execute(
                 """
                 UPDATE jobs

@@ -271,6 +271,156 @@ def test_non_translation_stage_does_not_consume_translate_locally_slot(
     assert claimed is not None and claimed.id == normal.id
 
 
+def test_normal_poll_claim_blocks_exact_job_translation_claim(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [
+        store.submit_job(movie, priority=100, force=False).job
+        for movie in ("new-331", "new-332")
+    ]
+    assert all(job is not None for job in jobs)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id IN (?, ?)",
+            (JobStatus.TRANSCRIPTION_DONE.value, jobs[0].id, jobs[1].id),
+        )
+
+    polled = store.claim_next_translation_job("mac-poll", 60)
+
+    assert polled is not None
+    other = jobs[1] if polled.id == jobs[0].id else jobs[0]
+    assert store.claim_translation_job(other.id, "mac-exact", 60) is None
+    assert store.get_job(other.id).status is JobStatus.TRANSCRIPTION_DONE
+
+
+def test_historical_claim_blocks_exact_job_translation_claim(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    historical, _ = _repair_candidate(store, mac_jobs_root, "old-333")
+    claimed = store.claim_next_historical_repair("mac-history", 60)
+    assert claimed is not None and claimed.id == historical.id
+    exact = store.submit_job("new-333", priority=100, force=False).job
+    assert exact is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, exact.id),
+        )
+
+    assert store.claim_translation_job(exact.id, "mac-exact", 60) is None
+    assert store.get_job(exact.id).status is JobStatus.TRANSCRIPTION_DONE
+
+
+def test_exact_job_claim_blocks_normal_poll_and_historical_claim(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    historical, _ = _repair_candidate(store, mac_jobs_root, "old-334")
+    exact = store.submit_job("new-334", priority=100, force=False).job
+    other = store.submit_job("new-335", priority=100, force=False).job
+    assert exact is not None and other is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id IN (?, ?)",
+            (JobStatus.TRANSCRIPTION_DONE.value, exact.id, other.id),
+        )
+
+    claimed = store.claim_translation_job(exact.id, "mac-exact", 60)
+
+    assert claimed is not None and claimed.id == exact.id
+    assert store.claim_next_translation_job("mac-poll", 60) is None
+    assert store.claim_next_historical_repair("mac-history", 60) is None
+    assert store.get_job(other.id).status is JobStatus.TRANSCRIPTION_DONE
+    assert store.get_job(historical.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_simultaneous_exact_job_claims_take_one_global_slot(
+    sqlite_path, mac_jobs_root
+):
+    setup_store = _store(sqlite_path, mac_jobs_root)
+    jobs = [
+        setup_store.submit_job(movie, priority=100, force=False).job
+        for movie in ("new-336", "new-337")
+    ]
+    assert all(job is not None for job in jobs)
+    with setup_store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id IN (?, ?)",
+            (JobStatus.TRANSCRIPTION_DONE.value, jobs[0].id, jobs[1].id),
+        )
+    barrier = Barrier(2)
+
+    def claim_exact(job_id, worker_id):
+        store = _store(sqlite_path, mac_jobs_root)
+        barrier.wait()
+        return store.claim_translation_job(job_id, worker_id, 60)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(claim_exact, jobs[0].id, "mac-exact-1")
+        second = pool.submit(claim_exact, jobs[1].id, "mac-exact-2")
+        claims = (first.result(), second.result())
+
+    assert sum(claim is not None for claim in claims) == 1
+    with setup_store.connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status = ?",
+            (JobStatus.TRANSLATING.value,),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_expired_exact_claim_blocks_until_translation_recovery(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [
+        store.submit_job(movie, priority=100, force=False).job
+        for movie in ("new-338", "new-339")
+    ]
+    assert all(job is not None for job in jobs)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id IN (?, ?)",
+            (JobStatus.TRANSCRIPTION_DONE.value, jobs[0].id, jobs[1].id),
+        )
+    first = store.claim_translation_job(jobs[0].id, "mac-exact-1", 60)
+    assert first is not None
+    expired = (datetime.now(UTC) - timedelta(seconds=1)).replace(
+        microsecond=0
+    ).isoformat()
+    store.force_lease_expiry_for_test(first.id, expired)
+
+    assert store.claim_translation_job(jobs[1].id, "mac-exact-2", 60) is None
+    assert store.recover_expired_translation_leases(3) == 1
+    assert store.claim_translation_job(jobs[1].id, "mac-exact-2", 60) is not None
+
+
+@pytest.mark.parametrize("busy_status", [JobStatus.PUBLISHING, JobStatus.CATALOG_SYNCING])
+def test_non_translation_stage_does_not_block_exact_job_claim(
+    sqlite_path, mac_jobs_root, busy_status
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    suffix = "340" if busy_status is JobStatus.PUBLISHING else "341"
+    busy = store.submit_job(f"busy-{suffix}", 100, False).job
+    exact = store.submit_job(f"new-{suffix}", 100, False).job
+    assert busy is not None and exact is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (busy_status.value, busy.id),
+        )
+        conn.execute(
+            "UPDATE jobs SET status = ? WHERE id = ?",
+            (JobStatus.TRANSCRIPTION_DONE.value, exact.id),
+        )
+
+    claimed = store.claim_translation_job(exact.id, "mac-exact", 60)
+
+    assert claimed is not None and claimed.id == exact.id
+
+
 @pytest.mark.parametrize(
     ("status", "retry_column"),
     [
