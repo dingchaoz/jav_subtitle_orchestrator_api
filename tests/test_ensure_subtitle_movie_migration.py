@@ -49,6 +49,31 @@ def test_validates_and_parses_canonical_movie_code_safely():
     assert re.search(r"movie_number[^;]{0,700}>\s*2147483647", sql)
 
 
+def test_normalizes_numeric_alias_before_catalog_lookups():
+    sql = compact_sql()
+    normalization = re.search(
+        r"v_movie_number\s*:=\s*v_movie_number_bigint::integer\s*;"
+        r"(?P<body>.*?)select\s+p\.id",
+        sql,
+    )
+    assert normalization, "canonical normalization must precede the public lookup"
+    assert re.search(
+        r"v_code\s*:=\s*v_series\s*\|\|\s*'-'\s*\|\|\s*case\s+when\s+"
+        r"v_movie_number\s*<\s*100\s+then\s+pg_catalog\.lpad\(\s*"
+        r"v_movie_number::text\s*,\s*3\s*,\s*'0'\s*\)\s+else\s+"
+        r"v_movie_number::text\s+end\s*;",
+        normalization.group("body"),
+    )
+    assert sql.index("v_code :=") < sql.index("from public.movies")
+    assert sql.index("v_code :=") < sql.index("from missav.movies")
+    assert "coalesce(v_missav_title, v_local_title, v_code)" in sql
+    assert "= v_code" in sql
+    assert re.search(
+        r"'canonical_code'\s*,\s*coalesce\([^)]*v_code",
+        sql,
+    )
+
+
 def test_reads_ranked_missav_metadata_and_local_allowlist():
     sql = compact_sql()
     assert "from missav.movies" in sql

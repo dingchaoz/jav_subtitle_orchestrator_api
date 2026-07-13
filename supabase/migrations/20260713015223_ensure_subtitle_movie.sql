@@ -68,6 +68,11 @@ begin
       errcode = '22023';
   end if;
   v_movie_number := v_movie_number_bigint::integer;
+  v_code := v_series || '-' || case
+    when v_movie_number < 100
+      then pg_catalog.lpad(v_movie_number::text, 3, '0')
+    else v_movie_number::text
+  end;
 
   select p.id, p.title, p.movie_id, p.standard_movie_id
     into
