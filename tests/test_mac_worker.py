@@ -215,6 +215,11 @@ class FailingMacTranslator:
         raise RuntimeError("Mac translation runtime unavailable")
 
 
+class NoOutputMacTranslator:
+    def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
+        return None
+
+
 class RecordingPublisher:
     def __init__(
         self,
@@ -639,6 +644,42 @@ def test_changed_pending_subtitle_is_permanently_rejected_before_publisher(
     assert worker.consecutive_quality_failures == 1
 
 
+def test_missing_pending_english_fails_quality_without_creating_rejected_dir(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    publisher = RecordingPublisher()
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=publisher,
+    )
+    assert worker.process_one() is True
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+    english.unlink()
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.FAILED
+    assert refreshed.error.startswith("publishing: quality_gate_failed:")
+    assert "english_srt_missing" in refreshed.error
+    assert refreshed.publish_attempt_count == 1
+    assert refreshed.translation_attempt_count == 0
+    assert publisher.events == []
+    assert audio.read_bytes() == b"keep-audio"
+    assert not english.exists()
+    assert not (english.parent / "rejected").exists()
+    assert worker.consecutive_quality_failures == 1
+
+
 def test_three_changed_pending_subtitles_stop_worker_before_next_claim(
     sqlite_path, mac_jobs_root
 ):
@@ -710,6 +751,41 @@ def test_mac_translation_worker_permanently_rejects_collapsed_output(
     assert '"passed": false' in (
         english.parent / "logs" / "quality.log"
     ).read_text(encoding="utf-8")
+
+
+def test_translator_no_output_fails_quality_without_creating_rejected_dir(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root)
+    audio = mac_jobs_root / "ktb-096" / "audio.wav"
+    audio.write_bytes(b"keep-audio")
+    publisher = RecordingPublisher()
+    worker = MacTranslationWorker(
+        store,
+        NoOutputMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=publisher,
+    )
+
+    assert worker.process_one() is True
+
+    refreshed = store.get_job(job.id)
+    english = mac_jobs_root / "ktb-096" / "ktb-096.English.srt"
+    assert refreshed.status is JobStatus.FAILED
+    assert refreshed.error.startswith("translating: quality_gate_failed:")
+    assert "english_srt_missing" in refreshed.error
+    assert refreshed.translation_attempt_count == 1
+    assert refreshed.publish_attempt_count == 0
+    assert publisher.events == []
+    assert audio.read_bytes() == b"keep-audio"
+    assert not english.exists()
+    assert not (english.parent / "rejected").exists()
+    assert worker.consecutive_quality_failures == 1
 
 
 def test_mac_translation_worker_retries_transient_failure_from_transcription_done(

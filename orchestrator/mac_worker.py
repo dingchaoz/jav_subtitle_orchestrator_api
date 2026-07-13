@@ -415,7 +415,9 @@ class MacTranslationWorker:
             json.dumps(payload, ensure_ascii=True, sort_keys=True),
         )
 
-    def _quarantine(self, english_srt: Path, reason: str) -> Path:
+    def _quarantine(self, english_srt: Path, reason: str) -> Path | None:
+        if not english_srt.exists():
+            return None
         rejected_dir = english_srt.parent / "rejected"
         rejected_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
