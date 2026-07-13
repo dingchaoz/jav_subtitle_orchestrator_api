@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import sqlite3
 
-from orchestrator.paths import build_job_paths
+from orchestrator.paths import build_job_paths, normalize_movie_number
 from orchestrator.store import JobStore
 from orchestrator.subtitle_quality import validate_translation_quality
 
@@ -36,7 +36,11 @@ def plan_historical_repairs(
     if limit < 1:
         raise ValueError("limit must be at least 1")
     normalized_allowlist = (
-        {movie.strip().lower() for movie in allowlist}
+        {
+            normalized
+            for movie in allowlist
+            if (normalized := normalize_movie_number(movie)) is not None
+        }
         if allowlist is not None
         else None
     )
@@ -49,8 +53,10 @@ def plan_historical_repairs(
         ).fetchall()
 
     for job_id, movie_number in rows:
-        if normalized_allowlist is not None and movie_number.lower() not in normalized_allowlist:
-            continue
+        if normalized_allowlist is not None:
+            comparison_movie = normalize_movie_number(movie_number)
+            if comparison_movie not in normalized_allowlist:
+                continue
         paths = build_job_paths(
             movie_number, store.jobs_root_mac, store.jobs_root_windows
         )

@@ -58,6 +58,31 @@ def test_repair_plan_excludes_good_translation(sqlite_path, mac_jobs_root):
     assert plan_historical_repairs(store, allowlist=None, limit=10) == []
 
 
+def test_repair_plan_matches_legacy_unpadded_alias_without_changing_paths(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-7", priority=100, force=False).job
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET normalized_movie_number = ? WHERE id = ?",
+            ("abc-7", job.id),
+        )
+    _write_pair(mac_jobs_root, "abc-7", bad=True)
+
+    plans = plan_historical_repairs(
+        store,
+        allowlist={"abc-007"},
+        limit=10,
+    )
+
+    assert [plan.job_id for plan in plans] == [job.id]
+    assert plans[0].movie_number == "abc-7"
+    assert plans[0].japanese_path.endswith("/abc-7/abc-7.Japanese.srt")
+    assert plans[0].english_path.endswith("/abc-7/abc-7.English.srt")
+
+
 def test_repair_report_contains_actions_but_not_subtitle_text(
     sqlite_path, mac_jobs_root
 ):

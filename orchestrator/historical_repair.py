@@ -69,8 +69,10 @@ def _candidate_for_job(
     allowlist: frozenset[str],
 ) -> HistoricalRepairCandidate | None:
     movie = job.normalized_movie_number
+    comparison_movie = normalize_movie_number(movie)
     if (
-        movie not in allowlist
+        comparison_movie is None
+        or comparison_movie not in allowlist
         or job.status not in ELIGIBLE_STATUSES
         or job.claimed_by is not None
     ):
@@ -120,13 +122,20 @@ def select_historical_repair_canary(
         for job in store.list_jobs()
         if (candidate := _candidate_for_job(store, job, allowlist)) is not None
     ]
-    candidates.sort(
-        key=lambda candidate: (
-            candidate.movie_number != preferred,
+
+    def sort_key(
+        candidate: HistoricalRepairCandidate,
+    ) -> tuple[bool, str, str, str]:
+        comparison_movie = normalize_movie_number(candidate.movie_number)
+        assert comparison_movie is not None
+        return (
+            comparison_movie != preferred,
+            comparison_movie,
             candidate.movie_number,
             candidate.job_id,
         )
-    )
+
+    candidates.sort(key=sort_key)
     return candidates[0] if candidates else None
 
 
@@ -148,7 +157,12 @@ def prepare_historical_repair_canary(
         allowlist_path,
         preferred_movie=normalized,
     )
-    if candidate is None or candidate.movie_number != normalized:
+    candidate_comparison = (
+        normalize_movie_number(candidate.movie_number)
+        if candidate is not None
+        else None
+    )
+    if candidate_comparison != normalized:
         raise ValueError("movie is not an eligible allowlisted canary")
     if candidate.job_id != confirm_job_id:
         raise ValueError("confirmed job does not match selected canary")

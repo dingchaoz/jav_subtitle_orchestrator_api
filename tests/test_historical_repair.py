@@ -57,6 +57,97 @@ def _prepare_local_job(
     return store.get_job(job.id), paths
 
 
+def _prepare_legacy_local_job(
+    store: JobStore,
+    root: Path,
+    *,
+    status: JobStatus = JobStatus.FAILED,
+):
+    job, paths = _prepare_local_job(
+        store,
+        root,
+        "abc-7",
+        status=status,
+        bad=True,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET normalized_movie_number = ? WHERE id = ?",
+            ("abc-7", job.id),
+        )
+    return store.get_job(job.id), paths
+
+
+@pytest.mark.parametrize(
+    "status", [JobStatus.FAILED, JobStatus.ENGLISH_SRT_READY]
+)
+@pytest.mark.parametrize("preferred_movie", ["abc-7", "abc-007"])
+def test_selector_matches_legacy_unpadded_alias_and_preserves_paths(
+    sqlite_path, mac_jobs_root, tmp_path, status, preferred_movie
+):
+    from orchestrator.historical_repair import select_historical_repair_canary
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = _prepare_legacy_local_job(
+        store,
+        mac_jobs_root,
+        status=status,
+    )
+    allowlist = tmp_path / "repair-allowlist.txt"
+    allowlist.write_text("abc-7\n", encoding="utf-8")
+
+    candidate = select_historical_repair_canary(
+        store,
+        allowlist,
+        preferred_movie=preferred_movie,
+    )
+
+    assert candidate.job_id == job.id
+    assert candidate.movie_number == "abc-7"
+    assert candidate.japanese_path == str(paths.japanese_srt_path_mac)
+    assert candidate.english_path == str(paths.english_srt_path_mac)
+    assert candidate.quarantine_directory == str(paths.job_dir_mac / "rejected")
+
+
+@pytest.mark.parametrize("movie", ["abc-7", "abc-007"])
+def test_prepare_matches_legacy_alias_and_resets_only_translation(
+    sqlite_path, mac_jobs_root, tmp_path, movie
+):
+    from orchestrator.historical_repair import prepare_historical_repair_canary
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = _prepare_legacy_local_job(store, mac_jobs_root)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET worker_attempt_count = 2, "
+            "translation_attempt_count = 2 WHERE id = ?",
+            (job.id,),
+        )
+    allowlist = tmp_path / "repair-allowlist.txt"
+    allowlist.write_text("abc-7\n", encoding="utf-8")
+    japanese_before = paths.japanese_srt_path_mac.read_bytes()
+    audio_before = paths.audio_path_mac.read_bytes()
+
+    prepared = prepare_historical_repair_canary(
+        store,
+        allowlist,
+        movie=movie,
+        limit=1,
+        confirm_job_id=job.id,
+    )
+
+    assert prepared.normalized_movie_number == "abc-7"
+    assert prepared.status is JobStatus.TRANSCRIPTION_DONE
+    assert prepared.worker_attempt_count == 2
+    assert prepared.translation_attempt_count == 0
+    assert prepared.english_srt_path_mac is None
+    assert paths.english_srt_path_mac.exists()
+    assert paths.japanese_srt_path_mac.read_bytes() == japanese_before
+    assert paths.audio_path_mac.read_bytes() == audio_before
+
+
 def test_selector_prefers_eligible_movie_and_is_read_only(
     sqlite_path, mac_jobs_root, tmp_path
 ):
