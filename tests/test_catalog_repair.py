@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 
@@ -17,7 +18,7 @@ from orchestrator.catalog_repair import (
 )
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
-from orchestrator.store import JobStore
+from orchestrator.store import MAX_PUBLICATION_CANARY_SRT_BYTES, JobStore
 
 
 def _write_subtitles(root: Path, movie: str, *, quality_passes: bool = True):
@@ -930,7 +931,7 @@ def test_prepare_catalog_publication_canary_rejects_subtitle_changed_during_qual
     files_before = _canary_files_snapshot(paths)
     changed_bytes = b"changed while the quality gate was returning\n"
     changed_path = getattr(paths, f"{changed_language}_srt_path_mac")
-    real_validate = catalog_repair.validate_translation_quality
+    real_validate = catalog_repair.validate_translation_quality_snapshots
 
     def validate_then_change(japanese_path, english_path):
         report = real_validate(japanese_path, english_path)
@@ -943,7 +944,7 @@ def test_prepare_catalog_publication_canary_rejects_subtitle_changed_during_qual
 
     monkeypatch.setattr(
         catalog_repair,
-        "validate_translation_quality",
+        "validate_translation_quality_snapshots",
         validate_then_change,
     )
     monkeypatch.setattr(
@@ -1059,6 +1060,84 @@ def test_prepare_catalog_publication_canary_binds_snapshot_at_store_boundary(
     assert store.get_job(job.id) == row_before
     expected_files = {**files_before, "english": replacement}
     assert _canary_files_snapshot(paths) == expected_files
+
+
+@pytest.mark.parametrize("oversized_language", ["english", "japanese"])
+def test_prepare_catalog_publication_canary_rejects_oversized_subtitle_before_quality(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, oversized_language
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-044")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-044")
+    oversized_path = getattr(paths, f"{oversized_language}_srt_path_mac")
+    os.truncate(oversized_path, MAX_PUBLICATION_CANARY_SRT_BYTES + 1)
+    row_before = store.get_job(job.id)
+    oversized_before = oversized_path.stat()
+    other_language = "japanese" if oversized_language == "english" else "english"
+    other_path = getattr(paths, f"{other_language}_srt_path_mac")
+    other_before = other_path.read_bytes()
+    audio_before = paths.audio_path_mac.read_bytes()
+    rejected_before = {
+        path.name: path.read_bytes()
+        for path in sorted((paths.job_dir_mac / "rejected").iterdir())
+    }
+    calls = {"quality": 0, "store": 0}
+
+    def unexpected_quality(*args, **kwargs):
+        calls["quality"] += 1
+        raise AssertionError("oversized subtitle reached quality gate")
+
+    def unexpected_prepare(*args, **kwargs):
+        calls["store"] += 1
+        raise AssertionError("oversized subtitle reached store transition")
+
+    monkeypatch.setattr(
+        catalog_repair,
+        "validate_translation_quality_snapshots",
+        unexpected_quality,
+    )
+    monkeypatch.setattr(
+        store,
+        "prepare_catalog_publication_repair",
+        unexpected_prepare,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"^quality_gate_failed:{oversized_language}_srt_too_large$",
+    ):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-044",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    assert calls == {"quality": 0, "store": 0}
+    assert store.get_job(job.id) == row_before
+    oversized_after = oversized_path.stat()
+    assert (
+        oversized_after.st_dev,
+        oversized_after.st_ino,
+        oversized_after.st_size,
+        oversized_after.st_mtime_ns,
+        oversized_after.st_ctime_ns,
+        oversized_after.st_blocks,
+    ) == (
+        oversized_before.st_dev,
+        oversized_before.st_ino,
+        oversized_before.st_size,
+        oversized_before.st_mtime_ns,
+        oversized_before.st_ctime_ns,
+        oversized_before.st_blocks,
+    )
+    assert other_path.read_bytes() == other_before
+    assert paths.audio_path_mac.read_bytes() == audio_before
+    assert {
+        path.name: path.read_bytes()
+        for path in sorted((paths.job_dir_mac / "rejected").iterdir())
+    } == rejected_before
 
 
 def test_prepare_catalog_publication_canary_rejects_symlinked_job_directory(

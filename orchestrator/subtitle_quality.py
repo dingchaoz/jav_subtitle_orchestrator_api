@@ -89,23 +89,30 @@ def _timestamp_seconds(hours: str, minutes: str, seconds: str, millis: str) -> f
     return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000
 
 
-def _read_utf8(path: Path, label: str) -> tuple[str | None, list[str]]:
-    if not path.is_file():
-        return None, [f"{label}: file does not exist"]
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        return None, [f"{label}: unable to read file: {exc}"]
-    if not data:
+def _decode_utf8(snapshot: bytes, label: str) -> tuple[str | None, list[str]]:
+    if not snapshot:
         return "", []
     try:
-        return data.decode("utf-8-sig"), []
+        return snapshot.decode("utf-8-sig"), []
     except UnicodeDecodeError as exc:
         return None, [f"{label}: file is not valid UTF-8: {exc}"]
 
 
-def _parse_srt(path: Path, label: str) -> tuple[list[Cue], list[str], bool]:
-    text, errors = _read_utf8(path, label)
+def _read_utf8(path: Path, label: str) -> tuple[str | None, list[str]]:
+    if not path.is_file():
+        return None, [f"{label}: file does not exist"]
+    try:
+        snapshot = path.read_bytes()
+    except OSError as exc:
+        return None, [f"{label}: unable to read file: {exc}"]
+    return _decode_utf8(snapshot, label)
+
+
+def _parse_srt_text(
+    text: str | None,
+    errors: list[str],
+    label: str,
+) -> tuple[list[Cue], list[str], bool]:
     if text is None:
         return [], errors, False
     if not text.strip():
@@ -151,6 +158,19 @@ def _parse_srt(path: Path, label: str) -> tuple[list[Cue], list[str], bool]:
     return cues, errors, False
 
 
+def _parse_srt(path: Path, label: str) -> tuple[list[Cue], list[str], bool]:
+    text, errors = _read_utf8(path, label)
+    return _parse_srt_text(text, errors, label)
+
+
+def _parse_srt_snapshot(
+    snapshot: bytes,
+    label: str,
+) -> tuple[list[Cue], list[str], bool]:
+    text, errors = _decode_utf8(snapshot, label)
+    return _parse_srt_text(text, errors, label)
+
+
 def normalize_text(text: str) -> str:
     folded = unicodedata.normalize("NFKC", text).casefold()
     return " ".join(re.sub(r"[^\w]+", " ", folded, flags=re.UNICODE).split())
@@ -161,24 +181,22 @@ def _append_once(items: list[str], value: str) -> None:
         items.append(value)
 
 
-def validate_translation_quality(
-    japanese_srt_path: str | Path,
-    english_srt_path: str | Path,
+def _build_quality_report(
+    japanese_cues: list[Cue],
+    japanese_errors: list[str],
+    _japanese_empty: bool,
+    english_cues: list[Cue],
+    english_errors: list[str],
+    english_empty: bool,
     *,
+    english_missing: bool,
     audio_duration_seconds: float | None = None,
 ) -> QualityReport:
-    japanese_path = Path(japanese_srt_path)
-    english_path = Path(english_srt_path)
     reasons: list[str] = []
     warnings: list[str] = []
-
-    japanese_cues, japanese_errors, japanese_empty = _parse_srt(
-        japanese_path, "japanese"
-    )
-    english_cues, english_errors, english_empty = _parse_srt(english_path, "english")
     parse_errors = [*japanese_errors, *english_errors]
 
-    if not english_path.is_file():
+    if english_missing:
         _append_once(reasons, "english_srt_missing")
     elif english_empty:
         _append_once(reasons, "english_srt_empty")
@@ -287,5 +305,59 @@ def validate_translation_quality(
         japanese_long_cue_over_10s_ratio=long_10_ratio,
         japanese_long_cue_over_20s_ratio=long_20_ratio,
         last_japanese_timestamp_seconds=last_timestamp or None,
+        audio_duration_seconds=audio_duration_seconds,
+    )
+
+
+def validate_translation_quality_snapshots(
+    japanese_snapshot: bytes,
+    english_snapshot: bytes,
+    *,
+    audio_duration_seconds: float | None = None,
+) -> QualityReport:
+    japanese_cues, japanese_errors, japanese_empty = _parse_srt_snapshot(
+        japanese_snapshot,
+        "japanese",
+    )
+    english_cues, english_errors, english_empty = _parse_srt_snapshot(
+        english_snapshot,
+        "english",
+    )
+    return _build_quality_report(
+        japanese_cues,
+        japanese_errors,
+        japanese_empty,
+        english_cues,
+        english_errors,
+        english_empty,
+        english_missing=False,
+        audio_duration_seconds=audio_duration_seconds,
+    )
+
+
+def validate_translation_quality(
+    japanese_srt_path: str | Path,
+    english_srt_path: str | Path,
+    *,
+    audio_duration_seconds: float | None = None,
+) -> QualityReport:
+    japanese_path = Path(japanese_srt_path)
+    english_path = Path(english_srt_path)
+    japanese_cues, japanese_errors, japanese_empty = _parse_srt(
+        japanese_path,
+        "japanese",
+    )
+    english_cues, english_errors, english_empty = _parse_srt(
+        english_path,
+        "english",
+    )
+    return _build_quality_report(
+        japanese_cues,
+        japanese_errors,
+        japanese_empty,
+        english_cues,
+        english_errors,
+        english_empty,
+        english_missing=not english_path.is_file(),
         audio_duration_seconds=audio_duration_seconds,
     )

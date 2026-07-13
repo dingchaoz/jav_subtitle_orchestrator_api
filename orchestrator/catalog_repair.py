@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import stat
+from typing import NoReturn
 
 from orchestrator.historical_repair import load_repair_allowlist
 from orchestrator.movie_catalog import (
@@ -15,8 +17,11 @@ from orchestrator.movie_catalog import (
 from orchestrator.movie_code import canonical_movie_code
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
-from orchestrator.store import JobStore
-from orchestrator.subtitle_quality import validate_translation_quality
+from orchestrator.store import MAX_PUBLICATION_CANARY_SRT_BYTES, JobStore
+from orchestrator.subtitle_quality import (
+    validate_translation_quality,
+    validate_translation_quality_snapshots,
+)
 from orchestrator.supabase_publisher import build_ai_subtitle_storage_path
 
 
@@ -73,6 +78,92 @@ def _require_regular_nonempty_subtitle(path: Path, label: str) -> None:
         raise ValueError(f"quality_gate_failed:{label}_srt_not_regular")
     if file_stat.st_size <= 0:
         raise ValueError(f"quality_gate_failed:{label}_srt_empty")
+    if file_stat.st_size > MAX_PUBLICATION_CANARY_SRT_BYTES:
+        raise ValueError(f"quality_gate_failed:{label}_srt_too_large")
+
+
+def _same_subtitle_stat(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_mode,
+        before.st_nlink,
+    ) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_mode,
+        after.st_nlink,
+    )
+
+
+def _read_bounded_subtitle_snapshot(
+    job_directory: Path,
+    subtitle_path: Path,
+    label: str,
+    *,
+    change_reason: str | None = None,
+) -> bytes:
+    def fail(reason: str, exc: OSError | None = None) -> NoReturn:
+        error = ValueError(f"quality_gate_failed:{change_reason or reason}")
+        if exc is None:
+            raise error
+        raise error from exc
+
+    try:
+        directory_fd = os.open(
+            job_directory,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        fail("job_directory_missing", exc)
+    try:
+        try:
+            file_fd = os.open(
+                subtitle_path.name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            fail(f"{label}_srt_missing", exc)
+        try:
+            try:
+                before = os.fstat(file_fd)
+            except OSError as exc:
+                fail(f"{label}_srt_missing", exc)
+            if not stat.S_ISREG(before.st_mode):
+                fail(f"{label}_srt_not_regular")
+            if before.st_size <= 0:
+                fail(f"{label}_srt_empty")
+            if before.st_size > MAX_PUBLICATION_CANARY_SRT_BYTES:
+                fail(f"{label}_srt_too_large")
+
+            snapshot = bytearray()
+            remaining = before.st_size
+            try:
+                while remaining:
+                    chunk = os.read(file_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        fail("subtitle_changed_while_reading")
+                    snapshot.extend(chunk)
+                    remaining -= len(chunk)
+                if os.read(file_fd, 1):
+                    fail("subtitle_changed_while_reading")
+                after = os.fstat(file_fd)
+            except OSError as exc:
+                fail("subtitle_changed_while_reading", exc)
+            if not _same_subtitle_stat(before, after):
+                fail("subtitle_changed_while_reading")
+            return bytes(snapshot)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _require_direct_job_directory(job_directory: Path, jobs_root: Path) -> None:
@@ -144,18 +235,36 @@ def prepare_catalog_publication_canary(
         paths.english_srt_path_mac,
         "english",
     )
-    japanese_before = paths.japanese_srt_path_mac.read_bytes()
-    english_before = paths.english_srt_path_mac.read_bytes()
-    report = validate_translation_quality(
+    japanese_before = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
         paths.japanese_srt_path_mac,
+        "japanese",
+    )
+    english_before = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
         paths.english_srt_path_mac,
+        "english",
+    )
+    report = validate_translation_quality_snapshots(
+        japanese_before,
+        english_before,
     )
     if not report.passed:
         reason_codes = ",".join(report.reason_codes) or "unknown"
         raise ValueError(f"quality_gate_failed:{reason_codes}")
 
-    japanese_snapshot = paths.japanese_srt_path_mac.read_bytes()
-    english_snapshot = paths.english_srt_path_mac.read_bytes()
+    japanese_snapshot = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
+        paths.japanese_srt_path_mac,
+        "japanese",
+        change_reason="subtitle_changed_during_validation",
+    )
+    english_snapshot = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
+        paths.english_srt_path_mac,
+        "english",
+        change_reason="subtitle_changed_during_validation",
+    )
     if japanese_snapshot != japanese_before or english_snapshot != english_before:
         raise ValueError(
             "quality_gate_failed:subtitle_changed_during_validation"
@@ -166,13 +275,18 @@ def prepare_catalog_publication_canary(
     allowlist_after_validation = load_repair_allowlist(allowlist_path)
     if requested not in allowlist_after_validation:
         raise RuntimeError("allowlist changed before prepare")
-    try:
-        japanese_before_transition = paths.japanese_srt_path_mac.read_bytes()
-        english_before_transition = paths.english_srt_path_mac.read_bytes()
-    except OSError as exc:
-        raise ValueError(
-            "quality_gate_failed:subtitle_changed_after_validation"
-        ) from exc
+    japanese_before_transition = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
+        paths.japanese_srt_path_mac,
+        "japanese",
+        change_reason="subtitle_changed_after_validation",
+    )
+    english_before_transition = _read_bounded_subtitle_snapshot(
+        paths.job_dir_mac,
+        paths.english_srt_path_mac,
+        "english",
+        change_reason="subtitle_changed_after_validation",
+    )
     if (
         japanese_before_transition != japanese_snapshot
         or english_before_transition != english_snapshot

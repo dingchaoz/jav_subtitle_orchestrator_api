@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from orchestrator.subtitle_quality import validate_translation_quality
+import pytest
+
+from orchestrator.subtitle_quality import (
+    validate_translation_quality,
+    validate_translation_quality_snapshots,
+)
 
 
 def write_srt(path: Path, texts: list[str]) -> Path:
@@ -22,6 +27,27 @@ def aligned_pair(tmp_path: Path, japanese: list[str], english: list[str]):
         write_srt(tmp_path / "sample.Japanese.srt", japanese),
         write_srt(tmp_path / "sample.English.srt", english),
     )
+
+
+@pytest.mark.parametrize("quality_state", ["good", "bad", "empty", "non_utf8"])
+def test_snapshot_quality_matches_path_quality(tmp_path, quality_state):
+    japanese = [f"日本語{i}" for i in range(25)]
+    english = [f"Distinct translation {i}." for i in range(25)]
+    if quality_state == "bad":
+        english = ["Cannot translate"] * 25
+    japanese_path, english_path = aligned_pair(tmp_path, japanese, english)
+    if quality_state == "empty":
+        english_path.write_bytes(b"")
+    elif quality_state == "non_utf8":
+        english_path.write_bytes(b"\xff\xfe\x80")
+
+    path_report = validate_translation_quality(japanese_path, english_path)
+    snapshot_report = validate_translation_quality_snapshots(
+        japanese_path.read_bytes(),
+        english_path.read_bytes(),
+    )
+
+    assert snapshot_report.as_dict() == path_report.as_dict()
 
 
 def test_diverse_aligned_translation_passes(tmp_path):
