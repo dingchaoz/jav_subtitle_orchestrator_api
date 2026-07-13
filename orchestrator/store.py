@@ -1,4 +1,5 @@
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -885,9 +886,17 @@ class JobStore:
                 self.jobs_root_mac,
                 self.jobs_root_windows,
             )
-            if not paths.english_srt_path_mac.is_file():
-                raise FileNotFoundError(paths.english_srt_path_mac)
-            if paths.english_srt_path_mac.stat().st_size == 0:
+            try:
+                english_stat = paths.english_srt_path_mac.lstat()
+            except OSError as exc:
+                raise FileNotFoundError(
+                    f"final file unavailable: {paths.english_srt_path_mac}"
+                ) from exc
+            if not stat.S_ISREG(english_stat.st_mode):
+                raise FileNotFoundError(
+                    f"final file is not regular: {paths.english_srt_path_mac}"
+                )
+            if english_stat.st_size <= 0:
                 raise FileNotFoundError(
                     f"final file empty: {paths.english_srt_path_mac}"
                 )

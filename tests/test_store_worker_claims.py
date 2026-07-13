@@ -196,6 +196,7 @@ def _prepare_catalog_publication_candidate(
     metadata_status: str | None = None,
     metadata_source: str | None = None,
     english_state: str = "present",
+    english_target: Path | None = None,
 ):
     job = store.submit_job(movie, priority=100, force=False).job
     paths = build_job_paths(movie, root, "M:\\")
@@ -204,7 +205,10 @@ def _prepare_catalog_publication_candidate(
     paths.japanese_srt_path_mac.write_bytes(
         b"1\n00:00:00,000 --> 00:00:01,000\nsource\n"
     )
-    if english_state != "missing":
+    if english_state == "symlink":
+        assert english_target is not None
+        paths.english_srt_path_mac.symlink_to(english_target)
+    elif english_state != "missing":
         english = (
             b"1\n00:00:00,000 --> 00:00:01,000\ntranslated\n"
             if english_state == "present"
@@ -393,6 +397,79 @@ def test_prepare_catalog_publication_rejects_invalid_canonical_english_atomicall
         )
 
     assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+
+
+def test_prepare_catalog_publication_rejects_symlinked_canonical_english_atomically(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    external_english = mac_jobs_root.parent / "outside.English.srt"
+    external_before = b"external subtitle must not be published"
+    external_english.write_bytes(external_before)
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store,
+        mac_jobs_root,
+        "abc-028",
+        english_state="symlink",
+        english_target=external_english,
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+    link_stat_before = paths.english_srt_path_mac.lstat()
+    link_target_before = paths.english_srt_path_mac.readlink()
+
+    with pytest.raises(FileNotFoundError, match="regular"):
+        store.prepare_catalog_publication_repair(
+            job_id,
+            expected_status=JobStatus.FAILED,
+            expected_movie="abc-028",
+        )
+
+    assert store.get_job(job_id) == row_before
+    assert _catalog_artifact_snapshot(paths) == files_before
+    assert paths.english_srt_path_mac.is_symlink()
+    assert paths.english_srt_path_mac.lstat() == link_stat_before
+    assert paths.english_srt_path_mac.readlink() == link_target_before
+    assert external_english.read_bytes() == external_before
+
+
+def test_prepare_catalog_publication_accepts_unverified_legacy_ready(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job_id, paths = _prepare_catalog_publication_candidate(
+        store,
+        mac_jobs_root,
+        "abc-029",
+        status=JobStatus.ENGLISH_SRT_READY,
+        catalog_movie_uuid=None,
+        metadata_status="complete",
+        metadata_source="public",
+    )
+    row_before = store.get_job(job_id)
+    files_before = _catalog_artifact_snapshot(paths)
+
+    prepared = store.prepare_catalog_publication_repair(
+        job_id,
+        expected_status=JobStatus.ENGLISH_SRT_READY,
+        expected_movie="abc-029",
+    )
+
+    assert prepared.status is JobStatus.PUBLISH_PENDING
+    assert prepared.translation_attempt_count == row_before.translation_attempt_count
+    assert prepared.publish_attempt_count == 0
+    assert prepared.catalog_movie_uuid is None
+    assert prepared.metadata_status is None
+    assert prepared.metadata_source is None
+    assert prepared.audio_path_mac == row_before.audio_path_mac
+    assert prepared.audio_path_windows == row_before.audio_path_windows
+    assert prepared.japanese_srt_path_mac == row_before.japanese_srt_path_mac
+    assert prepared.japanese_srt_path_windows == row_before.japanese_srt_path_windows
+    assert prepared.english_srt_path_mac == row_before.english_srt_path_mac
+    assert prepared.english_srt_path_windows == row_before.english_srt_path_windows
     assert _catalog_artifact_snapshot(paths) == files_before
 
 
