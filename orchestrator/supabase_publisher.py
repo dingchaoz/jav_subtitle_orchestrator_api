@@ -3,26 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import re
 import time
 from typing import Any
 from uuid import uuid4
 
 import requests
 
+from orchestrator.movie_code import canonical_movie_code
 from orchestrator.subtitle_quality import validate_translation_quality
 
 
-MOVIE_CODE_RE = re.compile(r"^([a-zA-Z]+)-?(\d+)$")
 AI_ENGLISH_LANGUAGE = "English_AI"
-
-
-def canonical_movie_code(movie_code: str) -> str:
-    match = MOVIE_CODE_RE.fullmatch(movie_code.strip())
-    if match is None:
-        raise ValueError(f"invalid movie code: {movie_code}")
-    series, number = match.groups()
-    return f"{series.lower()}-{int(number):03d}"
 
 
 def build_ai_subtitle_storage_path(movie_code: str) -> str:
