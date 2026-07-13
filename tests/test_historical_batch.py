@@ -287,6 +287,30 @@ def test_private_plan_parent_swap_after_link_is_detected_and_cleaned(
     assert not list(moved.glob("*.tmp"))
 
 
+def test_private_plan_is_0600_even_under_restrictive_umask(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import plan_historical_batch, write_private_plan
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    output = tmp_path / "private-plan.json"
+    prior_umask = os.umask(0o777)
+    try:
+        write_private_plan(output, plan)
+    finally:
+        os.umask(prior_umask)
+
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert output.read_bytes() == plan.to_json_bytes()
+    observed_umask = os.umask(prior_umask)
+    os.umask(observed_umask)
+    assert observed_umask == prior_umask
+
+
 def test_plan_json_parser_rejects_extra_missing_bool_counts_and_tampering(
     sqlite_path, mac_jobs_root, tmp_path
 ):
@@ -354,6 +378,127 @@ def test_enqueue_inserts_pending_without_mutating_job_and_is_idempotent(
     assert next_plan.eligible_total == 0
     assert next_plan.already_repaired == 1
     assert next_plan.items == ()
+
+
+def test_idempotent_replay_ignores_current_job_allowlist_and_files(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _job(store, mac_jobs_root, "abc-001")
+    assert job is not None
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    first = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+    rejected = paths.job_dir_mac / "rejected"
+    rejected.mkdir()
+    paths.english_srt_path_mac.replace(rejected / "old-English.srt")
+    allowlist.write_text("changed-999\n")
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, claimed_by = 'historical-worker', "
+            "updated_at = 'claimed-after-enqueue' WHERE id = ?",
+            (JobStatus.TRANSLATING.value, job.id),
+        )
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ?, "
+            "attempt_count = 1, updated_at = 'claimed-after-enqueue' "
+            "WHERE batch_id = ?",
+            (HistoricalRepairState.RUNNING.value, plan.batch_id),
+        )
+    before = sqlite_path.read_bytes()
+
+    replayed = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+
+    assert [record.id for record in replayed] == [record.id for record in first]
+    assert replayed[0].state is HistoricalRepairState.RUNNING
+    assert sqlite_path.read_bytes() == before
+    assert not paths.english_srt_path_mac.exists()
+    assert (rejected / "old-English.srt").exists()
+
+
+def test_enqueue_uses_bounded_descriptors_under_low_rlimit(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    resource = pytest.importorskip("resource")
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    movies = [f"bulk-{index:03d}" for index in range(1, 341)]
+    for movie in movies:
+        _job(store, mac_jobs_root, movie)
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("".join(f"{movie}\n" for movie in movies))
+    plan = plan_historical_batch(store, allowlist, limit=20)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = min(64, hard)
+    if target < 48:
+        pytest.skip("RLIMIT_NOFILE hard limit is already too low for pytest")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    try:
+        records = enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    assert len(records) == 20
+
+
+def test_idempotent_replay_rejects_partial_existing_batch(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    from orchestrator.historical_batch import (
+        enqueue_historical_batch,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    _job(store, mac_jobs_root, "abc-002")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\nabc-002\n")
+    plan = plan_historical_batch(store, allowlist, limit=2)
+    records = enqueue_historical_batch(
+        store,
+        plan,
+        allowlist,
+        confirm_plan_sha256=plan.plan_sha256,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "DELETE FROM historical_translation_repairs WHERE id = ?",
+            (records[0].id,),
+        )
+
+    with pytest.raises(ValueError, match="historical_plan_changed"):
+        enqueue_historical_batch(
+            store,
+            plan,
+            allowlist,
+            confirm_plan_sha256=plan.plan_sha256,
+        )
 
 
 def test_safe_report_names_exact_jobs_and_actions_without_paths_or_subtitle_text(
@@ -440,12 +585,12 @@ def test_enqueue_detects_path_replacement_after_individual_file_hash(
     allowlist = tmp_path / "allowlist.txt"
     allowlist.write_text("abc-001\n")
     plan = historical_batch.plan_historical_batch(store, allowlist, limit=1)
-    real_snapshot = historical_batch._snapshot_held_regular_file
+    real_snapshot = historical_batch._open_stable_regular_file_at
     replaced = False
 
-    def replace_path_after_hash(directory_fd, basename, fd, **kwargs):
+    def replace_path_after_hash(directory_fd, basename, **kwargs):
         nonlocal replaced
-        snapshot = real_snapshot(directory_fd, basename, fd, **kwargs)
+        snapshot = real_snapshot(directory_fd, basename, **kwargs)
         if not replaced and basename.endswith(replace_after):
             replacement = paths.job_dir_mac / f".{basename}.replacement"
             replacement.write_bytes(
@@ -461,7 +606,7 @@ def test_enqueue_detects_path_replacement_after_individual_file_hash(
 
     monkeypatch.setattr(
         historical_batch,
-        "_snapshot_held_regular_file",
+        "_open_stable_regular_file_at",
         replace_path_after_hash,
     )
 

@@ -1,7 +1,9 @@
-"""Orchestrator-wide advisory lock for writes to one job's audio state.
+"""Orchestrator-wide advisory locks for writes to one job's audio state.
 
 Every orchestrator component that writes ``audio.wav`` or marks it ready must
-hold this lock.  The lock coordinates cooperating orchestrator processes;
+hold the jobs-root shared lock and this job-exclusive lock. The order is root,
+job, then database, matching historical snapshot coordination. The locks
+coordinate cooperating orchestrator processes;
 arbitrary local processes that deliberately ignore OS advisory locks are out
 of scope.  Held directory descriptors still make path substitution fail safe.
 """
@@ -73,6 +75,7 @@ def exclusive_audio_job_lock(
 ) -> Iterator[AudioJobLock]:
     root_fd: int | None = None
     job_fd: int | None = None
+    root_locked = False
     locked = False
 
     def close_opened_descriptors() -> None:
@@ -81,6 +84,8 @@ def exclusive_audio_job_lock(
                 fcntl.flock(job_fd, fcntl.LOCK_UN)
             os.close(job_fd)
         if root_fd is not None:
+            if root_locked:
+                fcntl.flock(root_fd, fcntl.LOCK_UN)
             os.close(root_fd)
 
     try:
@@ -88,6 +93,14 @@ def exclusive_audio_job_lock(
             jobs_root,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
         )
+        root_operation = fcntl.LOCK_SH
+        if not blocking:
+            root_operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(root_fd, root_operation)
+        except BlockingIOError:
+            raise AudioJobLockBusy("audio_recovery_busy") from None
+        root_locked = True
         job_fd = os.open(
             movie_code,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,

@@ -1210,16 +1210,33 @@ class JobStore:
             HistoricalBatchPlan,
             _enqueue_historical_repairs_transaction,
             _prehold_plan_job_files,
+            find_idempotent_historical_enqueue,
         )
+        from orchestrator.job_files_lock import exclusive_jobs_root_lock
 
         if not isinstance(plan, HistoricalBatchPlan):
             raise ValueError("historical_plan_changed")
+        existing = find_idempotent_historical_enqueue(
+            self,
+            plan,
+            Path(allowlist_path),
+            confirm_plan_sha256=confirm_plan_sha256,
+        )
+        if existing is not None:
+            return existing
         with ExitStack() as descriptor_stack:
+            root_lock = descriptor_stack.enter_context(
+                exclusive_jobs_root_lock(
+                    self.jobs_root_mac,
+                    blocking=True,
+                )
+            )
             preheld_jobs = _prehold_plan_job_files(
                 self,
                 plan,
                 Path(allowlist_path),
                 confirm_plan_sha256=confirm_plan_sha256,
+                root_lock=root_lock,
                 descriptor_stack=descriptor_stack,
             )
             with self.connection() as conn:
@@ -1230,7 +1247,7 @@ class JobStore:
                     plan,
                     Path(allowlist_path),
                     confirm_plan_sha256=confirm_plan_sha256,
-                    descriptor_stack=descriptor_stack,
+                    root_lock=root_lock,
                     preheld_jobs=preheld_jobs,
                 )
 

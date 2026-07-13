@@ -16,7 +16,10 @@ from orchestrator.historical_repair import ELIGIBLE_STATUSES
 from orchestrator.job_files_lock import (
     JobFilesLock,
     JobFilesLockError,
-    shared_job_files_lock,
+    JobsRootLock,
+    exclusive_jobs_root_lock,
+    open_job_directory_from_root,
+    shared_job_files_lock_from_root,
 )
 from orchestrator.models import JobStatus
 from orchestrator.movie_code import canonical_movie_code
@@ -161,27 +164,6 @@ class _FileSnapshot:
     mtime_ns: int
     content: bytes | None
     basename: str | None = None
-    fd: int | None = None
-
-    def require_unchanged(self, directory_fd: int) -> None:
-        if self.basename is None or self.fd is None:
-            raise OSError("snapshot descriptor unavailable")
-        opened = os.fstat(self.fd)
-        current = os.stat(
-            self.basename,
-            dir_fd=directory_fd,
-            follow_symlinks=False,
-        )
-        expected = (self.size, self.mtime_ns)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(current.st_mode)
-            or (opened.st_dev, opened.st_ino)
-            != (current.st_dev, current.st_ino)
-            or (opened.st_size, opened.st_mtime_ns) != expected
-            or (current.st_size, current.st_mtime_ns) != expected
-        ):
-            raise OSError("snapshot path changed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,41 +174,31 @@ class _HeldJobSnapshot:
     def require_unchanged(self) -> None:
         self.lock.require_bound()
         for snapshot in self.files:
-            snapshot.require_unchanged(self.lock.job_fd)
+            if snapshot.basename is None:
+                raise OSError("snapshot basename unavailable")
+            current = _open_stable_regular_file_at(
+                self.lock.job_fd,
+                snapshot.basename,
+                keep_content=False,
+            )
+            if (
+                current.sha256 != snapshot.sha256
+                or current.size != snapshot.size
+                or current.mtime_ns != snapshot.mtime_ns
+            ):
+                raise OSError("snapshot path changed")
 
 
 @dataclass(frozen=True, slots=True)
 class _PreheldJobFiles:
     lock: JobFilesLock
-    descriptors: tuple[tuple[str, int], tuple[str, int], tuple[str, int]]
 
     def snapshots(
         self,
     ) -> tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]:
-        japanese_name, japanese_fd = self.descriptors[0]
-        english_name, english_fd = self.descriptors[1]
-        audio_name, audio_fd = self.descriptors[2]
-        return (
-            _snapshot_held_regular_file(
-                self.lock.job_fd,
-                japanese_name,
-                japanese_fd,
-                keep_content=True,
-                max_bytes=MAX_SUBTITLE_BYTES,
-            ),
-            _snapshot_held_regular_file(
-                self.lock.job_fd,
-                english_name,
-                english_fd,
-                keep_content=True,
-                max_bytes=MAX_SUBTITLE_BYTES,
-            ),
-            _snapshot_held_regular_file(
-                self.lock.job_fd,
-                audio_name,
-                audio_fd,
-                keep_content=False,
-            ),
+        return _snapshot_three_job_files(
+            self.lock.job_fd,
+            self.lock.movie_code,
         )
 
 
@@ -449,7 +421,6 @@ def _open_stable_regular_file_at(
     *,
     keep_content: bool,
     max_bytes: int | None = None,
-    descriptor_stack: ExitStack | None = None,
 ) -> _FileSnapshot:
     before_path = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
     if not stat.S_ISREG(before_path.st_mode) or before_path.st_size <= 0:
@@ -461,7 +432,6 @@ def _open_stable_regular_file_at(
         os.O_RDONLY | os.O_NOFOLLOW,
         dir_fd=directory_fd,
     )
-    close_descriptor = True
     try:
         before = os.fstat(fd)
         if (
@@ -492,101 +462,39 @@ def _open_stable_regular_file_at(
             != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         ):
             raise OSError("file changed")
-        result = _FileSnapshot(
+        return _FileSnapshot(
             sha256=digest.hexdigest(),
             size=before.st_size,
             mtime_ns=before.st_mtime_ns,
             content=bytes(content) if content is not None else None,
             basename=basename,
-            fd=fd if descriptor_stack is not None else None,
         )
-        if descriptor_stack is not None:
-            descriptor_stack.callback(os.close, fd)
-            close_descriptor = False
-        return result
     finally:
-        if close_descriptor:
-            os.close(fd)
-
-
-def _open_regular_descriptor_at(
-    directory_fd: int,
-    basename: str,
-    descriptor_stack: ExitStack,
-) -> int:
-    path_stat = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
-    if not stat.S_ISREG(path_stat.st_mode) or path_stat.st_size <= 0:
-        raise OSError("not a nonempty regular file")
-    fd = os.open(
-        basename,
-        os.O_RDONLY | os.O_NOFOLLOW,
-        dir_fd=directory_fd,
-    )
-    opened = os.fstat(fd)
-    if (
-        not stat.S_ISREG(opened.st_mode)
-        or opened.st_size <= 0
-        or (opened.st_dev, opened.st_ino) != (path_stat.st_dev, path_stat.st_ino)
-    ):
         os.close(fd)
-        raise OSError("file changed")
-    descriptor_stack.callback(os.close, fd)
-    return fd
 
 
-def _snapshot_held_regular_file(
+def _snapshot_three_job_files(
     directory_fd: int,
-    basename: str,
-    fd: int,
-    *,
-    keep_content: bool,
-    max_bytes: int | None = None,
-) -> _FileSnapshot:
-    before = os.fstat(fd)
-    path_before = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or before.st_size <= 0
-        or (before.st_dev, before.st_ino)
-        != (path_before.st_dev, path_before.st_ino)
-        or (max_bytes is not None and before.st_size > max_bytes)
-    ):
-        raise OSError("held file changed")
-    os.lseek(fd, 0, os.SEEK_SET)
-    digest = hashlib.sha256()
-    content = bytearray() if keep_content else None
-    remaining = before.st_size
-    while remaining:
-        chunk = os.read(fd, min(1024 * 1024, remaining))
-        if not chunk:
-            raise OSError("held file changed")
-        digest.update(chunk)
-        if content is not None:
-            content.extend(chunk)
-        remaining -= len(chunk)
-    if os.read(fd, 1):
-        raise OSError("held file changed")
-    after = os.fstat(fd)
-    path_after = os.stat(basename, dir_fd=directory_fd, follow_symlinks=False)
-    expected = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    if (
-        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != expected
-        or (
-            path_after.st_dev,
-            path_after.st_ino,
-            path_after.st_size,
-            path_after.st_mtime_ns,
-        )
-        != expected
-    ):
-        raise OSError("held file changed")
-    return _FileSnapshot(
-        sha256=digest.hexdigest(),
-        size=before.st_size,
-        mtime_ns=before.st_mtime_ns,
-        content=bytes(content) if content is not None else None,
-        basename=basename,
-        fd=fd,
+    path_movie_number: str,
+) -> tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]:
+    return (
+        _open_stable_regular_file_at(
+            directory_fd,
+            f"{path_movie_number}.Japanese.srt",
+            keep_content=True,
+            max_bytes=MAX_SUBTITLE_BYTES,
+        ),
+        _open_stable_regular_file_at(
+            directory_fd,
+            f"{path_movie_number}.English.srt",
+            keep_content=True,
+            max_bytes=MAX_SUBTITLE_BYTES,
+        ),
+        _open_stable_regular_file_at(
+            directory_fd,
+            "audio.wav",
+            keep_content=False,
+        ),
     )
 
 
@@ -596,51 +504,36 @@ def _prehold_plan_job_files(
     allowlist_path: Path,
     *,
     confirm_plan_sha256: str,
+    root_lock: JobsRootLock,
     descriptor_stack: ExitStack,
 ) -> dict[str, _PreheldJobFiles]:
     try:
-        if (
-            _LOWER_HEX_RE.fullmatch(confirm_plan_sha256) is None
-            or confirm_plan_sha256 != plan.plan_sha256
-            or plan.recalculate_sha256() != plan.plan_sha256
-            or str(Path(allowlist_path).absolute()) != plan.allowlist_path
-        ):
-            raise ValueError
+        _validate_plan_confirmation(
+            plan,
+            allowlist_path,
+            confirm_plan_sha256=confirm_plan_sha256,
+        )
         result: dict[str, _PreheldJobFiles] = {}
         for item in sorted(plan.items, key=lambda candidate: candidate.path_movie_number):
             held = descriptor_stack.enter_context(
-                shared_job_files_lock(
-                    store.jobs_root_mac,
+                shared_job_files_lock_from_root(
+                    root_lock,
                     item.path_movie_number,
                     blocking=True,
                 )
             )
-            names = (
-                f"{item.path_movie_number}.Japanese.srt",
-                f"{item.path_movie_number}.English.srt",
-                "audio.wav",
-            )
-            descriptors = tuple(
-                (name, _open_regular_descriptor_at(held.job_fd, name, descriptor_stack))
-                for name in names
-            )
-            result[item.path_movie_number] = _PreheldJobFiles(
-                held,
-                descriptors,  # type: ignore[arg-type]
-            )
+            result[item.path_movie_number] = _PreheldJobFiles(held)
         return result
     except (JobFilesLockError, OSError, TypeError, ValueError):
         raise ValueError("historical_plan_changed") from None
 
 
 def _snapshot_job_files(
-    root: Path,
+    root_lock: JobsRootLock,
     path_movie_number: str,
     *,
-    descriptor_stack: ExitStack | None = None,
     held_snapshots: list[_HeldJobSnapshot] | None = None,
     preheld: _PreheldJobFiles | None = None,
-    lock_blocking: bool = True,
 ) -> tuple[_FileSnapshot, _FileSnapshot, _FileSnapshot]:
     if (
         normalize_movie_number(path_movie_number) is None
@@ -654,40 +547,8 @@ def _snapshot_job_files(
         if held_snapshots is not None:
             held_snapshots.append(held_snapshot)
         return snapshots
-    with ExitStack() as local_stack:
-        stack = descriptor_stack if descriptor_stack is not None else local_stack
-        held = stack.enter_context(
-            shared_job_files_lock(
-                root,
-                path_movie_number,
-                blocking=lock_blocking,
-            )
-        )
-        japanese = _open_stable_regular_file_at(
-            held.job_fd,
-            f"{path_movie_number}.Japanese.srt",
-            keep_content=True,
-            max_bytes=MAX_SUBTITLE_BYTES,
-            descriptor_stack=stack,
-        )
-        english = _open_stable_regular_file_at(
-            held.job_fd,
-            f"{path_movie_number}.English.srt",
-            keep_content=True,
-            max_bytes=MAX_SUBTITLE_BYTES,
-            descriptor_stack=stack,
-        )
-        audio = _open_stable_regular_file_at(
-            held.job_fd,
-            "audio.wav",
-            keep_content=False,
-            descriptor_stack=stack,
-        )
-        snapshot = _HeldJobSnapshot(held, (japanese, english, audio))
-        snapshot.require_unchanged()
-        if held_snapshots is not None:
-            held_snapshots.append(snapshot)
-        return japanese, english, audio
+    with open_job_directory_from_root(root_lock, path_movie_number) as job_fd:
+        return _snapshot_three_job_files(job_fd, path_movie_number)
 
 
 def _read_allowlist(path: Path) -> tuple[tuple[str, ...], str, str]:
@@ -772,11 +633,10 @@ def _build_plan(
     *,
     limit: int,
     conn: sqlite3.Connection,
+    root_lock: JobsRootLock,
     ignore_batch_id: str | None = None,
-    descriptor_stack: ExitStack | None = None,
     held_snapshots: list[_HeldJobSnapshot] | None = None,
     preheld_jobs: dict[str, _PreheldJobFiles] | None = None,
-    missing_lock_blocking: bool = True,
 ) -> HistoricalBatchPlan:
     movies, allowlist_sha256, absolute_allowlist_path = _read_allowlist(allowlist_path)
     jobs_by_movie: dict[str, list[Any]] = {}
@@ -859,12 +719,10 @@ def _build_plan(
         path_movie_number = row["normalized_movie_number"]
         try:
             japanese, english, audio = _snapshot_job_files(
-                store.jobs_root_mac,
+                root_lock,
                 path_movie_number,
-                descriptor_stack=descriptor_stack,
                 held_snapshots=held_snapshots,
                 preheld=(preheld_jobs or {}).get(path_movie_number),
-                lock_blocking=missing_lock_blocking,
             )
         except (JobFilesLockError, OSError):
             blocked += 1
@@ -957,16 +815,21 @@ def plan_historical_batch(
         or not 1 <= limit <= MAX_BATCH_LIMIT
     ):
         raise ValueError("historical batch limit must be between 1 and 20")
-    conn = _read_only_connection(store.db_path)
-    try:
-        return _build_plan(
-            store,
-            Path(allowlist_path),
-            limit=limit,
-            conn=conn,
-        )
-    finally:
-        conn.close()
+    with exclusive_jobs_root_lock(
+        store.jobs_root_mac,
+        blocking=True,
+    ) as root_lock:
+        conn = _read_only_connection(store.db_path)
+        try:
+            return _build_plan(
+                store,
+                Path(allowlist_path),
+                limit=limit,
+                conn=conn,
+                root_lock=root_lock,
+            )
+        finally:
+            conn.close()
 
 
 def render_historical_batch_report(plan: HistoricalBatchPlan) -> str:
@@ -1086,6 +949,7 @@ def write_private_plan(path: Path, plan: HistoricalBatchPlan) -> None:
             0o600,
             dir_fd=parent_fd,
         )
+        os.fchmod(temporary_fd, 0o600)
         temporary_stat = os.fstat(temporary_fd)
         temporary_inode = (temporary_stat.st_dev, temporary_stat.st_ino)
         snapshot = plan.to_json_bytes()
@@ -1163,6 +1027,79 @@ def _row_to_repair(row: sqlite3.Row) -> HistoricalRepairRecord:
     )
 
 
+def _validate_plan_confirmation(
+    plan: HistoricalBatchPlan,
+    allowlist_path: Path,
+    *,
+    confirm_plan_sha256: str,
+) -> None:
+    if (
+        not isinstance(confirm_plan_sha256, str)
+        or _LOWER_HEX_RE.fullmatch(confirm_plan_sha256) is None
+        or confirm_plan_sha256 != plan.plan_sha256
+        or plan.recalculate_sha256() != plan.plan_sha256
+        or HistoricalBatchPlan.from_json_bytes(plan.to_json_bytes()) != plan
+        or str(Path(allowlist_path).absolute()) != plan.allowlist_path
+    ):
+        raise ValueError("historical_plan_changed")
+
+
+def _exact_existing_records(
+    conn: sqlite3.Connection,
+    plan: HistoricalBatchPlan,
+) -> list[HistoricalRepairRecord] | None:
+    rows = conn.execute(
+        "SELECT * FROM historical_translation_repairs WHERE batch_id = ? "
+        "ORDER BY movie_code ASC, job_id ASC",
+        (plan.batch_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != len(plan.items):
+        raise ValueError("historical_plan_changed")
+    expected_by_job = {item.job_id: item for item in plan.items}
+    if {row["job_id"] for row in rows} != set(expected_by_job):
+        raise ValueError("historical_plan_changed")
+    for row in rows:
+        item = expected_by_job[row["job_id"]]
+        expected_id = "repair_" + hashlib.sha256(
+            f"{plan.plan_sha256}:{item.job_id}".encode()
+        ).hexdigest()[:32]
+        if (
+            row["id"] != expected_id
+            or row["batch_id"] != plan.batch_id
+            or row["movie_code"] != item.movie_code
+            or row["allowlist_sha256"] != plan.allowlist_sha256
+            or row["japanese_sha256"] != item.japanese_sha256
+            or row["audio_sha256"] != item.audio_sha256
+            or row["english_sha256"] != item.english_sha256
+        ):
+            raise ValueError("historical_plan_changed")
+    return [_row_to_repair(row) for row in rows]
+
+
+def find_idempotent_historical_enqueue(
+    store: JobStore,
+    plan: HistoricalBatchPlan,
+    allowlist_path: Path,
+    *,
+    confirm_plan_sha256: str,
+) -> list[HistoricalRepairRecord] | None:
+    try:
+        _validate_plan_confirmation(
+            plan,
+            allowlist_path,
+            confirm_plan_sha256=confirm_plan_sha256,
+        )
+        conn = _read_only_connection(store.db_path)
+        try:
+            return _exact_existing_records(conn, plan)
+        finally:
+            conn.close()
+    except (sqlite3.Error, TypeError, ValueError):
+        raise ValueError("historical_plan_changed") from None
+
+
 def _enqueue_historical_repairs_transaction(
     store: JobStore,
     conn: sqlite3.Connection,
@@ -1170,55 +1107,31 @@ def _enqueue_historical_repairs_transaction(
     allowlist_path: Path,
     *,
     confirm_plan_sha256: str,
-    descriptor_stack: ExitStack,
+    root_lock: JobsRootLock,
     preheld_jobs: dict[str, _PreheldJobFiles],
 ) -> list[HistoricalRepairRecord]:
     try:
-        if (
-            _LOWER_HEX_RE.fullmatch(confirm_plan_sha256) is None
-            or confirm_plan_sha256 != plan.plan_sha256
-            or plan.recalculate_sha256() != plan.plan_sha256
-            or str(Path(allowlist_path).absolute()) != plan.allowlist_path
-        ):
-            raise ValueError
-        existing = conn.execute(
-            "SELECT * FROM historical_translation_repairs WHERE batch_id = ? "
-            "ORDER BY movie_code ASC, job_id ASC",
-            (plan.batch_id,),
-        ).fetchall()
-        if existing and len(existing) != len(plan.items):
-            raise ValueError
+        _validate_plan_confirmation(
+            plan,
+            allowlist_path,
+            confirm_plan_sha256=confirm_plan_sha256,
+        )
+        existing_records = _exact_existing_records(conn, plan)
+        if existing_records is not None:
+            return existing_records
         held_snapshots: list[_HeldJobSnapshot] = []
         recalculated = _build_plan(
             store,
             Path(allowlist_path),
             limit=plan.limit,
             conn=conn,
+            root_lock=root_lock,
             ignore_batch_id=plan.batch_id,
-            descriptor_stack=descriptor_stack,
             held_snapshots=held_snapshots,
             preheld_jobs=preheld_jobs,
-            missing_lock_blocking=False,
         )
         if recalculated != plan:
             raise ValueError
-        expected_by_job = {item.job_id: item for item in plan.items}
-        if existing:
-            if {row["job_id"] for row in existing} != set(expected_by_job):
-                raise ValueError
-            for row in existing:
-                item = expected_by_job[row["job_id"]]
-                if (
-                    row["movie_code"] != item.movie_code
-                    or row["allowlist_sha256"] != plan.allowlist_sha256
-                    or row["japanese_sha256"] != item.japanese_sha256
-                    or row["audio_sha256"] != item.audio_sha256
-                    or row["english_sha256"] != item.english_sha256
-                ):
-                    raise ValueError
-            for snapshot in held_snapshots:
-                snapshot.require_unchanged()
-            return [_row_to_repair(row) for row in existing]
         for snapshot in held_snapshots:
             snapshot.require_unchanged()
         now = utc_now_iso()
