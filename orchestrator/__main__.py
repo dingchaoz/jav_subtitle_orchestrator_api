@@ -264,6 +264,22 @@ def run_plan_historical_repairs(
     print(render_repair_report(plans))
 
 
+def run_plan_catalog_repairs(
+    *, allowlist: set[str] | None, limit: int
+) -> None:
+    from orchestrator.catalog_repair import (
+        plan_catalog_repairs,
+        render_catalog_repair_report,
+    )
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plans = plan_catalog_repairs(store, allowlist=allowlist, limit=limit)
+    print(render_catalog_repair_report(plans))
+
+
 def _write_private_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -430,6 +446,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="only inspect these movie numbers",
     )
     repair_parser.add_argument("--limit", type=int, default=100)
+    catalog_repair_parser = subcommands.add_parser(
+        "plan-catalog-repairs",
+        help="print a read-only catalog publication repair plan",
+    )
+    catalog_repair_parser.add_argument(
+        "--allowlist",
+        help="comma-separated movie codes to inspect",
+    )
+    catalog_repair_parser.add_argument("--limit", type=int, default=100)
     audit_parser = subcommands.add_parser(
         "audit-english-ai-local",
         help="GET-only local audit of exact English_AI catalog subtitles",
@@ -475,6 +500,11 @@ def main() -> None:
     elif args.command == "plan-historical-subtitle-repair":
         run_plan_historical_repairs(
             allowlist=set(args.allowlist) if args.allowlist else None,
+            limit=args.limit,
+        )
+    elif args.command == "plan-catalog-repairs":
+        run_plan_catalog_repairs(
+            allowlist=set(args.allowlist.split(",")) if args.allowlist else None,
             limit=args.limit,
         )
     elif args.command == "audit-english-ai-local":
