@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
 import sqlite3
+import stat
 
+from orchestrator.historical_repair import load_repair_allowlist
 from orchestrator.movie_catalog import (
     METADATA_SOURCES,
     METADATA_STATUSES,
@@ -39,11 +43,114 @@ class CatalogRepairPlan:
     storage_effect: str
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogPublicationCanaryReceipt:
+    job_id: str
+    movie_code: str
+    prior_status: JobStatus
+    new_status: JobStatus
+    translation_attempt_count: int
+    english_sha256: str
+    quality_passed: bool
+    english_cue_count: int
+    english_unique_ratio: float
+    known_bad_phrase_count: int
+
+
 def _nonempty_file(path) -> bool:
     try:
         return path.is_file() and path.stat().st_size > 0
     except OSError:
         return False
+
+
+def _require_regular_nonempty_subtitle(path: Path, label: str) -> None:
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"quality_gate_failed:{label}_srt_missing") from exc
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"quality_gate_failed:{label}_srt_not_regular")
+    if file_stat.st_size <= 0:
+        raise ValueError(f"quality_gate_failed:{label}_srt_empty")
+
+
+def prepare_catalog_publication_canary(
+    store: JobStore,
+    allowlist_path: Path,
+    *,
+    movie: str,
+    limit: int,
+    confirm_job_id: str,
+) -> CatalogPublicationCanaryReceipt:
+    if limit != 1:
+        raise ValueError("limit must be exactly 1")
+    requested = canonical_movie_code(movie)
+    allowlist = load_repair_allowlist(allowlist_path)
+    if requested not in allowlist:
+        raise ValueError("movie is not in the explicit allowlist")
+
+    prior = store.get_job(confirm_job_id)
+    if prior is None:
+        raise ValueError("confirmed catalog publication job does not exist")
+    if canonical_movie_code(prior.normalized_movie_number) != requested:
+        raise ValueError("confirmed job does not match requested movie")
+    if prior.status not in {JobStatus.FAILED, JobStatus.ENGLISH_SRT_READY}:
+        raise ValueError("confirmed job status is not eligible")
+    if prior.claimed_by is not None:
+        raise ValueError("confirmed job is claimed")
+    if (
+        prior.status is JobStatus.ENGLISH_SRT_READY
+        and prior.catalog_movie_uuid
+        and prior.metadata_status in METADATA_STATUSES
+        and prior.metadata_source in METADATA_SOURCES
+    ):
+        raise ValueError("verified publication is not eligible")
+
+    paths = build_job_paths(
+        prior.normalized_movie_number,
+        store.jobs_root_mac,
+        store.jobs_root_windows,
+    )
+    _require_regular_nonempty_subtitle(
+        paths.japanese_srt_path_mac,
+        "japanese",
+    )
+    _require_regular_nonempty_subtitle(
+        paths.english_srt_path_mac,
+        "english",
+    )
+    report = validate_translation_quality(
+        paths.japanese_srt_path_mac,
+        paths.english_srt_path_mac,
+    )
+    if not report.passed:
+        reason_codes = ",".join(report.reason_codes) or "unknown"
+        raise ValueError(f"quality_gate_failed:{reason_codes}")
+
+    with paths.english_srt_path_mac.open("rb") as english_file:
+        english_sha256 = hashlib.file_digest(english_file, "sha256").hexdigest()
+
+    allowlist_after_validation = load_repair_allowlist(allowlist_path)
+    if requested not in allowlist_after_validation:
+        raise RuntimeError("allowlist changed before prepare")
+    prepared = store.prepare_catalog_publication_repair(
+        prior.id,
+        expected_status=prior.status,
+        expected_movie=requested,
+    )
+    return CatalogPublicationCanaryReceipt(
+        job_id=prepared.id,
+        movie_code=requested,
+        prior_status=prior.status,
+        new_status=prepared.status,
+        translation_attempt_count=prepared.translation_attempt_count,
+        english_sha256=english_sha256,
+        quality_passed=report.passed,
+        english_cue_count=report.english_cue_count,
+        english_unique_ratio=report.english_unique_ratio,
+        known_bad_phrase_count=report.known_bad_phrase_count,
+    )
 
 
 def plan_catalog_repairs(

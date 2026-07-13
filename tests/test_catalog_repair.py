@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -8,9 +9,12 @@ import requests
 
 from orchestrator.__main__ import build_parser
 from orchestrator.catalog_repair import (
+    CatalogPublicationCanaryReceipt,
     plan_catalog_repairs,
+    prepare_catalog_publication_canary,
     render_catalog_repair_report,
 )
+from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
 
@@ -43,6 +47,78 @@ def _store(sqlite_path: Path, mac_jobs_root: Path) -> JobStore:
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     return store
+
+
+def _write_canary_allowlist(path: Path, *movies: str) -> Path:
+    path.write_text("".join(f"{movie}\n" for movie in movies), encoding="utf-8")
+    return path
+
+
+def _prepare_canary_candidate(
+    store: JobStore,
+    root: Path,
+    movie: str,
+    *,
+    quality_passes: bool = True,
+    status: JobStatus = JobStatus.FAILED,
+    claimed_by: str | None = None,
+    catalog_movie_uuid: str | None = None,
+    metadata_status: str | None = None,
+    metadata_source: str | None = None,
+):
+    job = store.submit_job(movie, priority=100, force=False).job
+    paths = _write_subtitles(root, movie, quality_passes=quality_passes)
+    paths.audio_path_mac.write_bytes(b"canary-audio")
+    rejected = paths.job_dir_mac / "rejected"
+    rejected.mkdir()
+    (rejected / "existing.srt").write_bytes(b"existing-rejected")
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = ?, claimed_by = ?, lease_expires_at = ?, "
+            "translation_attempt_count = 3, publish_attempt_count = 4, "
+            "next_publish_attempt_at = ?, catalog_movie_uuid = ?, "
+            "metadata_status = ?, metadata_source = ?, error = ? WHERE id = ?",
+            (
+                status.value,
+                claimed_by,
+                "2026-07-13T12:00:00+00:00" if claimed_by else None,
+                "2026-07-13T13:00:00+00:00",
+                catalog_movie_uuid,
+                metadata_status,
+                metadata_source,
+                "stale publication error",
+                job.id,
+            ),
+        )
+    return job, paths
+
+
+def _canary_files_snapshot(paths) -> dict[str, object]:
+    rejected = paths.job_dir_mac / "rejected"
+    return {
+        "audio": paths.audio_path_mac.read_bytes(),
+        "japanese": (
+            paths.japanese_srt_path_mac.read_bytes()
+            if paths.japanese_srt_path_mac.exists()
+            else None
+        ),
+        "english": (
+            paths.english_srt_path_mac.read_bytes()
+            if paths.english_srt_path_mac.exists()
+            else None
+        ),
+        "japanese_symlink": paths.japanese_srt_path_mac.is_symlink(),
+        "english_symlink": paths.english_srt_path_mac.is_symlink(),
+        "rejected": {
+            path.name: path.read_bytes()
+            for path in sorted(rejected.iterdir())
+        },
+    }
+
+
+def _assert_canary_failure_is_atomic(store, job_id, paths, row_before, files_before):
+    assert store.get_job(job_id) == row_before
+    assert _canary_files_snapshot(paths) == files_before
 
 
 def test_catalog_repair_plan_is_deterministic_allowlisted_and_limited(
@@ -340,3 +416,371 @@ def test_catalog_repair_cli_runner_only_prints(
     output = capsys.readouterr().out
     assert output.startswith("DRY RUN affected_count=1")
     assert "force=True" not in output
+
+
+def test_prepare_catalog_publication_canary_is_exact_and_preserves_translation(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-021")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "ABC21")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+    english_before = paths.english_srt_path_mac.read_bytes()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("canary preparation invoked external work")
+
+    monkeypatch.setattr(requests.Session, "request", unexpected)
+    monkeypatch.setattr(
+        "orchestrator.translation.SubtitleTranslator.translate_to_english",
+        unexpected,
+    )
+    monkeypatch.setattr(
+        "orchestrator.supabase_publisher.SupabaseSubtitlePublisher.publish_english_ai",
+        unexpected,
+    )
+
+    receipt = prepare_catalog_publication_canary(
+        store,
+        allowlist,
+        movie="ABC21",
+        limit=1,
+        confirm_job_id=job.id,
+    )
+
+    assert receipt == CatalogPublicationCanaryReceipt(
+        job_id=job.id,
+        movie_code="abc-021",
+        prior_status=JobStatus.FAILED,
+        new_status=JobStatus.PUBLISH_PENDING,
+        translation_attempt_count=3,
+        english_sha256=hashlib.sha256(english_before).hexdigest(),
+        quality_passed=True,
+        english_cue_count=25,
+        english_unique_ratio=1.0,
+        known_bad_phrase_count=0,
+    )
+    with pytest.raises(FrozenInstanceError):
+        receipt.new_status = JobStatus.FAILED
+    assert not hasattr(receipt, "__dict__")
+    assert "Private translated sentence" not in repr(receipt)
+
+    prepared = store.get_job(job.id)
+    assert prepared.status is JobStatus.PUBLISH_PENDING
+    assert prepared.translation_attempt_count == row_before.translation_attempt_count
+    assert prepared.publish_attempt_count == 0
+    assert prepared.next_publish_attempt_at is None
+    assert prepared.catalog_movie_uuid is None
+    assert prepared.metadata_status is None
+    assert prepared.metadata_source is None
+    assert prepared.error is None
+    assert _canary_files_snapshot(paths) == files_before
+
+
+@pytest.mark.parametrize("limit", [0, 2, -1])
+def test_prepare_catalog_publication_canary_requires_exactly_one(
+    sqlite_path, mac_jobs_root, tmp_path, limit
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-030")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-030")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="exactly 1"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-030",
+            limit=limit,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+@pytest.mark.parametrize("allowlist_state", ["empty", "duplicate", "invalid", "symlink"])
+def test_prepare_catalog_publication_canary_reuses_strict_allowlist_loader(
+    sqlite_path, mac_jobs_root, tmp_path, allowlist_state
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-031")
+    allowlist = tmp_path / "allowlist.txt"
+    if allowlist_state == "empty":
+        allowlist.write_bytes(b"")
+    elif allowlist_state == "duplicate":
+        allowlist.write_text("ABC31\nabc-031\n", encoding="utf-8")
+    elif allowlist_state == "invalid":
+        allowlist.write_text("not-a-movie\n", encoding="utf-8")
+    else:
+        target = _write_canary_allowlist(tmp_path / "real.txt", "abc-031")
+        allowlist.symlink_to(target)
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="allowlist"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-031",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rejects_movie_absent_from_allowlist(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-032")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-999")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="explicit allowlist"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="ABC32",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rejects_missing_exact_job(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-033")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-033")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="does not exist"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-033",
+            limit=1,
+            confirm_job_id="job_does_not_exist",
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rejects_job_movie_mismatch(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    requested_job, requested_paths = _prepare_canary_candidate(
+        store, mac_jobs_root, "abc-034"
+    )
+    other_job, other_paths = _prepare_canary_candidate(
+        store, mac_jobs_root, "xyz-034"
+    )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-034")
+    requested_before = store.get_job(requested_job.id)
+    requested_files_before = _canary_files_snapshot(requested_paths)
+    other_before = store.get_job(other_job.id)
+    other_files_before = _canary_files_snapshot(other_paths)
+
+    with pytest.raises(ValueError, match="does not match"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-034",
+            limit=1,
+            confirm_job_id=other_job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store,
+        requested_job.id,
+        requested_paths,
+        requested_before,
+        requested_files_before,
+    )
+    _assert_canary_failure_is_atomic(
+        store, other_job.id, other_paths, other_before, other_files_before
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "claimed_by"),
+    [
+        (JobStatus.FAILED, "publisher"),
+        (JobStatus.QUEUED, None),
+        (JobStatus.PUBLISH_PENDING, None),
+        (JobStatus.PUBLISHING, None),
+    ],
+)
+def test_prepare_catalog_publication_canary_rejects_claimed_or_ineligible_row(
+    sqlite_path, mac_jobs_root, tmp_path, status, claimed_by
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(
+        store,
+        mac_jobs_root,
+        "abc-035",
+        status=status,
+        claimed_by=claimed_by,
+    )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-035")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="claimed|status"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-035",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rejects_modern_verified_ready(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(
+        store,
+        mac_jobs_root,
+        "abc-036",
+        status=JobStatus.ENGLISH_SRT_READY,
+        catalog_movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+    )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-036")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError, match="verified publication"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-036",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rejects_bad_quality_safely(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(
+        store, mac_jobs_root, "abc-037", quality_passes=False
+    )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-037")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    with pytest.raises(ValueError) as error:
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-037",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    message = str(error.value)
+    assert message.startswith("quality_gate_failed:")
+    reason_codes = message.removeprefix("quality_gate_failed:").split(",")
+    assert reason_codes
+    assert all(code.replace("_", "").isalnum() for code in reason_codes)
+    assert "Cannot translate" not in message
+    assert "日本語" not in message
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+@pytest.mark.parametrize("language", ["japanese", "english"])
+@pytest.mark.parametrize("file_state", ["missing", "empty", "symlink"])
+def test_prepare_catalog_publication_canary_rejects_unsafe_canonical_subtitles(
+    sqlite_path, mac_jobs_root, tmp_path, language, file_state
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-038")
+    subtitle = getattr(paths, f"{language}_srt_path_mac")
+    if file_state == "missing":
+        subtitle.unlink()
+    elif file_state == "empty":
+        subtitle.write_bytes(b"")
+    else:
+        external = tmp_path / f"external-{language}.srt"
+        external.write_bytes(subtitle.read_bytes())
+        subtitle.unlink()
+        subtitle.symlink_to(external)
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-038")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+
+    expected_state = "not_regular" if file_state == "symlink" else file_state
+    with pytest.raises(
+        ValueError,
+        match=rf"^quality_gate_failed:{language}_srt_{expected_state}$",
+    ):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-038",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
+
+
+def test_prepare_catalog_publication_canary_rechecks_allowlist_before_mutation(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-039")
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "abc-039")
+    row_before = store.get_job(job.id)
+    files_before = _canary_files_snapshot(paths)
+    reads = iter((frozenset({"abc-039"}), frozenset({"abc-999"})))
+    monkeypatch.setattr(
+        "orchestrator.catalog_repair.load_repair_allowlist",
+        lambda path: next(reads),
+    )
+
+    with pytest.raises(RuntimeError, match="allowlist changed"):
+        prepare_catalog_publication_canary(
+            store,
+            allowlist,
+            movie="abc-039",
+            limit=1,
+            confirm_job_id=job.id,
+        )
+
+    _assert_canary_failure_is_atomic(
+        store, job.id, paths, row_before, files_before
+    )
