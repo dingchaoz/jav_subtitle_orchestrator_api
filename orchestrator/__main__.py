@@ -38,7 +38,17 @@ def build_supabase_publisher(settings):
         raise RuntimeError(
             "Supabase publication is enabled but URL, service key, or bucket is missing"
         )
+    import requests
+
+    from orchestrator.movie_catalog import SupabaseMovieCatalogEnsurer
     from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
+
+    session = requests.Session()
+    catalog_ensurer = SupabaseMovieCatalogEnsurer(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        session=session,
+    )
 
     return SupabaseSubtitlePublisher(
         settings.supabase_url,
@@ -47,6 +57,8 @@ def build_supabase_publisher(settings):
         verification_timeout_seconds=(
             settings.supabase_publish_verify_timeout_seconds
         ),
+        session=session,
+        catalog_ensurer=catalog_ensurer,
     )
 
 
@@ -198,6 +210,8 @@ def run_mac_translation_worker() -> None:
         lease_seconds=settings.mac_translation_lease_seconds,
         quality_failure_limit=settings.translation_quality_failure_limit,
         publisher=publisher,
+        max_publish_attempts=settings.max_publish_attempts,
+        publish_retry_seconds=settings.mac_publish_retry_seconds,
     )
     run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
 
@@ -224,6 +238,8 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         lease_seconds=settings.mac_translation_lease_seconds,
         quality_failure_limit=settings.translation_quality_failure_limit,
         publisher=publisher,
+        max_publish_attempts=settings.max_publish_attempts,
+        publish_retry_seconds=settings.mac_publish_retry_seconds,
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)

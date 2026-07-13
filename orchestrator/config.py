@@ -43,6 +43,17 @@ class MacSettings(BaseSettings):
         alias="MAC_TRANSLATION_LEASE_SECONDS",
     )
     max_translation_attempts: int = Field(default=3, alias="MAX_TRANSLATION_ATTEMPTS")
+    max_publish_attempts: int = Field(
+        default=10,
+        ge=1,
+        alias="MAX_PUBLISH_ATTEMPTS",
+    )
+    mac_publish_retry_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=3600,
+        alias="MAC_PUBLISH_RETRY_SECONDS",
+    )
     mac_translation_poll_interval_seconds: int = Field(
         default=10,
         alias="MAC_TRANSLATION_POLL_INTERVAL_SECONDS",

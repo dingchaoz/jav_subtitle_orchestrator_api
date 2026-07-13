@@ -1,3 +1,4 @@
+import inspect
 import os
 import subprocess
 import sys
@@ -7,8 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from orchestrator.__main__ import _build_windows_transcriber, build_supabase_publisher
+from orchestrator.__main__ import (
+    _build_windows_transcriber,
+    build_supabase_publisher,
+    run_mac_translation_worker,
+    run_mac_translation_worker_once,
+)
 from orchestrator.config import MacSettings, WindowsSettings
+from orchestrator.movie_catalog import SupabaseMovieCatalogEnsurer
 from orchestrator.paths import build_job_paths, normalize_movie_number
 from orchestrator.transcription import ExternalScriptTranscriber, FasterWhisperTranscriber
 
@@ -25,6 +32,8 @@ MAC_ENV_ALIASES = (
     "MAX_DOWNLOAD_ATTEMPTS",
     "MAX_WORKER_ATTEMPTS",
     "MAC_TRANSLATION_PUBLISH_ENABLED",
+    "MAX_PUBLISH_ATTEMPTS",
+    "MAC_PUBLISH_RETRY_SECONDS",
     "SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS",
 )
 
@@ -225,7 +234,25 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.max_download_attempts == 3
     assert settings.max_worker_attempts == 3
     assert settings.mac_translation_publish_enabled is False
+    assert settings.max_publish_attempts == 10
+    assert settings.mac_publish_retry_seconds == 30
     assert settings.supabase_publish_verify_timeout_seconds == 90
+
+
+@pytest.mark.parametrize(
+    ("alias", "value"),
+    [
+        ("MAX_PUBLISH_ATTEMPTS", "0"),
+        ("MAC_PUBLISH_RETRY_SECONDS", "0"),
+        ("MAC_PUBLISH_RETRY_SECONDS", "3601"),
+    ],
+)
+def test_mac_publication_retry_settings_are_bounded(monkeypatch, alias, value):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv(alias, value)
+
+    with pytest.raises(ValueError):
+        MacSettings(_env_file=None)
 
 
 def test_supabase_publisher_factory_requires_credentials_when_enabled():
@@ -241,6 +268,37 @@ def test_supabase_publisher_factory_requires_credentials_when_enabled():
     )
     with pytest.raises(RuntimeError, match="publication is enabled"):
         build_supabase_publisher(enabled)
+
+
+def test_supabase_publisher_factory_shares_session_with_catalog_ensurer():
+    settings = SimpleNamespace(
+        mac_translation_publish_enabled=True,
+        supabase_url="https://example.supabase.co",
+        supabase_service_role_key="service-role-key",
+        supabase_subtitle_bucket="subtitles",
+        supabase_publish_verify_timeout_seconds=90,
+    )
+
+    publisher = build_supabase_publisher(settings)
+
+    assert isinstance(publisher.catalog_ensurer, SupabaseMovieCatalogEnsurer)
+    assert publisher.catalog_ensurer.session is publisher.session
+    assert publisher.catalog_ensurer.url == "https://example.supabase.co"
+    assert publisher.catalog_ensurer.service_key == "service-role-key"
+    source = inspect.getsource(build_supabase_publisher)
+    assert "SupabaseMovieCatalogEnsurer(" in source
+    assert "catalog_ensurer=catalog_ensurer" in source
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [run_mac_translation_worker, run_mac_translation_worker_once],
+)
+def test_mac_translation_entrypoints_wire_publication_retry_settings(entrypoint):
+    source = inspect.getsource(entrypoint)
+
+    assert "max_publish_attempts=settings.max_publish_attempts" in source
+    assert "publish_retry_seconds=settings.mac_publish_retry_seconds" in source
 
 
 def test_windows_settings_defaults_match_design_spec(monkeypatch):
