@@ -286,6 +286,11 @@ def test_build_job_detail_returns_full_operational_fields(sqlite_path, mac_jobs_
     assert detail.attempt_count == 0
     assert detail.worker_attempt_count == 0
     assert detail.translation_attempt_count == 0
+    assert detail.publish_attempt_count == 0
+    assert detail.next_publish_attempt_at is None
+    assert detail.catalog_movie_uuid is None
+    assert detail.metadata_status is None
+    assert detail.metadata_source is None
     assert detail.claimed_by is None
     assert detail.lease_expires_at is None
     assert detail.created_at == ready.created_at
@@ -300,6 +305,49 @@ def test_build_job_detail_returns_full_operational_fields(sqlite_path, mac_jobs_
     assert detail.japanese_srt_path_windows is None
     assert detail.english_srt_path_mac is None
     assert detail.english_srt_path_windows is None
+
+
+def test_publication_states_are_active_processing_and_browser_jobs(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = store.submit_job("abc-021", priority=100, force=False).job
+    publishing = store.submit_job("abc-022", priority=100, force=False).job
+    set_job_status_and_recency(
+        sqlite_path,
+        pending.id,
+        status=JobStatus.PUBLISH_PENDING,
+        created_at="2026-07-05T11:00:01+00:00",
+        updated_at="2026-07-05T12:00:01+00:00",
+    )
+
+    pending_state = build_dashboard_state(store)
+
+    assert pending_state.counts["publish_pending"] == 1
+    assert pending_state.activity["processing"]["status"] == "publish_pending"
+    assert pending_state.activity["translation"]["status"] == "publish_pending"
+
+    set_job_status_and_recency(
+        sqlite_path,
+        publishing.id,
+        status=JobStatus.PUBLISHING,
+        created_at="2026-07-05T11:00:02+00:00",
+        updated_at="2026-07-05T12:00:02+00:00",
+    )
+
+    publishing_state = build_dashboard_state(store)
+    browser = build_job_browser(store, view="active")
+
+    assert publishing_state.counts["publish_pending"] == 1
+    assert publishing_state.counts["publishing"] == 1
+    assert publishing_state.activity["processing"]["status"] == "publishing"
+    assert publishing_state.activity["translation"]["status"] == "publishing"
+    assert browser.total == 2
+    assert [item.status for item in browser.items] == [
+        JobStatus.PUBLISHING,
+        JobStatus.PUBLISH_PENDING,
+    ]
 
 
 def test_build_job_browser_defaults_to_active_with_in_progress_before_queued(

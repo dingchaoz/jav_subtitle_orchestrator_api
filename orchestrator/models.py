@@ -195,6 +195,11 @@ class JobDetailResponse(BaseModel):
     attempt_count: int
     worker_attempt_count: int
     translation_attempt_count: int
+    publish_attempt_count: int
+    next_publish_attempt_at: str | None = None
+    catalog_movie_uuid: str | None = None
+    metadata_status: str | None = None
+    metadata_source: str | None = None
     claimed_by: str | None = None
     lease_expires_at: str | None = None
     created_at: str

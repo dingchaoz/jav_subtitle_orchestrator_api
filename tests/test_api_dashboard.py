@@ -77,6 +77,13 @@ def test_job_detail_endpoint_returns_full_paths(sqlite_path, mac_jobs_root):
     assert body["job_dir_mac"].endswith("/ktb-112")
     assert body["job_dir_windows"] == "M:\\ktb-112"
     assert body["audio_path_windows"] == "M:\\ktb-112\\audio.wav"
+    assert body["publish_attempt_count"] == 0
+    assert body["next_publish_attempt_at"] is None
+    assert body["catalog_movie_uuid"] is None
+    assert body["metadata_status"] is None
+    assert body["metadata_source"] is None
+    for sensitive_key in ("title", "description", "raw_metadata", "subtitle_text"):
+        assert sensitive_key not in body
 
 
 def test_log_endpoints_list_and_tail_allowlisted_logs(sqlite_path, mac_jobs_root):
@@ -151,6 +158,23 @@ def test_dashboard_page_returns_operator_html_without_force_controls(
     assert "Audio Mac" in html
     assert "Japanese SRT Mac" in html
     assert "English SRT Mac" in html
+    assert "Publish attempts" in html
+    assert "Next publish attempt" in html
+    assert "Catalog movie UUID" in html
+    assert "Metadata status" in html
+    assert "Metadata source" in html
+    assert "detail.publish_attempt_count" in html
+    assert "detail.next_publish_attempt_at" in html
+    assert "detail.catalog_movie_uuid" in html
+    assert "detail.metadata_status" in html
+    assert "detail.metadata_source" in html
+    for sensitive_row in (
+        '["Title", detail.title]',
+        '["Description", detail.description]',
+        '["Raw metadata", detail.raw_metadata]',
+        '["Subtitle text", detail.subtitle_text]',
+    ):
+        assert sensitive_row not in html
     assert "job-worker" in html
     assert "job-error" in html
     assert "job.claimed_by" in html

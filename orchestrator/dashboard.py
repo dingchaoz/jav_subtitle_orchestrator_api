@@ -32,6 +32,8 @@ WINDOWS_TRANSCRIPTION_STATUSES = {
 
 MAC_TRANSLATION_STATUSES = {
     JobStatus.TRANSLATING,
+    JobStatus.PUBLISH_PENDING,
+    JobStatus.PUBLISHING,
 }
 
 SUBTITLE_PROCESSING_STATUSES = {
@@ -49,6 +51,8 @@ ACTIVE_BROWSER_STATUSES = {
     JobStatus.TRANSCRIBING,
     JobStatus.TRANSCRIPTION_DONE,
     JobStatus.TRANSLATING,
+    JobStatus.PUBLISH_PENDING,
+    JobStatus.PUBLISHING,
 }
 
 IN_PROGRESS_BROWSER_STATUSES = ACTIVE_BROWSER_STATUSES - {JobStatus.QUEUED}
@@ -90,6 +94,11 @@ def build_job_detail(job: JobRecord) -> JobDetailResponse:
         attempt_count=job.attempt_count,
         worker_attempt_count=job.worker_attempt_count,
         translation_attempt_count=job.translation_attempt_count,
+        publish_attempt_count=job.publish_attempt_count,
+        next_publish_attempt_at=job.next_publish_attempt_at,
+        catalog_movie_uuid=job.catalog_movie_uuid,
+        metadata_status=job.metadata_status,
+        metadata_source=job.metadata_source,
         claimed_by=job.claimed_by,
         lease_expires_at=job.lease_expires_at,
         created_at=job.created_at,
@@ -1415,6 +1424,11 @@ def dashboard_html() -> str:
         ["Mac attempts", detail.attempt_count],
         ["Worker attempts", detail.worker_attempt_count],
         ["Translation attempts", detail.translation_attempt_count],
+        ["Publish attempts", detail.publish_attempt_count],
+        ["Next publish attempt", formatDate(detail.next_publish_attempt_at)],
+        ["Catalog movie UUID", detail.catalog_movie_uuid],
+        ["Metadata status", detail.metadata_status],
+        ["Metadata source", detail.metadata_source],
         ["Claimed by", detail.claimed_by],
         ["Lease expires", formatDate(detail.lease_expires_at)],
         ["Created", formatDate(detail.created_at)],
