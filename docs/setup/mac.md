@@ -191,6 +191,40 @@ metrics, and SHA-256 values, but no subtitle text or service key.
 later canary decision, not authorization to translate, quarantine, upload,
 overwrite, or requeue anything.
 
+## One-job catalog publication-only canary
+
+Use this path only after the exact job and publication operation have received
+separate approval. Create a private allowlist file containing exactly `mist-166`,
+then prepare and run only the approved job:
+
+```bash
+python -m orchestrator prepare-catalog-publication-canary \
+  --allowlist-file /absolute/path/catalog-canary-allowlist.txt \
+  --movie mist-166 \
+  --limit 1 \
+  --confirm-job-id job_5ca44399d21c40168821397f10c04538
+python -m orchestrator mac-translation-worker-once \
+  --job-id job_5ca44399d21c40168821397f10c04538
+```
+
+The prepare command initializes the local job database, reruns the local subtitle
+quality gate, and moves only that exact eligible row to `publish_pending`. It does
+not invoke translation, claim a worker job, contact Supabase, upload, move subtitle
+files, or delete audio. Its one-line receipt contains only job/status identifiers,
+quality statistics, and the accepted English SHA-256; it never prints subtitle
+text, credentials, or adult metadata.
+
+The one-shot worker is the separately authorized publication step. Before any
+catalog or Storage call, it reruns the Japanese/English pair quality gate and may
+claim only the confirmed job ID. Verify the local Japanese and audio hashes remain
+unchanged, the accepted English file remains in place, the remote English hash and
+catalog record are verified, and the final state is `english_srt_ready`.
+
+Stop after this job and report its evidence. Preparing or publishing a second job
+requires new explicit approval and a new exact-job invocation. This command has no
+automatic selector, `--force`, or batch mode; one-job approval never authorizes a
+batch, bulk overwrite, requeue, or `audio.wav` deletion.
+
 ## One-job historical repair canary
 
 ### Deployment approval gate

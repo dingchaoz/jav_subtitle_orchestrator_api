@@ -365,6 +365,40 @@ def run_prepare_historical_repair_canary(
     )
 
 
+def run_prepare_catalog_publication_canary(
+    *,
+    allowlist_file: Path,
+    movie: str,
+    limit: int,
+    confirm_job_id: str,
+) -> None:
+    from orchestrator.catalog_repair import prepare_catalog_publication_canary
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+    receipt = prepare_catalog_publication_canary(
+        store,
+        allowlist_file,
+        movie=movie,
+        limit=limit,
+        confirm_job_id=confirm_job_id,
+    )
+    print(
+        f"prepared=true job_id={receipt.job_id} movie={receipt.movie_code} "
+        f"prior_status={receipt.prior_status.value} "
+        f"new_status={receipt.new_status.value} "
+        f"translation_attempt_count={receipt.translation_attempt_count} "
+        f"english_sha256={receipt.english_sha256} "
+        f"quality_passed={str(receipt.quality_passed).lower()} "
+        f"cues={receipt.english_cue_count} "
+        f"unique_ratio={receipt.english_unique_ratio:.3f} "
+        f"known_bad={receipt.known_bad_phrase_count}"
+    )
+
+
 def run_local_english_ai_audit(
     *,
     output: Path,
@@ -489,6 +523,13 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--movie", required=True)
     prepare.add_argument("--limit", type=int, required=True)
     prepare.add_argument("--confirm-job-id", required=True)
+    catalog_prepare = subcommands.add_parser(
+        "prepare-catalog-publication-canary"
+    )
+    catalog_prepare.add_argument("--allowlist-file", type=Path, required=True)
+    catalog_prepare.add_argument("--movie", required=True)
+    catalog_prepare.add_argument("--limit", type=int, required=True)
+    catalog_prepare.add_argument("--confirm-job-id", required=True)
     return parser
 
 
@@ -535,6 +576,13 @@ def main() -> None:
         )
     elif args.command == "prepare-historical-repair-canary":
         run_prepare_historical_repair_canary(
+            allowlist_file=args.allowlist_file,
+            movie=args.movie,
+            limit=args.limit,
+            confirm_job_id=args.confirm_job_id,
+        )
+    elif args.command == "prepare-catalog-publication-canary":
+        run_prepare_catalog_publication_canary(
             allowlist_file=args.allowlist_file,
             movie=args.movie,
             limit=args.limit,

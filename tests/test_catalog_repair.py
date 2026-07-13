@@ -419,6 +419,94 @@ def test_catalog_repair_cli_runner_only_prints(
     assert "force=True" not in output
 
 
+def test_prepare_catalog_publication_canary_cli_requires_exact_arguments():
+    parser = build_parser()
+
+    parsed = parser.parse_args(
+        [
+            "prepare-catalog-publication-canary",
+            "--allowlist-file",
+            "approved.txt",
+            "--movie",
+            "ABC22",
+            "--limit",
+            "1",
+            "--confirm-job-id",
+            "job_exact",
+        ]
+    )
+
+    assert parsed.command == "prepare-catalog-publication-canary"
+    assert parsed.allowlist_file == Path("approved.txt")
+    assert parsed.movie == "ABC22"
+    assert parsed.limit == 1
+    assert parsed.confirm_job_id == "job_exact"
+    for forbidden in ("force", "batch", "preferred_movie"):
+        assert not hasattr(parsed, forbidden)
+
+
+def test_prepare_catalog_publication_canary_cli_runner_is_sanitized_and_local(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, capsys
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    job, paths = _prepare_canary_candidate(store, mac_jobs_root, "abc-022")
+    paths.metadata_path_mac.write_text(
+        json.dumps({"number": "ABC22", "title": "Secret Adult Metadata"}),
+        encoding="utf-8",
+    )
+    allowlist = _write_canary_allowlist(tmp_path / "allowlist.txt", "ABC22")
+    files_before = _canary_files_snapshot(paths)
+    directory_before = {
+        path.relative_to(paths.job_dir_mac): path.read_bytes()
+        for path in paths.job_dir_mac.rglob("*")
+        if path.is_file()
+    }
+    english_sha256 = hashlib.sha256(
+        paths.english_srt_path_mac.read_bytes()
+    ).hexdigest()
+
+    class Settings:
+        db_path = sqlite_path
+        jobs_root_mac = mac_jobs_root
+        jobs_root_windows = "M:\\"
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("CLI preparation invoked external work")
+
+    monkeypatch.setattr("orchestrator.config.MacSettings", Settings)
+    monkeypatch.setattr(requests.Session, "request", unexpected)
+    monkeypatch.setattr(
+        "orchestrator.translation.SubtitleTranslator.translate_to_english",
+        unexpected,
+    )
+    monkeypatch.setattr(
+        "orchestrator.supabase_publisher.SupabaseSubtitlePublisher.publish_english_ai",
+        unexpected,
+    )
+    from orchestrator.__main__ import run_prepare_catalog_publication_canary
+
+    run_prepare_catalog_publication_canary(
+        allowlist_file=allowlist,
+        movie="ABC22",
+        limit=1,
+        confirm_job_id=job.id,
+    )
+
+    assert capsys.readouterr().out == (
+        f"prepared=true job_id={job.id} movie=abc-022 prior_status=failed "
+        "new_status=publish_pending translation_attempt_count=3 "
+        f"english_sha256={english_sha256} quality_passed=true cues=25 "
+        "unique_ratio=1.000 known_bad=0\n"
+    )
+    assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert _canary_files_snapshot(paths) == files_before
+    assert {
+        path.relative_to(paths.job_dir_mac): path.read_bytes()
+        for path in paths.job_dir_mac.rglob("*")
+        if path.is_file()
+    } == directory_before
+
+
 def test_prepare_catalog_publication_canary_is_exact_and_preserves_translation(
     sqlite_path, mac_jobs_root, tmp_path, monkeypatch
 ):

@@ -1,8 +1,10 @@
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from orchestrator.catalog_repair import prepare_catalog_publication_canary
 from orchestrator.mac_worker import (
     MacDownloadWorker,
     MacTranslationUnhealthyError,
@@ -648,6 +650,77 @@ def test_exact_pending_job_publishes_without_claiming_other_pending(
     assert store.get_job(second.id).status is JobStatus.PUBLISH_PENDING
     assert store.get_job(third.id).status is JobStatus.ENGLISH_SRT_READY
     assert [event[0] for event in events] == ["publish"]
+
+
+def test_prepared_catalog_canary_publication_only_exact_job_preserves_other_job(
+    sqlite_path, mac_jobs_root, tmp_path
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first = prepare_transcription_done_job(
+        store, mac_jobs_root, cue_count=25, movie="abc-041"
+    )
+    first_dir = mac_jobs_root / first.normalized_movie_number
+    japanese = first_dir / f"{first.normalized_movie_number}.Japanese.srt"
+    english = first_dir / f"{first.normalized_movie_number}.English.srt"
+    audio = first_dir / "audio.wav"
+    audio.write_bytes(b"accepted-canary-audio")
+    DiverseMacTranslator().translate_to_english(japanese, english)
+    rejected_dir = first_dir / "rejected"
+    rejected_dir.mkdir()
+    (rejected_dir / "existing.srt").write_bytes(b"existing-rejected")
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = ?, translation_attempt_count = 2 WHERE id = ?",
+            (JobStatus.FAILED.value, first.id),
+        )
+    second = prepare_transcription_done_job(
+        store, mac_jobs_root, cue_count=25, movie="abc-042"
+    )
+    second_before = store.get_job(second.id)
+    allowlist = tmp_path / "approved.txt"
+    allowlist.write_text("ABC41\n", encoding="utf-8")
+    japanese_sha256 = hashlib.sha256(japanese.read_bytes()).hexdigest()
+    audio_sha256 = hashlib.sha256(audio.read_bytes()).hexdigest()
+    english_before = english.read_bytes()
+    rejected_before = {
+        path.name: path.read_bytes() for path in sorted(rejected_dir.iterdir())
+    }
+
+    receipt = prepare_catalog_publication_canary(
+        store,
+        allowlist,
+        movie="ABC41",
+        limit=1,
+        confirm_job_id=first.id,
+    )
+    translation_calls = []
+    publication_calls = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(translation_calls),
+        max_translation_attempts=3,
+        worker_id="mac-catalog-canary",
+        lease_seconds=60,
+        publisher=RecordingPublisher(publication_calls, verified=True),
+    )
+
+    assert receipt.new_status is JobStatus.PUBLISH_PENDING
+    assert worker.process_job_id(first.id) is True
+
+    assert translation_calls == []
+    assert [event[1] for event in publication_calls] == [
+        first.normalized_movie_number
+    ]
+    assert store.get_job(first.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_job(second.id) == second_before
+    assert hashlib.sha256(japanese.read_bytes()).hexdigest() == japanese_sha256
+    assert hashlib.sha256(audio.read_bytes()).hexdigest() == audio_sha256
+    assert english.exists()
+    assert english.read_bytes() == english_before
+    assert {
+        path.name: path.read_bytes() for path in sorted(rejected_dir.iterdir())
+    } == rejected_before
 
 
 def test_publisher_receives_metadata_json_path(sqlite_path, mac_jobs_root):
