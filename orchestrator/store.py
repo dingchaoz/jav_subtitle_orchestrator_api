@@ -1526,14 +1526,19 @@ class JobStore:
             self.jobs_root_mac,
             repair.movie_code,
             blocking=True,
-        ):
+        ) as files_lock:
             if (
-                self._sha256_regular_file(paths.japanese_srt_path_mac)
+                self._sha256_regular_file_at(
+                    files_lock.job_fd, paths.japanese_srt_path_mac.name
+                )
                 != repair.japanese_sha256
-                or self._sha256_regular_file(paths.audio_path_mac)
+                or self._sha256_regular_file_at(
+                    files_lock.job_fd, paths.audio_path_mac.name
+                )
                 != repair.audio_sha256
             ):
                 raise RuntimeError("preservation_hash_changed")
+            files_lock.require_bound()
 
     def _has_claimable_normal_work_conn(
         self,
@@ -1610,6 +1615,120 @@ class JobStore:
             ).fetchone()
             return row is not None
 
+    def find_recoverable_historical_marker_job(self) -> JobRecord | None:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT j.* FROM jobs AS j
+                JOIN historical_translation_repairs AS r ON r.job_id = j.id
+                WHERE r.state = ? AND j.translation_origin = ?
+                  AND (j.claimed_by IS NULL OR j.lease_expires_at IS NULL
+                       OR j.lease_expires_at <= ?)
+                ORDER BY r.updated_at ASC, r.id ASC
+                LIMIT 1
+                """,
+                (
+                    HistoricalRepairState.RUNNING.value,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                    now,
+                ),
+            ).fetchone()
+            return self._row_to_job(row) if row else None
+
+    def complete_historical_marker_recovery(
+        self,
+        job_id: str,
+        *,
+        reason_code: str,
+        candidate_sha256: str | None,
+        quality_failure_limit: int,
+    ) -> HistoricalStageFailureOutcome | None:
+        quality_failure = reason_code.startswith("quality_gate_failed:")
+        preservation_failure = reason_code == "preservation_hash_changed"
+        if not quality_failure and not preservation_failure:
+            raise ValueError("historical marker reason is invalid")
+        if quality_failure_limit < 1:
+            raise ValueError("historical quality failure limit must be positive")
+        if quality_failure:
+            if candidate_sha256 is None:
+                raise ValueError("historical quality marker hash is required")
+            _validate_expected_sha256(candidate_sha256, "candidate_sha256")
+        elif candidate_sha256 is not None:
+            _validate_expected_sha256(candidate_sha256, "candidate_sha256")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            repair = self.get_historical_repair(job_id, conn=conn)
+            if job is None or repair is None:
+                raise KeyError(job_id)
+            if repair.state is not HistoricalRepairState.RUNNING:
+                return None
+            if job.translation_origin != HISTORICAL_TRANSLATION_ORIGIN:
+                return None
+            if (
+                job.claimed_by is not None
+                and job.lease_expires_at is not None
+                and job.lease_expires_at > now
+            ):
+                return None
+            job_cursor = conn.execute(
+                """
+                UPDATE jobs SET status = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    catalog_lease_token = NULL, next_publish_attempt_at = NULL,
+                    next_catalog_sync_attempt_at = NULL,
+                    updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by IS ?
+                  AND lease_expires_at IS ? AND stage_lease_token IS ?
+                  AND catalog_lease_token IS ? AND translation_origin = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    f"historical_repair: {reason_code}",
+                    job_id,
+                    job.status.value,
+                    job.claimed_by,
+                    job.lease_expires_at,
+                    job.stage_lease_token,
+                    job.catalog_lease_token,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            repair_cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                    english_sha256 = COALESCE(?, english_sha256),
+                    updated_at = ?
+                WHERE job_id = ? AND state = ? AND updated_at = ?
+                """,
+                (
+                    HistoricalRepairState.PERMANENT_FAILED.value,
+                    reason_code,
+                    candidate_sha256,
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                    repair.updated_at,
+                ),
+            )
+            if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                raise StageLeaseLostError(
+                    "historical marker recovery state changed"
+                )
+            if quality_failure:
+                self._increment_historical_quality_failure_conn(
+                    conn, quality_failure_limit, now
+                )
+            else:
+                self._pause_historical_preservation_conn(conn, now)
+            return self._historical_failure_outcome_conn(
+                conn, job_id, terminal=True
+            )
+
     def reconcile_orphaned_historical_repairs(
         self,
         *,
@@ -1663,6 +1782,7 @@ class JobStore:
                     translation_retry or publication_retry or catalog_retry
                 )
                 quality_failure = "quality_gate_failed:" in error
+                preservation_failure = "preservation_hash_changed" in error
                 if transient_retry:
                     state = HistoricalRepairState.RETRY_WAIT
                     next_attempt_at = now
@@ -1674,7 +1794,7 @@ class JobStore:
                         reason_code = "quality_gate_failed:" + error.split(
                             "quality_gate_failed:", 1
                         )[1]
-                    elif "preservation_hash_changed" in error:
+                    elif preservation_failure:
                         reason_code = "preservation_hash_changed"
                     elif (
                         row["publish_attempt_count"]
@@ -1715,6 +1835,12 @@ class JobStore:
                     self._increment_historical_quality_failure_conn(
                         conn, quality_failure_limit, now
                     )
+                elif (
+                    cursor.rowcount == 1
+                    and preservation_failure
+                    and not transient_retry
+                ):
+                    self._pause_historical_preservation_conn(conn, now)
         return reconciled
 
     def claim_next_historical_repair(
@@ -1848,6 +1974,7 @@ class JobStore:
                     )
                     if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
                         raise RuntimeError("historical_repair_state_changed")
+                    self._pause_historical_preservation_conn(conn, now)
                     files_lock.require_bound()
                     rejected = True
                 else:
@@ -2124,6 +2251,8 @@ class JobStore:
                     HISTORICAL_TRANSLATION_ORIGIN,
                 ),
             )
+            if reason_code == "preservation_hash_changed":
+                self._pause_historical_preservation_conn(conn, now)
             updated = self.get_historical_repair(job_id, conn=conn)
             assert updated is not None
             return updated
@@ -2193,6 +2322,8 @@ class JobStore:
                     HISTORICAL_TRANSLATION_ORIGIN,
                 ),
             )
+            if reason_code == "preservation_hash_changed":
+                self._pause_historical_preservation_conn(conn, now)
             updated = self.get_historical_repair(job_id, conn=conn)
             assert updated is not None
             return updated
@@ -2218,6 +2349,18 @@ class JobStore:
             WHERE singleton = 1
             """,
             (limit, limit, now),
+        )
+
+    @staticmethod
+    def _pause_historical_preservation_conn(
+        conn: sqlite3.Connection,
+        now: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE historical_repair_control SET paused = 1, "
+            "reason_code = 'preservation_hash_changed', updated_at = ? "
+            "WHERE singleton = 1",
+            (now,),
         )
 
     def _historical_failure_outcome_conn(
@@ -2312,7 +2455,9 @@ class JobStore:
             )
             if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
                 raise StageLeaseLostError("historical translation lease is lost")
-            if quality_failure_limit is not None:
+            if reason_code == "preservation_hash_changed":
+                self._pause_historical_preservation_conn(conn, now)
+            elif quality_failure_limit is not None:
                 self._increment_historical_quality_failure_conn(
                     conn, quality_failure_limit, now
                 )
@@ -3090,7 +3235,9 @@ class JobStore:
                     raise StageLeaseLostError(
                         "historical publication lease is lost"
                     )
-                if permanent and quality_failure_limit is not None:
+                if terminal_reason == "preservation_hash_changed":
+                    self._pause_historical_preservation_conn(conn, now)
+                elif permanent and quality_failure_limit is not None:
                     self._increment_historical_quality_failure_conn(
                         conn, quality_failure_limit, now
                     )
@@ -3714,6 +3861,7 @@ class JobStore:
             )
             if cursor.rowcount != 1:
                 raise CatalogLeaseLostError(f"job {job_id} historical repair is no longer running")
+            self._pause_historical_preservation_conn(conn, now)
             updated = self.get_job(job_id, conn=conn)
             assert updated is not None
             return updated
@@ -3739,7 +3887,7 @@ class JobStore:
             attempts = row["catalog_sync_attempt_count"] + 1
             exhausted = attempts >= max_catalog_sync_attempts
             preservation_changed = False
-            if exhausted and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+            if row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
                 repair = self.get_historical_repair(row["id"])
                 try:
                     if repair is None:
@@ -3747,6 +3895,7 @@ class JobStore:
                     self.validate_historical_preservation(repair)
                 except (OSError, RuntimeError):
                     preservation_changed = True
+            exhausted = exhausted or preservation_changed
             with self.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 next_status = (
@@ -3775,7 +3924,11 @@ class JobStore:
                         attempts,
                         next_attempt_at,
                         now,
-                        "catalog_sync: catalog_sync_lease_expired",
+                        (
+                            "historical_repair: preservation_hash_changed"
+                            if preservation_changed
+                            else "catalog_sync: catalog_sync_lease_expired"
+                        ),
                         row["id"],
                         JobStatus.CATALOG_SYNCING.value,
                         row["claimed_by"],
@@ -3788,7 +3941,7 @@ class JobStore:
                     and exhausted
                     and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN
                 ):
-                    conn.execute(
+                    repair_cursor = conn.execute(
                         """
                         UPDATE historical_translation_repairs
                         SET state = ?, next_attempt_at = NULL, reason_code = ?,
@@ -3807,6 +3960,12 @@ class JobStore:
                             HistoricalRepairState.RUNNING.value,
                         ),
                     )
+                    if repair_cursor.rowcount != 1:
+                        raise CatalogLeaseLostError(
+                            "historical catalog recovery state changed"
+                        )
+                    if preservation_changed:
+                        self._pause_historical_preservation_conn(conn, now)
                 recovered += cursor.rowcount
         return recovered
 
@@ -3831,7 +3990,7 @@ class JobStore:
             attempts = row["publish_attempt_count"] + 1
             exhausted = attempts >= max_publish_attempts
             preservation_changed = False
-            if exhausted and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
+            if row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN:
                 repair = self.get_historical_repair(row["id"])
                 try:
                     if repair is None:
@@ -3839,6 +3998,7 @@ class JobStore:
                     self.validate_historical_preservation(repair)
                 except (OSError, RuntimeError):
                     preservation_changed = True
+            exhausted = exhausted or preservation_changed
             with self.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 next_status = JobStatus.FAILED if exhausted else JobStatus.PUBLISH_PENDING
@@ -3862,7 +4022,11 @@ class JobStore:
                         attempts,
                         next_attempt_at,
                         now,
-                        "publishing: publication lease expired",
+                        (
+                            "historical_repair: preservation_hash_changed"
+                            if preservation_changed
+                            else "publishing: publication lease expired"
+                        ),
                         row["id"],
                         JobStatus.PUBLISHING.value,
                         row["claimed_by"],
@@ -3875,7 +4039,7 @@ class JobStore:
                     and exhausted
                     and row["translation_origin"] == HISTORICAL_TRANSLATION_ORIGIN
                 ):
-                    conn.execute(
+                    repair_cursor = conn.execute(
                         """
                         UPDATE historical_translation_repairs
                         SET state = ?, next_attempt_at = NULL, reason_code = ?,
@@ -3894,6 +4058,12 @@ class JobStore:
                             HistoricalRepairState.RUNNING.value,
                         ),
                     )
+                    if repair_cursor.rowcount != 1:
+                        raise StageLeaseLostError(
+                            "historical publication recovery state changed"
+                        )
+                    if preservation_changed:
+                        self._pause_historical_preservation_conn(conn, now)
                 recovered += cursor.rowcount
         return recovered
 
@@ -3992,7 +4162,7 @@ class JobStore:
                         if exhausted
                         else HistoricalRepairState.RETRY_WAIT
                     )
-                    conn.execute(
+                    repair_cursor = conn.execute(
                         """
                         UPDATE historical_translation_repairs
                         SET state = ?, next_attempt_at = ?, reason_code = ?,
@@ -4037,6 +4207,12 @@ class JobStore:
                             row["stage_lease_token"],
                         ),
                     )
+                    if cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                        raise StageLeaseLostError(
+                            "historical translation recovery state changed"
+                        )
+                    if preservation_changed:
+                        self._pause_historical_preservation_conn(conn, now)
                     recovered += cursor.rowcount
                     continue
                 attempts = row["translation_attempt_count"] + 1

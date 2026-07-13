@@ -233,7 +233,89 @@ class MacTranslationWorker:
         except Exception:
             return
 
+    def _recover_historical_marker_before_generic_leases(self) -> bool:
+        job = self.store.find_recoverable_historical_marker_job()
+        if job is None:
+            return False
+        repair = self.store.get_historical_repair(job.id)
+        if repair is None or repair.state is not HistoricalRepairState.RUNNING:
+            return False
+        paths = build_job_paths(
+            job.normalized_movie_number,
+            self.store.jobs_root_mac,
+            self.store.jobs_root_windows,
+        )
+        try:
+            with exclusive_job_files_lock(
+                self.store.jobs_root_mac,
+                job.normalized_movie_number,
+                blocking=True,
+            ) as files_lock:
+                try:
+                    marker = self._find_historical_quality_quarantine_locked(
+                        files_lock,
+                        repair,
+                        paths,
+                        stages={"translation", "publication", "publisher"},
+                    )
+                except (OSError, RuntimeError) as marker_error:
+                    try:
+                        self._require_historical_preservation_locked(
+                            files_lock, repair, paths
+                        )
+                    except (OSError, RuntimeError):
+                        reason_code = "preservation_hash_changed"
+                        outcome = self.store.complete_historical_marker_recovery(
+                            job.id,
+                            reason_code=reason_code,
+                            candidate_sha256=None,
+                            quality_failure_limit=self.quality_failure_limit,
+                        )
+                        marker = None
+                    else:
+                        raise marker_error
+                else:
+                    outcome = None
+                if marker is None:
+                    if outcome is None:
+                        return False
+                else:
+                    try:
+                        self._require_historical_preservation_locked(
+                            files_lock, repair, paths
+                        )
+                    except (OSError, RuntimeError):
+                        reason_code = "preservation_hash_changed"
+                        candidate_sha256 = marker.candidate_sha256
+                    else:
+                        reason_code = marker.reason_code
+                        candidate_sha256 = marker.candidate_sha256
+                    outcome = self.store.complete_historical_marker_recovery(
+                        job.id,
+                        reason_code=reason_code,
+                        candidate_sha256=candidate_sha256,
+                        quality_failure_limit=self.quality_failure_limit,
+                    )
+        except (OSError, RuntimeError):
+            self.store.pause_historical_lane("quarantine_failed")
+            self._record_idle(error="quarantine_failed")
+            return True
+        if outcome is None:
+            return True
+        self.historical_quality_failures = (
+            outcome.consecutive_quality_failures
+        )
+        _write_job_snapshot_safely(outcome.job)
+        _append_job_log_safely(
+            paths.job_dir_mac,
+            "mac-translation.log",
+            f"historical_marker_recovered {job.id} reason_code={reason_code}",
+        )
+        return True
+
     def process_one(self) -> bool:
+        if self._recover_historical_marker_before_generic_leases():
+            return True
         if self.consecutive_quality_failures >= self.quality_failure_limit:
             raise MacTranslationUnhealthyError(
                 "Mac translation worker stopped after "
@@ -595,9 +677,59 @@ class MacTranslationWorker:
                         files_lock.job_fd,
                         paths.english_srt_path_mac.name,
                     )
+                except Exception:
+                    outcome = (
+                        self.store.fail_historical_translation_quarantine(
+                            job.id,
+                            self.worker_id,
+                            lease_token=job.stage_lease_token,
+                            retry_seconds=self.publish_retry_seconds,
+                        )
+                    )
+                    _write_job_snapshot_safely(outcome.job)
+                    _append_job_log_safely(
+                        paths.job_dir_mac,
+                        "mac-translation.log",
+                        f"failed {job.id}: quarantine_failed",
+                    )
+                    return
+                try:
                     self._require_historical_preservation_locked(
                         files_lock, repair, paths
                     )
+                except (OSError, RuntimeError):
+                    try:
+                        self._historical_quarantine_locked(
+                            files_lock,
+                            paths.english_srt_path_mac.name,
+                            f"{paths.english_srt_path_mac.stem}."
+                            f"rejected-quality-{repair.id}-"
+                            f"{candidate_sha256[:12]}.srt",
+                            expected_sha256=candidate_sha256,
+                            quality_marker={
+                                "job_id": repair.job_id,
+                                "repair_id": repair.id,
+                                "stage": "translation",
+                                "reason_code": reason_code,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    outcome = self.store.fail_historical_translation_permanent(
+                        job.id,
+                        self.worker_id,
+                        lease_token=job.stage_lease_token,
+                        reason_code="preservation_hash_changed",
+                        english_sha256=candidate_sha256,
+                    )
+                    _write_job_snapshot_safely(outcome.job)
+                    _append_job_log_safely(
+                        paths.job_dir_mac,
+                        "mac-translation.log",
+                        f"failed {job.id}: preservation_hash_changed",
+                    )
+                    return
+                try:
                     self._historical_quarantine_locked(
                         files_lock,
                         paths.english_srt_path_mac.name,
@@ -1265,8 +1397,37 @@ class MacTranslationWorker:
                 exc, MacPublicationQualityError
             )
             preservation_failure = str(exc) == "preservation_hash_changed"
+            repair = None
+            paths = None
+            if historical:
+                repair = self.store.get_historical_repair(job.id)
+                if repair is None:
+                    raise RuntimeError("historical_repair_missing")
+                paths = build_job_paths(
+                    job.normalized_movie_number,
+                    self.store.jobs_root_mac,
+                    self.store.jobs_root_windows,
+                )
+                try:
+                    with exclusive_job_files_lock(
+                        self.store.jobs_root_mac,
+                        job.normalized_movie_number,
+                        blocking=True,
+                    ) as files_lock:
+                        self._require_historical_preservation_locked(
+                            files_lock, repair, paths
+                        )
+                except (OSError, RuntimeError):
+                    preservation_failure = True
             permanent = quality_failure or preservation_failure
-            safe_error = str(exc) if permanent else "publication_failed"
+            safe_error = (
+                "preservation_hash_changed"
+                if preservation_failure
+                else str(exc)
+                if permanent
+                else "publication_failed"
+            )
+            quality_reason = str(exc) if quality_failure else None
             if permanent and not historical:
                 self.consecutive_quality_failures += 1
             if publisher_quality_failure and not historical:
@@ -1278,14 +1439,7 @@ class MacTranslationWorker:
                 self._quarantine(paths.english_srt_path_mac, "quality")
             historical_quality_outcome = None
             if historical and quality_failure:
-                repair = self.store.get_historical_repair(job.id)
-                if repair is None:
-                    raise RuntimeError("historical_repair_missing")
-                paths = build_job_paths(
-                    job.normalized_movie_number,
-                    self.store.jobs_root_mac,
-                    self.store.jobs_root_windows,
-                )
+                assert repair is not None and paths is not None
                 quarantine_stage = (
                     "publisher" if publisher_quality_failure else "publication"
                 )
@@ -1311,7 +1465,7 @@ class MacTranslationWorker:
                                 "job_id": repair.job_id,
                                 "repair_id": repair.id,
                                 "stage": quarantine_stage,
-                                "reason_code": safe_error,
+                                "reason_code": quality_reason,
                             },
                         )
                         quarantine_completed = True
@@ -1325,7 +1479,9 @@ class MacTranslationWorker:
                                 retry_seconds=self.publish_retry_seconds,
                                 permanent=True,
                                 quality_failure_limit=(
-                                    self.quality_failure_limit
+                                    None
+                                    if preservation_failure
+                                    else self.quality_failure_limit
                                 ),
                             )
                         )
@@ -1343,6 +1499,24 @@ class MacTranslationWorker:
                             True
                         )
                         raise
+                    if preservation_failure:
+                        outcome = self.store.fail_historical_publication(
+                            job.id,
+                            self.worker_id,
+                            "preservation_hash_changed",
+                            lease_token=job.stage_lease_token,
+                            max_publish_attempts=self.max_publish_attempts,
+                            retry_seconds=self.publish_retry_seconds,
+                            permanent=True,
+                        )
+                        _write_job_snapshot_safely(outcome.job)
+                        _append_job_log_safely(
+                            Path(job.job_dir_mac),
+                            "mac-translation.log",
+                            f"publication_failed {job.id} "
+                            "preservation_hash_changed",
+                        )
+                        return True
                     try:
                         outcome = (
                             self.store.fail_historical_publication_quarantine(
@@ -1386,7 +1560,7 @@ class MacTranslationWorker:
                         permanent=permanent,
                         quality_failure_limit=(
                             self.quality_failure_limit
-                            if quality_failure
+                            if quality_failure and not preservation_failure
                             else None
                         ),
                     )
@@ -1517,6 +1691,51 @@ class MacTranslationWorker:
                     exc.reason_code if isinstance(exc, CatalogSyncError) else "catalog_sync_failed"
                 )
                 error = f"catalog_sync: {reason_code}"
+                if historical:
+                    repair = self.store.get_historical_repair(job.id)
+                    paths = build_job_paths(
+                        job.normalized_movie_number,
+                        self.store.jobs_root_mac,
+                        self.store.jobs_root_windows,
+                    )
+                    try:
+                        if repair is None:
+                            raise RuntimeError("historical_repair_missing")
+                        with exclusive_job_files_lock(
+                            self.store.jobs_root_mac,
+                            job.normalized_movie_number,
+                            blocking=True,
+                        ) as files_lock:
+                            self._require_historical_preservation_locked(
+                                files_lock, repair, paths
+                            )
+                    except (OSError, RuntimeError):
+                        error = "catalog_sync: preservation_hash_changed"
+                        try:
+                            updated = (
+                                self.store.fail_historical_catalog_after_side_effect(
+                                    job.id,
+                                    self.worker_id,
+                                    lease_token=job.catalog_lease_token,
+                                    reason_code="preservation_hash_changed",
+                                )
+                            )
+                        except CatalogLeaseLostError:
+                            error = "catalog_sync: catalog_lease_lost"
+                            _append_job_log_safely(
+                                Path(job.job_dir_mac),
+                                "mac-translation.log",
+                                f"catalog_lease_lost {job.id}",
+                            )
+                            return True
+                        _write_job_snapshot_safely(updated)
+                        _append_job_log_safely(
+                            Path(job.job_dir_mac),
+                            "mac-translation.log",
+                            f"historical_failed {job.id} "
+                            "reason_code=preservation_hash_changed",
+                        )
+                        return True
                 try:
                     if historical:
                         outcome = self.store.fail_historical_catalog_sync(

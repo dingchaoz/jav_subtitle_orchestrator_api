@@ -677,11 +677,13 @@ def test_historical_local_quality_crash_after_quarantine_resumes_without_retrans
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-107")
+    store.record_historical_quality_failure(3)
+    store.record_historical_quality_failure(3)
     events = []
     worker = MacTranslationWorker(
         store,
         RecordingTranslator(events),
-        max_translation_attempts=3,
+        max_translation_attempts=1,
         worker_id="mac-crash-1",
         lease_seconds=60,
         publisher=RecordingPublisher(events),
@@ -709,6 +711,17 @@ def test_historical_local_quality_crash_after_quarantine_resumes_without_retrans
     assert list(
         (paths.job_dir_mac / "rejected").glob(".quality-rejected-*.json")
     )
+    active_observer = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=1,
+        worker_id="mac-crash-observer",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert active_observer.process_one() is False
+    assert store.get_job(job.id).claimed_by == "mac-crash-1"
     monkeypatch.setattr(
         store,
         "fail_historical_translation_permanent",
@@ -722,7 +735,7 @@ def test_historical_local_quality_crash_after_quarantine_resumes_without_retrans
     recovering = MacTranslationWorker(
         store,
         RecordingTranslator(recovery_events),
-        max_translation_attempts=3,
+        max_translation_attempts=1,
         worker_id="mac-crash-2",
         lease_seconds=60,
         publisher=RecordingPublisher(recovery_events),
@@ -738,6 +751,14 @@ def test_historical_local_quality_crash_after_quarantine_resumes_without_retrans
     )
     assert recovery_events == []
     assert not paths.english_srt_path_mac.exists()
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert repair.reason_code.startswith("quality_gate_failed:")
+    assert lane.consecutive_quality_failures == 3
+    assert lane.paused is True
+    assert lane.reason_code == "quality_failure_limit"
+    assert recovering.process_one() is False
+    assert store.historical_lane_state().consecutive_quality_failures == 3
 
 
 def test_historical_local_quality_crash_before_quarantine_keeps_canonical_nonterminal(
@@ -793,6 +814,7 @@ def test_historical_publisher_quality_crash_resumes_without_reupload(
         store,
         DiverseMacTranslator(),
         max_translation_attempts=3,
+        max_publish_attempts=1,
         worker_id="mac-publish-crash-1",
         lease_seconds=60,
         publisher=RecordingPublisher(
@@ -835,6 +857,7 @@ def test_historical_publisher_quality_crash_resumes_without_reupload(
         store,
         DiverseMacTranslator(),
         max_translation_attempts=3,
+        max_publish_attempts=1,
         worker_id="mac-publish-crash-2",
         lease_seconds=60,
         publish_retry_seconds=0,
@@ -852,6 +875,14 @@ def test_historical_publisher_quality_crash_resumes_without_reupload(
         is HistoricalRepairState.PERMANENT_FAILED
     )
     assert recovery_events == []
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert repair.reason_code == (
+        "quality_gate_failed:subtitle_changed_after_validation"
+    )
+    assert lane.consecutive_quality_failures == 1
+    assert recovering.process_one() is False
+    assert store.historical_lane_state().consecutive_quality_failures == 1
 
 
 def test_historical_publisher_quarantine_symlink_failure_pauses_without_terminal(
@@ -938,6 +969,50 @@ def test_historical_local_quarantine_io_failure_pauses_without_terminal(
     assert paths.english_srt_path_mac.exists()
 
 
+@pytest.mark.parametrize("changed_file", ["audio", "japanese"])
+def test_historical_bad_quality_with_preservation_change_is_preservation_permanent(
+    sqlite_path, mac_jobs_root, changed_file
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-118")
+    target = (
+        paths.audio_path_mac
+        if changed_file == "audio"
+        else paths.japanese_srt_path_mac
+    )
+
+    class TamperingCollapsedTranslator(CollapsedMacTranslator):
+        def translate_to_english(self, input_srt, output_srt):
+            super().translate_to_english(input_srt, output_srt)
+            with target.open("ab") as handle:
+                handle.write(b"tampered")
+
+    publish_events = []
+    worker = MacTranslationWorker(
+        store,
+        TamperingCollapsedTranslator(),
+        max_translation_attempts=3,
+        worker_id=f"mac-preservation-{changed_file}",
+        lease_seconds=60,
+        publisher=RecordingPublisher(publish_events),
+        catalog_sync_client=RecordingCatalogSync(publish_events),
+    )
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert current.status is JobStatus.FAILED
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "preservation_hash_changed"
+    assert lane.paused is True
+    assert lane.reason_code == "preservation_hash_changed"
+    assert lane.consecutive_quality_failures == 0
+    assert publish_events == []
+
+
 def test_historical_publication_local_gate_quarantines_before_permanent(
     sqlite_path, mac_jobs_root
 ):
@@ -971,6 +1046,90 @@ def test_historical_publication_local_gate_quarantines_before_permanent(
         (paths.job_dir_mac / "rejected").glob(".quality-rejected-*.json")
     )
     assert events == []
+
+
+def test_historical_publication_preservation_change_blocks_publisher_and_pauses(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-119")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-publication-preservation",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(events),
+    )
+    assert worker.process_one() is True
+    paths.audio_path_mac.write_bytes(b"changed before publication")
+
+    assert worker.process_one() is True
+
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert store.get_job(job.id).status is JobStatus.FAILED
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "preservation_hash_changed"
+    assert lane.paused is True
+    assert lane.reason_code == "preservation_hash_changed"
+    assert lane.consecutive_quality_failures == 0
+    assert events == []
+
+
+def test_historical_catalog_failure_checks_preservation_before_retry(
+    sqlite_path, mac_jobs_root
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-120")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-catalog-preservation",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=[CatalogSyncError("catalog_sync_failed")],
+        ),
+    )
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    published = store.get_job(job.id)
+    receipt = (
+        published.published_subtitle_id,
+        published.published_storage_path,
+        published.published_content_sha256,
+        published.published_file_size,
+    )
+    paths.audio_path_mac.write_bytes(b"changed before catalog failure")
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    repair = store.get_historical_repair(job.id)
+    lane = store.historical_lane_state()
+    assert current.status is JobStatus.FAILED
+    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.reason_code == "preservation_hash_changed"
+    assert lane.paused is True
+    assert lane.reason_code == "preservation_hash_changed"
+    assert lane.consecutive_quality_failures == 0
+    assert (
+        current.published_subtitle_id,
+        current.published_storage_path,
+        current.published_content_sha256,
+        current.published_file_size,
+    ) == receipt
+    assert [event[0] for event in events] == ["publish", "catalog"]
 
 
 def test_three_historical_quality_failures_pause_history_but_normal_still_runs(
