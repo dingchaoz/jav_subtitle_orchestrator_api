@@ -31,6 +31,8 @@ class SupabasePublishResult:
     content_sha256: str
     file_size: int
     verified: bool
+    metadata_status: str
+    metadata_source: str
 
 
 class SupabaseSubtitlePublisher:
@@ -47,6 +49,7 @@ class SupabaseSubtitlePublisher:
         clock=time.monotonic,
         sleeper=time.sleep,
         nonce_factory=None,
+        catalog_ensurer=None,
     ) -> None:
         if verification_timeout_seconds <= 0:
             raise ValueError("verification timeout must be positive")
@@ -62,6 +65,16 @@ class SupabaseSubtitlePublisher:
         self.clock = clock
         self.sleeper = sleeper
         self.nonce_factory = nonce_factory or (lambda: uuid4().hex)
+        if catalog_ensurer is None:
+            from orchestrator.movie_catalog import SupabaseMovieCatalogEnsurer
+
+            catalog_ensurer = SupabaseMovieCatalogEnsurer(
+                self.supabase_url,
+                self.service_role_key,
+                timeout_seconds=self.timeout_seconds,
+                session=self.session,
+            )
+        self.catalog_ensurer = catalog_ensurer
 
     @property
     def headers(self) -> dict[str, str]:
@@ -71,7 +84,10 @@ class SupabaseSubtitlePublisher:
         }
 
     def publish_english_ai(
-        self, movie_code: str, english_srt_path: Path
+        self,
+        movie_code: str,
+        english_srt_path: Path,
+        metadata_path: Path | None = None,
     ) -> SupabasePublishResult:
         canonical = canonical_movie_code(movie_code)
         japanese_srt_path = english_srt_path.with_name(
@@ -83,31 +99,36 @@ class SupabaseSubtitlePublisher:
                 "quality_gate_failed:" + ",".join(report.reason_codes)
             )
 
+        catalog = self.catalog_ensurer.ensure_movie(
+            canonical,
+            metadata_path or english_srt_path.with_name("metadata.json"),
+        )
         subtitle_bytes = english_srt_path.read_bytes()
         content_sha256 = hashlib.sha256(subtitle_bytes).hexdigest()
         storage_path = build_ai_subtitle_storage_path(canonical)
         self._upload_storage_object(storage_path, subtitle_bytes)
-        movie_uuid = self._find_movie(canonical)
         subtitle_id = self._upsert_language_row(
-            movie_uuid,
+            catalog.movie_uuid,
             storage_path,
             len(subtitle_bytes),
         )
         self._verify_storage(storage_path, subtitle_bytes, content_sha256)
         self._verify_catalog(
             subtitle_id,
-            movie_uuid,
+            catalog.movie_uuid,
             storage_path,
             len(subtitle_bytes),
         )
         return SupabasePublishResult(
             movie_code=canonical,
             storage_path=storage_path,
-            movie_uuid=movie_uuid,
+            movie_uuid=catalog.movie_uuid,
             subtitle_id=subtitle_id,
             content_sha256=content_sha256,
             file_size=len(subtitle_bytes),
             verified=True,
+            metadata_status=catalog.metadata_status,
+            metadata_source=catalog.metadata_source,
         )
 
     def _request_raw(self, method: str, path: str, **kwargs: Any) -> Any:
@@ -148,20 +169,6 @@ class SupabaseSubtitlePublisher:
             },
             data=subtitle_bytes,
         )
-
-    def _find_movie(self, canonical: str) -> str:
-        rows = self._request_json(
-            "GET",
-            "/rest/v1/movies",
-            params={
-                "select": "id",
-                "standard_movie_id": f"eq.{canonical}",
-                "limit": "1",
-            },
-        )
-        if not rows:
-            raise RuntimeError(f"Supabase movie not found: {canonical}")
-        return rows[0]["id"]
 
     def _upsert_language_row(
         self, movie_uuid: str, storage_path: str, file_size: int
