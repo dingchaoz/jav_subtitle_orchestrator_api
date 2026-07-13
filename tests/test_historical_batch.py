@@ -691,6 +691,9 @@ def test_idempotent_replay_ignores_current_job_allowlist_and_files(
             "WHERE batch_id = ?",
             (HistoricalRepairState.RUNNING.value, plan.batch_id),
         )
+        conn.execute(
+            "DELETE FROM historical_repair_control WHERE singleton = 1"
+        )
     before = sqlite_path.read_bytes()
 
     replayed = enqueue_historical_batch(
@@ -2648,6 +2651,158 @@ def test_controller_rechecks_normal_backlog_atomically_before_enqueue(
         assert conn.execute(
             "SELECT COUNT(*) FROM historical_translation_repairs"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason", "hard_pause"),
+    [
+        ("delete_singleton", "historical_controller_state_unavailable", True),
+        ("pause_lane", "operator_pause", True),
+        ("normal_arrival", "normal_backlog", False),
+    ],
+)
+def test_controller_exact_existing_replay_cannot_bypass_final_guards(
+    sqlite_path,
+    mac_jobs_root,
+    tmp_path,
+    mutation,
+    expected_reason,
+    hard_pause,
+):
+    from orchestrator.historical_batch import (
+        HistoricalRepairController,
+        enqueue_historical_controller_batch,
+        load_historical_allowlist_identity,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    identity = load_historical_allowlist_identity(allowlist)
+    before_replay = None
+
+    def first_controller_inserts_then_state_changes():
+        nonlocal before_replay
+        records, created = enqueue_historical_controller_batch(
+            store,
+            plan,
+            allowlist,
+            identity,
+        )
+        assert created is True
+        assert len(records) == 1
+        if mutation == "delete_singleton":
+            with store.connection() as conn:
+                conn.execute(
+                    "DELETE FROM historical_repair_control WHERE singleton = 1"
+                )
+        elif mutation == "pause_lane":
+            store.pause_historical_lane("operator_pause")
+        else:
+            _add_normal_stage(
+                store,
+                "new-001",
+                JobStatus.TRANSCRIPTION_DONE,
+                claimed=False,
+            )
+        before_replay = sqlite_path.read_bytes()
+
+    result = HistoricalRepairController(
+        store,
+        allowlist,
+        before_enqueue=first_controller_inserts_then_state_changes,
+    ).run_once()
+
+    assert result.reason_code == expected_reason
+    assert result.hard_pause is hard_pause
+    assert result.enqueued == 0
+    assert before_replay is not None
+    assert sqlite_path.read_bytes() == before_replay
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_exception", "expected_message"),
+    [
+        (
+            "delete_singleton",
+            "state_unavailable",
+            "historical_controller_state_missing",
+        ),
+        ("pause_lane", "value", "historical_controller_paused:operator_pause"),
+        ("normal_arrival", "value", "normal_backlog"),
+    ],
+)
+def test_controller_final_enqueue_exact_existing_validates_control_first(
+    sqlite_path,
+    mac_jobs_root,
+    tmp_path,
+    mutation,
+    expected_exception,
+    expected_message,
+):
+    from orchestrator.historical_batch import (
+        HistoricalControllerStateUnavailable,
+        enqueue_historical_controller_batch,
+        load_historical_allowlist_identity,
+        plan_historical_batch,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    _job(store, mac_jobs_root, "abc-001")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\n")
+    plan = plan_historical_batch(store, allowlist, limit=1)
+    identity = load_historical_allowlist_identity(allowlist)
+    records, created = enqueue_historical_controller_batch(
+        store,
+        plan,
+        allowlist,
+        identity,
+    )
+    assert created is True
+    assert len(records) == 1
+
+    if mutation == "delete_singleton":
+        with store.connection() as conn:
+            conn.execute(
+                "DELETE FROM historical_repair_control WHERE singleton = 1"
+            )
+    elif mutation == "pause_lane":
+        store.pause_historical_lane("operator_pause")
+    else:
+        _add_normal_stage(
+            store,
+            "new-001",
+            JobStatus.TRANSCRIPTION_DONE,
+            claimed=False,
+        )
+    before_replay = sqlite_path.read_bytes()
+
+    exception_type = (
+        HistoricalControllerStateUnavailable
+        if expected_exception == "state_unavailable"
+        else ValueError
+    )
+    with pytest.raises(exception_type, match=expected_message):
+        enqueue_historical_controller_batch(
+            store,
+            plan,
+            allowlist,
+            identity,
+        )
+
+    assert sqlite_path.read_bytes() == before_replay
+    with store.connection() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM historical_translation_repairs"
+        ).fetchone()[0] == 1
 
 
 def test_controller_rejects_plan_digest_change_before_enqueue_without_records(

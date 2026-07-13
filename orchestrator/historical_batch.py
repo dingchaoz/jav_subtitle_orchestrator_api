@@ -1782,13 +1782,10 @@ def _enqueue_historical_repairs_transaction(
             confirm_plan_sha256=confirm_plan_sha256,
         )
         jobs, repairs = _read_database_snapshot(conn)
-        existing_records = _exact_existing_records_from_rows(repairs, plan)
-        if existing_records is not None:
-            return (
-                (existing_records, False)
-                if controller_identity is not None
-                else existing_records
-            )
+        if controller_identity is None:
+            existing_records = _exact_existing_records_from_rows(repairs, plan)
+            if existing_records is not None:
+                return existing_records
         derived_identity = (
             hashlib.sha256(allowlist.absolute_path.encode("utf-8")).hexdigest(),
             allowlist.sha256,
@@ -1818,6 +1815,8 @@ def _enqueue_historical_repairs_transaction(
             if control["paused"]:
                 reason = control["reason_code"] or "historical_lane_paused"
                 raise ValueError(f"historical_controller_paused:{reason}")
+            if normal_translation_backlog_exists(conn):
+                raise ValueError("normal_backlog")
             if any(
                 row["state"]
                 not in {
@@ -1827,8 +1826,9 @@ def _enqueue_historical_repairs_transaction(
                 for row in repairs
             ):
                 raise ValueError("waiting_previous_batch")
-            if normal_translation_backlog_exists(conn):
-                raise ValueError("normal_backlog")
+            existing_records = _exact_existing_records_from_rows(repairs, plan)
+            if existing_records is not None:
+                return existing_records, False
         recalculated = _build_plan_from_snapshots(
             filesystem,
             jobs,
