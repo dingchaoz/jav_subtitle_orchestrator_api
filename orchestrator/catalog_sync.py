@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -17,12 +17,19 @@ _SAFE_REASON_CODES = {
     "catalog_sync_failed",
     "catalog_response_invalid",
     "catalog_response_mismatch",
+    "public_visibility_fetch_failed",
+    "public_visibility_redirect_rejected",
+    "public_visibility_not_found",
+    "public_visibility_response_invalid",
+    "public_visibility_mismatch",
 }
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class CatalogSyncSession(Protocol):
     def post(self, url: str, **kwargs: Any) -> Any: ...
+
+    def get(self, url: str, **kwargs: Any) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -51,7 +58,7 @@ class CatalogSyncClient:
         timeout_seconds: int | float = 30,
         session: CatalogSyncSession | None = None,
     ) -> None:
-        self.endpoint = self._endpoint(base_url)
+        self.base_url, self.endpoint = self._endpoints(base_url)
         if not isinstance(admin_token, str) or not admin_token.strip():
             raise ValueError("catalog admin token is required")
         if (
@@ -64,7 +71,14 @@ class CatalogSyncClient:
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
 
-    def sync(self, movie_code: str) -> CatalogSyncResult:
+    def sync(
+        self,
+        movie_code: str,
+        *,
+        expected_subtitle_id: str,
+        expected_storage_path: str,
+        expected_content_sha256: str,
+    ) -> CatalogSyncResult:
         invalid_movie_code = False
         try:
             canonical = canonical_movie_code(movie_code)
@@ -73,6 +87,16 @@ class CatalogSyncClient:
             canonical = ""
         if invalid_movie_code:
             raise ValueError("invalid movie code")
+        if (
+            not isinstance(expected_subtitle_id, str)
+            or not expected_subtitle_id
+            or not isinstance(expected_storage_path, str)
+            or not expected_storage_path
+            or not isinstance(expected_content_sha256, str)
+            or len(expected_content_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in expected_content_sha256)
+        ):
+            raise ValueError("verified publication receipt is invalid")
 
         request_failed = False
         try:
@@ -155,6 +179,13 @@ class CatalogSyncClient:
         ):
             raise CatalogSyncError("catalog_response_mismatch")
 
+        self._verify_public_visibility(
+            canonical,
+            expected_subtitle_id=expected_subtitle_id,
+            expected_storage_path=expected_storage_path,
+            expected_content_sha256=expected_content_sha256,
+        )
+
         return CatalogSyncResult(
             canonical_code=canonical,
             d1_rows_updated=d1_rows_updated,
@@ -163,7 +194,7 @@ class CatalogSyncClient:
         )
 
     @staticmethod
-    def _endpoint(base_url: str) -> str:
+    def _endpoints(base_url: str) -> tuple[str, str]:
         if not isinstance(base_url, str) or not base_url or base_url != base_url.strip():
             raise ValueError("catalog API base URL is invalid")
         parse_failed = False
@@ -193,7 +224,54 @@ class CatalogSyncClient:
             or parsed.fragment
         ):
             raise ValueError("catalog API base URL is invalid")
-        return f"{parsed.scheme}://{parsed.netloc}{_SYNC_PATH}"
+        root = f"{parsed.scheme}://{parsed.netloc}"
+        return root, f"{root}{_SYNC_PATH}"
+
+    def _verify_public_visibility(
+        self,
+        canonical: str,
+        *,
+        expected_subtitle_id: str,
+        expected_storage_path: str,
+        expected_content_sha256: str,
+    ) -> None:
+        try:
+            response = self.session.get(
+                f"{self.base_url}/api/movie/{quote(canonical, safe='')}",
+                timeout=self.timeout_seconds,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            raise CatalogSyncError("public_visibility_fetch_failed") from None
+        if 300 <= response.status_code < 400:
+            raise CatalogSyncError("public_visibility_redirect_rejected")
+        if response.status_code == 404:
+            raise CatalogSyncError("public_visibility_not_found")
+        if response.status_code != 200:
+            raise CatalogSyncError("public_visibility_fetch_failed")
+        try:
+            body = response.json()
+        except (TypeError, ValueError):
+            raise CatalogSyncError("public_visibility_response_invalid") from None
+        if not isinstance(body, dict) or not isinstance(body.get("subtitles"), list):
+            raise CatalogSyncError("public_visibility_response_invalid")
+        if body.get("canonicalCode") != canonical:
+            raise CatalogSyncError("public_visibility_mismatch")
+        matching = [
+            row
+            for row in body["subtitles"]
+            if isinstance(row, dict) and row.get("id") == expected_subtitle_id
+        ]
+        if len(matching) != 1:
+            raise CatalogSyncError("public_visibility_mismatch")
+        row = matching[0]
+        public_hash = row.get("srtHash")
+        if (
+            row.get("storagePath") != expected_storage_path
+            or public_hash is not None
+            and public_hash != expected_content_sha256
+        ):
+            raise CatalogSyncError("public_visibility_mismatch")
 
     @staticmethod
     def _exact_int(value: object, expected: int) -> bool:

@@ -33,6 +33,11 @@ _CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
         "catalog_sync_failed",
         "catalog_response_invalid",
         "catalog_response_mismatch",
+        "public_visibility_fetch_failed",
+        "public_visibility_redirect_rejected",
+        "public_visibility_not_found",
+        "public_visibility_response_invalid",
+        "public_visibility_mismatch",
     }
 )
 
@@ -279,6 +284,7 @@ class HistoricalRepairRecord:
 class HistoricalLaneState:
     paused: bool
     reason_code: str | None
+    consecutive_quality_failures: int
     updated_at: str
 
 
@@ -659,10 +665,20 @@ class JobStore:
                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                   paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
                   reason_code TEXT,
+                  consecutive_quality_failures INTEGER NOT NULL DEFAULT 0,
                   updated_at TEXT NOT NULL
                 )
                 """
             )
+            control_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(historical_repair_control)").fetchall()
+            }
+            if "consecutive_quality_failures" not in control_columns:
+                conn.execute(
+                    "ALTER TABLE historical_repair_control ADD COLUMN "
+                    "consecutive_quality_failures INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO historical_repair_control (
@@ -1401,38 +1417,26 @@ class JobStore:
         self,
         repair: HistoricalRepairRecord,
     ) -> None:
-        from orchestrator.job_files_lock import exclusive_job_files_lock
-
         paths = build_job_paths(
             repair.movie_code,
             self.jobs_root_mac,
             self.jobs_root_windows,
         )
-        with exclusive_job_files_lock(
-            self.jobs_root_mac,
-            repair.movie_code,
-            blocking=True,
-        ):
-            if (
-                self._sha256_regular_file(paths.japanese_srt_path_mac)
-                != repair.japanese_sha256
-            ):
-                raise RuntimeError("preservation_hash_changed")
-            if (
-                self._sha256_regular_file(paths.audio_path_mac)
-                != repair.audio_sha256
-            ):
-                raise RuntimeError("preservation_hash_changed")
-            quarantine_path = self.historical_source_quarantine_path(repair)
-            old_path = paths.english_srt_path_mac
-            source_path = (
-                quarantine_path if quarantine_path.exists() else old_path
-            )
-            if (
-                self._sha256_regular_file(source_path)
-                != repair.source_english_sha256
-            ):
-                raise RuntimeError("historical_source_english_changed")
+        if self._sha256_regular_file(paths.japanese_srt_path_mac) != repair.japanese_sha256:
+            raise RuntimeError("preservation_hash_changed")
+        if self._sha256_regular_file(paths.audio_path_mac) != repair.audio_sha256:
+            raise RuntimeError("preservation_hash_changed")
+        quarantine_path = self.historical_source_quarantine_path(repair)
+        old_path = paths.english_srt_path_mac
+        for source_path in (old_path, quarantine_path):
+            try:
+                source_hash = self._sha256_regular_file(source_path)
+            except OSError:
+                continue
+            if source_hash == repair.source_english_sha256:
+                break
+        else:
+            raise RuntimeError("historical_source_english_changed")
 
     def validate_historical_preservation(
         self,
@@ -1517,16 +1521,42 @@ class JobStore:
         with self.connection() as conn:
             return self._has_claimable_normal_work_conn(conn, now)
 
+    def has_due_historical_repair(self) -> bool:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM historical_translation_repairs
+                WHERE state IN (?, ?)
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                LIMIT 1
+                """,
+                (
+                    HistoricalRepairState.PENDING.value,
+                    HistoricalRepairState.RETRY_WAIT.value,
+                    now,
+                ),
+            ).fetchone()
+            return row is not None
+
     def claim_next_historical_repair(
         self,
         worker_id: str,
         lease_seconds: int,
     ) -> JobRecord | None:
+        from orchestrator.job_files_lock import exclusive_job_files_lock
+
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
         lease = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
         lease_token = uuid4().hex
         with self.connection() as read_conn:
+            running = read_conn.execute(
+                "SELECT 1 FROM historical_translation_repairs WHERE state = ? LIMIT 1",
+                (HistoricalRepairState.RUNNING.value,),
+            ).fetchone()
+            if running is not None:
+                return None
             row = read_conn.execute(
                 """
                 SELECT * FROM historical_translation_repairs
@@ -1540,39 +1570,74 @@ class JobStore:
                     now,
                 ),
             ).fetchone()
+            job_snapshot = self.get_job(row["job_id"], conn=read_conn) if row is not None else None
         if row is None:
             return None
         repair = self._row_to_historical_repair(row)
-        try:
-            self._validate_historical_source_files(repair)
-        except (OSError, RuntimeError):
-            rejected = False
+        if job_snapshot is None:
+            return None
+        with exclusive_job_files_lock(
+            self.jobs_root_mac,
+            repair.movie_code,
+            blocking=True,
+        ) as files_lock:
+            files_lock.require_bound()
+            validation_failed = False
+            try:
+                self._validate_historical_source_files(repair)
+            except (OSError, RuntimeError):
+                validation_failed = True
+            files_lock.require_bound()
             with self.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                cursor = conn.execute(
+                control = conn.execute(
+                    "SELECT paused FROM historical_repair_control WHERE singleton = 1"
+                ).fetchone()
+                if control is None or control["paused"]:
+                    return None
+                running = conn.execute(
+                    "SELECT 1 FROM historical_translation_repairs WHERE state = ? LIMIT 1",
+                    (HistoricalRepairState.RUNNING.value,),
+                ).fetchone()
+                if running is not None:
+                    return None
+                if self._has_claimable_normal_work_conn(conn, now):
+                    return None
+                current = conn.execute(
                     """
-                    UPDATE historical_translation_repairs
-                    SET state = ?, next_attempt_at = NULL, reason_code = ?,
-                        updated_at = ?
-                    WHERE id = ? AND state IN (?, ?)
+                    SELECT * FROM historical_translation_repairs
+                    WHERE state IN (?, ?)
+                      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                    ORDER BY created_at ASC, id ASC LIMIT 1
                     """,
                     (
-                        HistoricalRepairState.PERMANENT_FAILED.value,
-                        "preservation_hash_changed",
-                        now,
-                        repair.id,
                         HistoricalRepairState.PENDING.value,
                         HistoricalRepairState.RETRY_WAIT.value,
+                        now,
                     ),
-                )
-                if cursor.rowcount == 1:
-                    conn.execute(
+                ).fetchone()
+                current_job = self.get_job(repair.job_id, conn=conn)
+                if (
+                    current is None
+                    or self._row_to_historical_repair(current) != repair
+                    or current_job != job_snapshot
+                    or current_job.claimed_by is not None
+                    or current_job.status
+                    not in {
+                        JobStatus.QUEUED,
+                        JobStatus.FAILED,
+                        JobStatus.ENGLISH_SRT_READY,
+                    }
+                ):
+                    return None
+                if validation_failed:
+                    job_cursor = conn.execute(
                         """
                         UPDATE jobs SET status = ?, claimed_by = NULL,
                             lease_expires_at = NULL, stage_lease_token = NULL,
-                            translation_origin = ?,
-                            updated_at = ?, error = ?
-                        WHERE id = ? AND claimed_by IS NULL
+                            translation_origin = ?, updated_at = ?, error = ?
+                        WHERE id = ? AND claimed_by IS NULL AND status = ?
+                          AND translation_origin = ? AND updated_at = ?
                         """,
                         (
                             JobStatus.FAILED.value,
@@ -1580,66 +1645,52 @@ class JobStore:
                             now,
                             "historical_repair: preservation_hash_changed",
                             repair.job_id,
+                            job_snapshot.status.value,
+                            job_snapshot.translation_origin,
+                            job_snapshot.updated_at,
                         ),
                     )
+                    repair_cursor = conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                            updated_at = ?
+                        WHERE id = ? AND state = ? AND updated_at = ?
+                        """,
+                        (
+                            HistoricalRepairState.PERMANENT_FAILED.value,
+                            "preservation_hash_changed",
+                            now,
+                            repair.id,
+                            repair.state.value,
+                            repair.updated_at,
+                        ),
+                    )
+                    if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                        raise RuntimeError("historical_repair_state_changed")
+                    files_lock.require_bound()
                     rejected = True
-            if rejected:
-                raise HistoricalRepairActivationError(
-                    "preservation_hash_changed"
-                ) from None
-            return None
-        with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            control = conn.execute(
-                "SELECT paused FROM historical_repair_control WHERE singleton = 1"
-            ).fetchone()
-            if control is None or control["paused"]:
-                return None
-            if self._has_claimable_normal_work_conn(conn, now):
-                return None
-            current = conn.execute(
-                "SELECT * FROM historical_translation_repairs WHERE id = ?",
-                (repair.id,),
-            ).fetchone()
-            if current is None:
-                return None
-            current_repair = self._row_to_historical_repair(current)
-            if (
-                current_repair.state
-                not in {HistoricalRepairState.PENDING, HistoricalRepairState.RETRY_WAIT}
-                or (
-                    current_repair.next_attempt_at is not None
-                    and current_repair.next_attempt_at > now
-                )
-                or current_repair != repair
-            ):
-                return None
-            job = self.get_job(repair.job_id, conn=conn)
-            if job is None or job.claimed_by is not None or job.status not in {
-                JobStatus.QUEUED,
-                JobStatus.FAILED,
-                JobStatus.ENGLISH_SRT_READY,
-            }:
-                return None
-            cursor = conn.execute(
-                """
-                UPDATE historical_translation_repairs
-                SET state = ?, attempt_count = attempt_count + 1,
-                    next_attempt_at = NULL, reason_code = NULL, updated_at = ?
-                WHERE id = ? AND state IN (?, ?)
-                """,
-                (
-                    HistoricalRepairState.RUNNING.value,
-                    now,
-                    repair.id,
-                    HistoricalRepairState.PENDING.value,
-                    HistoricalRepairState.RETRY_WAIT.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            cursor = conn.execute(
-                """
+                else:
+                    repair_cursor = conn.execute(
+                        """
+                        UPDATE historical_translation_repairs
+                        SET state = ?, attempt_count = attempt_count + 1,
+                            next_attempt_at = NULL, reason_code = NULL,
+                            updated_at = ?
+                        WHERE id = ? AND state = ? AND updated_at = ?
+                        """,
+                        (
+                            HistoricalRepairState.RUNNING.value,
+                            now,
+                            repair.id,
+                            repair.state.value,
+                            repair.updated_at,
+                        ),
+                    )
+                    if repair_cursor.rowcount != 1:
+                        return None
+                    cursor = conn.execute(
+                        """
                 UPDATE jobs
                 SET status = ?, translation_origin = ?, claimed_by = ?,
                     lease_expires_at = ?, stage_lease_token = ?,
@@ -1653,25 +1704,30 @@ class JobStore:
                     metadata_status = NULL, metadata_source = NULL,
                     english_srt_path_mac = NULL,
                     english_srt_path_windows = NULL, updated_at = ?, error = NULL
-                WHERE id = ? AND claimed_by IS NULL
-                  AND status IN (?, ?, ?)
+                WHERE id = ? AND claimed_by IS NULL AND status = ?
+                  AND translation_origin = ? AND updated_at = ?
                 """,
-                (
-                    JobStatus.TRANSLATING.value,
-                    HISTORICAL_TRANSLATION_ORIGIN,
-                    worker_id,
-                    lease,
-                    lease_token,
-                    now,
-                    repair.job_id,
-                    JobStatus.QUEUED.value,
-                    JobStatus.FAILED.value,
-                    JobStatus.ENGLISH_SRT_READY.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("historical_repair_state_changed")
-            return self.get_job(repair.job_id, conn=conn)
+                        (
+                            JobStatus.TRANSLATING.value,
+                            HISTORICAL_TRANSLATION_ORIGIN,
+                            worker_id,
+                            lease,
+                            lease_token,
+                            now,
+                            repair.job_id,
+                            job_snapshot.status.value,
+                            job_snapshot.translation_origin,
+                            job_snapshot.updated_at,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("historical_repair_state_changed")
+                    files_lock.require_bound()
+                    claimed = self.get_job(repair.job_id, conn=conn)
+            files_lock.require_bound()
+        if validation_failed and rejected:
+            raise HistoricalRepairActivationError("preservation_hash_changed") from None
+        return claimed
 
     def historical_lane_state(self) -> HistoricalLaneState:
         with self.connection() as conn:
@@ -1682,8 +1738,44 @@ class JobStore:
             return HistoricalLaneState(
                 paused=bool(row["paused"]),
                 reason_code=row["reason_code"],
+                consecutive_quality_failures=row["consecutive_quality_failures"],
                 updated_at=row["updated_at"],
             )
+
+    def record_historical_quality_failure(self, limit: int) -> HistoricalLaneState:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("historical quality failure limit must be positive")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE historical_repair_control
+                SET consecutive_quality_failures =
+                      consecutive_quality_failures + 1,
+                    paused = CASE
+                      WHEN consecutive_quality_failures + 1 >= ? THEN 1
+                      ELSE paused END,
+                    reason_code = CASE
+                      WHEN consecutive_quality_failures + 1 >= ?
+                      THEN 'quality_failure_limit' ELSE reason_code END,
+                    updated_at = ?
+                WHERE singleton = 1
+                """,
+                (limit, limit, now),
+            )
+        return self.historical_lane_state()
+
+    def reset_historical_quality_failures(self) -> HistoricalLaneState:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE historical_repair_control "
+                "SET consecutive_quality_failures = 0, updated_at = ? "
+                "WHERE singleton = 1",
+                (now,),
+            )
+        return self.historical_lane_state()
 
     def pause_historical_lane(self, reason_code: str) -> HistoricalLaneState:
         if not reason_code or not reason_code.replace("_", "").isalnum():
@@ -1702,7 +1794,8 @@ class JobStore:
         with self.connection() as conn:
             conn.execute(
                 "UPDATE historical_repair_control SET paused = 0, "
-                "reason_code = NULL, updated_at = ? WHERE singleton = 1",
+                "reason_code = NULL, consecutive_quality_failures = 0, "
+                "updated_at = ? WHERE singleton = 1",
                 (now,),
             )
         return self.historical_lane_state()
@@ -2881,6 +2974,64 @@ class JobStore:
             completed = self.get_job(job_id, conn=conn)
             assert completed is not None
             return completed
+
+    def fail_historical_catalog_after_side_effect(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        lease_token: str,
+        reason_code: str,
+    ) -> JobRecord:
+        """Fail a repair while proving ownership of the catalog side effect."""
+        if reason_code != "preservation_hash_changed":
+            raise ValueError("historical catalog failure reason is invalid")
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE jobs SET status = ?, claimed_by = NULL,
+                    lease_expires_at = NULL, catalog_lease_token = NULL,
+                    updated_at = ?, error = ?
+                WHERE id = ? AND status = ? AND claimed_by = ?
+                  AND catalog_lease_token = ? AND lease_expires_at > ?
+                  AND translation_origin = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now,
+                    f"historical_repair: {reason_code}",
+                    job_id,
+                    JobStatus.CATALOG_SYNCING.value,
+                    worker_id,
+                    lease_token,
+                    now,
+                    HISTORICAL_TRANSLATION_ORIGIN,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CatalogLeaseLostError(f"job {job_id} catalog lease is no longer owned")
+            cursor = conn.execute(
+                """
+                UPDATE historical_translation_repairs
+                SET state = ?, next_attempt_at = NULL, reason_code = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND state = ?
+                """,
+                (
+                    HistoricalRepairState.PERMANENT_FAILED.value,
+                    reason_code,
+                    now,
+                    job_id,
+                    HistoricalRepairState.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CatalogLeaseLostError(f"job {job_id} historical repair is no longer running")
+            updated = self.get_job(job_id, conn=conn)
+            assert updated is not None
+            return updated
 
     def recover_expired_catalog_sync_leases(
         self,

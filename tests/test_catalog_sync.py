@@ -9,6 +9,9 @@ from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, Catal
 
 
 CANONICAL_CODE = "roe-291"
+SUBTITLE_ID = "00000000-0000-0000-0000-000000000002"
+STORAGE_PATH = "roe/roe-291/roe-291-English_AI.srt"
+CONTENT_SHA256 = "a" * 64
 TOKEN = "never-log-this-token"
 ADULT_TEXT = "sensitive-response-subtitle-text"
 CREDENTIAL_URL = f"https://user:{TOKEN}@javsubtitle.example/private"
@@ -31,6 +34,19 @@ def valid_body() -> dict[str, object]:
                     f"movie:light:{CANONICAL_CODE}",
                 ],
                 "dryRun": False,
+            }
+        ],
+    }
+
+
+def valid_public_body(*, srt_hash: str | None = CONTENT_SHA256) -> dict[str, object]:
+    return {
+        "canonicalCode": CANONICAL_CODE,
+        "subtitles": [
+            {
+                "id": SUBTITLE_ID,
+                "storagePath": STORAGE_PATH,
+                "srtHash": srt_hash,
             }
         ],
     }
@@ -61,10 +77,14 @@ class FakeSession:
         self,
         response: FakeResponse | None = None,
         *,
+        public_response: FakeResponse | None = None,
         error: requests.RequestException | None = None,
+        public_error: requests.RequestException | None = None,
     ) -> None:
         self.response = response or FakeResponse()
+        self.public_response = public_response or FakeResponse(body=valid_public_body())
         self.error = error
+        self.public_error = public_error
         self.requests: list[tuple[str, dict[str, object]]] = []
 
     def post(self, url: str, **kwargs: object) -> FakeResponse:
@@ -72,6 +92,21 @@ class FakeSession:
         if self.error is not None:
             raise self.error
         return self.response
+
+    def get(self, url: str, **kwargs: object) -> FakeResponse:
+        self.requests.append((url, kwargs))
+        if self.public_error is not None:
+            raise self.public_error
+        return self.public_response
+
+
+def sync(client: CatalogSyncClient, movie_code: str = CANONICAL_CODE):
+    return client.sync(
+        movie_code,
+        expected_subtitle_id=SUBTITLE_ID,
+        expected_storage_path=STORAGE_PATH,
+        expected_content_sha256=CONTENT_SHA256,
+    )
 
 
 def sync_with_response(
@@ -81,19 +116,23 @@ def sync_with_response(
     json_error: Exception | None = None,
     token: str = TOKEN,
 ) -> CatalogSyncResult:
-    return CatalogSyncClient(
+    client = CatalogSyncClient(
         "https://javsubtitle.example/",
         token,
         session=FakeSession(FakeResponse(status, body, json_error=json_error)),
-    ).sync(CANONICAL_CODE)
+    )
+    return sync(client)
 
 
 def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
     session = FakeSession()
 
-    result = CatalogSyncClient(
-        "https://javsubtitle.example/", TOKEN, timeout_seconds=17, session=session
-    ).sync("ROE291")
+    result = sync(
+        CatalogSyncClient(
+            "https://javsubtitle.example/", TOKEN, timeout_seconds=17, session=session
+        ),
+        "ROE291",
+    )
 
     assert result == CatalogSyncResult(
         canonical_code=CANONICAL_CODE,
@@ -129,7 +168,11 @@ def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
                 "timeout": 17,
                 "allow_redirects": False,
             },
-        )
+        ),
+        (
+            f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}",
+            {"timeout": 17, "allow_redirects": False},
+        ),
     ]
 
 
@@ -160,14 +203,10 @@ def test_http_failures_are_classified_without_leaking_secrets(status: int, reaso
 
 
 def test_request_exception_is_safe_catalog_fetch_failure():
-    session = FakeSession(
-        error=requests.ConnectionError(f"failed {CREDENTIAL_URL} {ADULT_TEXT}")
-    )
+    session = FakeSession(error=requests.ConnectionError(f"failed {CREDENTIAL_URL} {ADULT_TEXT}"))
 
     with pytest.raises(CatalogSyncError) as raised:
-        CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session).sync(
-            CANONICAL_CODE
-        )
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
 
     assert raised.value.reason_code == "catalog_fetch_failed"
     assert str(raised.value) == "catalog_fetch_failed"
@@ -316,7 +355,7 @@ def test_base_url_validation_fails_closed_without_leaking_input(base_url: str):
 def test_base_url_accepts_https_and_explicit_localhost_http(base_url: str):
     client = CatalogSyncClient(base_url, TOKEN, session=FakeSession())
 
-    assert client.sync(CANONICAL_CODE).canonical_code == CANONICAL_CODE
+    assert sync(client).canonical_code == CANONICAL_CODE
 
 
 @pytest.mark.parametrize("token", ["", "   ", None, 123])
@@ -338,8 +377,9 @@ def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():
     sensitive_movie_code = f"{TOKEN} {SECRET_NETLOC} {ADULT_TEXT}"
 
     with pytest.raises(ValueError) as raised:
-        CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session).sync(
-            sensitive_movie_code
+        sync(
+            CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session),
+            sensitive_movie_code,
         )
 
     assert str(raised.value) == "invalid movie code"
@@ -349,3 +389,91 @@ def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():
         assert sensitive not in str(raised.value)
         assert sensitive not in repr(raised.value)
     assert session.requests == []
+
+
+@pytest.mark.parametrize("srt_hash", [None, CONTENT_SHA256])
+def test_public_movie_verification_accepts_expected_subtitle_and_nullable_hash(srt_hash):
+    session = FakeSession(public_response=FakeResponse(body=valid_public_body(srt_hash=srt_hash)))
+
+    result = sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert result.canonical_code == CANONICAL_CODE
+    assert session.requests[-1] == (
+        f"https://javsubtitle.example/api/movie/{CANONICAL_CODE}",
+        {"timeout": 30, "allow_redirects": False},
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ({"canonicalCode": "abc-123", "subtitles": []}, "public_visibility_mismatch"),
+        ({"canonicalCode": CANONICAL_CODE, "subtitles": []}, "public_visibility_mismatch"),
+        (
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "subtitles": [
+                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": None},
+                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": None},
+                ],
+            },
+            "public_visibility_mismatch",
+        ),
+        (
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "subtitles": [
+                    {"id": SUBTITLE_ID, "storagePath": "wrong/path.srt", "srtHash": None}
+                ],
+            },
+            "public_visibility_mismatch",
+        ),
+        (
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "subtitles": [
+                    {"id": SUBTITLE_ID, "storagePath": STORAGE_PATH, "srtHash": "b" * 64}
+                ],
+            },
+            "public_visibility_mismatch",
+        ),
+        ([], "public_visibility_response_invalid"),
+    ],
+)
+def test_public_movie_verification_fails_closed_on_mismatch(body, reason):
+    session = FakeSession(public_response=FakeResponse(body=body))
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert raised.value.reason_code == reason
+    assert TOKEN not in repr(raised.value)
+    assert ADULT_TEXT not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        (302, "public_visibility_redirect_rejected"),
+        (404, "public_visibility_not_found"),
+        (500, "public_visibility_fetch_failed"),
+    ],
+)
+def test_public_movie_http_failure_has_structured_safe_reason(status, reason):
+    session = FakeSession(public_response=FakeResponse(status_code=status))
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert raised.value.reason_code == reason
+
+
+def test_public_movie_request_exception_does_not_leak_details():
+    session = FakeSession(public_error=requests.ConnectionError(f"failed {TOKEN} {ADULT_TEXT}"))
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert raised.value.reason_code == "public_visibility_fetch_failed"
+    assert TOKEN not in repr(raised.value)
+    assert ADULT_TEXT not in repr(raised.value)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import sys
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
 
@@ -140,9 +142,43 @@ def test_historical_claim_atomically_activates_exact_job(
     assert repair.attempt_count == 1
 
 
-def test_historical_lane_pause_is_durable_and_does_not_hide_normal_work(
-    sqlite_path, mac_jobs_root
+@pytest.mark.parametrize(
+    ("status", "retry_column"),
+    [
+        (JobStatus.PUBLISH_PENDING, "next_publish_attempt_at"),
+        (JobStatus.CATALOG_SYNC_PENDING, "next_catalog_sync_attempt_at"),
+        (JobStatus.FAILED, None),
+    ],
+)
+def test_running_historical_unit_blocks_activation_of_second_repair(
+    sqlite_path, mac_jobs_root, status, retry_column
 ):
+    store = _store(sqlite_path, mac_jobs_root)
+    first, _ = _repair_candidate(store, mac_jobs_root, "old-011")
+    second, _ = _repair_candidate(store, mac_jobs_root, "old-012")
+    future = (datetime.now(UTC) + timedelta(hours=1)).replace(microsecond=0).isoformat()
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = ? WHERE job_id = ?",
+            (HistoricalRepairState.RUNNING.value, first.id),
+        )
+        if retry_column is None:
+            conn.execute(
+                "UPDATE jobs SET status = ?, translation_origin = ? WHERE id = ?",
+                (status.value, HISTORICAL_TRANSLATION_ORIGIN, first.id),
+            )
+        else:
+            conn.execute(
+                f"UPDATE jobs SET status = ?, translation_origin = ?, "
+                f"{retry_column} = ? WHERE id = ?",
+                (status.value, HISTORICAL_TRANSLATION_ORIGIN, future, first.id),
+            )
+
+    assert store.claim_next_historical_repair("mac-1", 60) is None
+    assert store.get_historical_repair(second.id).state is HistoricalRepairState.PENDING
+
+
+def test_historical_lane_pause_is_durable_and_does_not_hide_normal_work(sqlite_path, mac_jobs_root):
     store = _store(sqlite_path, mac_jobs_root)
     normal = store.submit_job("new-001", priority=100, force=False).job
     assert normal is not None
@@ -161,6 +197,40 @@ def test_historical_lane_pause_is_durable_and_does_not_hide_normal_work(
     resumed = store.resume_historical_lane()
     assert resumed.paused is False
     assert resumed.reason_code is None
+
+
+def test_historical_quality_failure_counter_is_durable_atomic_and_resets(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+
+    first = store.record_historical_quality_failure(3)
+    restarted = _store(sqlite_path, mac_jobs_root)
+    second = restarted.record_historical_quality_failure(3)
+    third = restarted.record_historical_quality_failure(3)
+
+    assert first.consecutive_quality_failures == 1
+    assert second.consecutive_quality_failures == 2
+    assert third.consecutive_quality_failures == 3
+    assert third.paused is True
+    assert third.reason_code == "quality_failure_limit"
+    reset = restarted.reset_historical_quality_failures()
+    assert reset.consecutive_quality_failures == 0
+
+
+def test_initialize_migrates_legacy_historical_control_counter(
+    sqlite_path, mac_jobs_root
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    with store.connection() as conn:
+        conn.execute(
+            "ALTER TABLE historical_repair_control "
+            "DROP COLUMN consecutive_quality_failures"
+        )
+
+    restarted = _store(sqlite_path, mac_jobs_root)
+
+    assert restarted.historical_lane_state().consecutive_quality_failures == 0
 
 
 def test_expired_historical_translation_returns_only_to_repair_retry_queue(
@@ -297,3 +367,55 @@ def test_normal_arriving_after_historical_file_check_still_wins_transaction(
     assert store.get_job(historical.id).status is JobStatus.ENGLISH_SRT_READY
     claimed = store.claim_next_translation_job("mac-1", 60, origin="normal")
     assert claimed is not None and claimed.id == normal.id
+
+
+def test_historical_job_lock_is_still_held_inside_activation_transaction(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    _repair_candidate(store, mac_jobs_root, "old-205")
+    real_check = store._has_claimable_normal_work_conn
+    observed = []
+
+    def check_while_transaction_is_open(conn, now):
+        script = (
+            "import fcntl, os, sys; "
+            "fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); "
+            "\ntry: fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+            "except BlockingIOError: sys.exit(17)\n"
+            "else: sys.exit(0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(mac_jobs_root / "old-205")],
+            check=False,
+        )
+        observed.append(result.returncode)
+        return real_check(conn, now)
+
+    monkeypatch.setattr(store, "_has_claimable_normal_work_conn", check_while_transaction_is_open)
+
+    assert store.claim_next_historical_repair("mac-1", 60) is not None
+    assert observed == [17]
+
+
+def test_invalid_files_are_not_rejected_if_normal_work_arrives_before_transaction(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = _store(sqlite_path, mac_jobs_root)
+    historical, _ = _repair_candidate(store, mac_jobs_root, "old-206")
+    normal = store.submit_job("new-206", priority=100, force=False).job
+    assert normal is not None
+
+    def fail_after_normal_arrives(_repair):
+        with store.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ? WHERE id = ?",
+                (JobStatus.TRANSCRIPTION_DONE.value, normal.id),
+            )
+        raise RuntimeError("preservation_hash_changed")
+
+    monkeypatch.setattr(store, "_validate_historical_source_files", fail_after_normal_arrives)
+
+    assert store.claim_next_historical_repair("mac-1", 60) is None
+    assert store.get_job(historical.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_historical_repair(historical.id).state is HistoricalRepairState.PENDING

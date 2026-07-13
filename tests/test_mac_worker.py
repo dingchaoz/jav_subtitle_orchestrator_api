@@ -323,9 +323,11 @@ class RecordingCatalogSync:
     def __init__(self, events=None, *, errors=None):
         self.events = events if events is not None else []
         self.errors = iter(errors or [])
+        self.receipts = []
 
-    def sync(self, movie):
+    def sync(self, movie, **expected_receipt):
         self.events.append(("catalog", movie))
+        self.receipts.append(expected_receipt)
         error = next(self.errors, None)
         if error is not None:
             raise error
@@ -347,12 +349,10 @@ class ReclaimingCatalogSync:
         self.fail = fail
         self.reclaimed = None
 
-    def sync(self, movie):
+    def sync(self, movie, **_expected_receipt):
         from orchestrator.catalog_sync import CatalogSyncError
 
-        expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(
-            microsecond=0
-        ).isoformat()
+        expired = (datetime.now(UTC) - timedelta(minutes=5)).replace(microsecond=0).isoformat()
         self.store.force_lease_expiry_for_test(self.job_id, expired)
         assert self.store.recover_expired_catalog_sync_leases(3, 0) == 1
         self.reclaimed = self.store.claim_catalog_sync_job(
@@ -528,9 +528,30 @@ def test_historical_job_runs_when_normal_lane_is_empty_and_quarantines_old_engli
     assert [event[0] for event in events] == ["translate"]
 
 
-def test_good_historical_repair_uploads_catalogs_and_marks_success(
-    sqlite_path, mac_jobs_root
-):
+def test_historical_repair_fails_closed_without_publication_pipeline(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-105")
+    events = []
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+    )
+
+    assert worker.process_one() is False
+
+    assert events == []
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.PENDING
+    status = store.get_worker_status("mac-translation-1")
+    assert status is not None
+    assert status.last_error == "historical_publication_unconfigured"
+
+
+def test_good_historical_repair_uploads_catalogs_and_marks_success(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
     job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-103")
@@ -603,25 +624,55 @@ def test_three_historical_quality_failures_pause_history_but_normal_still_runs(
     store.initialize()
     for movie in ("old-111", "old-112", "old-113"):
         enqueue_historical_worker_job(store, mac_jobs_root, movie)
+    workers = [
+        MacTranslationWorker(
+            store,
+            CollapsedMacTranslator(),
+            max_translation_attempts=3,
+            worker_id=f"mac-translation-{index}",
+            lease_seconds=60,
+            quality_failure_limit=3,
+            publisher=RecordingPublisher(),
+            catalog_sync_client=RecordingCatalogSync(),
+        )
+        for index in range(1, 4)
+    ]
+
+    assert [worker.process_one() for worker in workers] == [True, True, True]
+    assert workers[-1].historical_quality_failures == 3
+    assert store.historical_lane_state().reason_code == "quality_failure_limit"
+    normal = prepare_transcription_done_job(store, mac_jobs_root, movie="new-111")
+    worker = workers[-1]
+    worker.translator = DiverseMacTranslator()
+
+    assert worker.process_one() is True
+    assert store.get_job(normal.id).status is JobStatus.PUBLISH_PENDING
+
+
+def test_good_historical_quality_pass_resets_durable_failure_streak(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    enqueue_historical_worker_job(store, mac_jobs_root, "old-114")
+    good, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-115")
     worker = MacTranslationWorker(
         store,
         CollapsedMacTranslator(),
         max_translation_attempts=3,
         worker_id="mac-translation-1",
         lease_seconds=60,
-        quality_failure_limit=3,
         publisher=RecordingPublisher(),
         catalog_sync_client=RecordingCatalogSync(),
     )
-
-    assert [worker.process_one() for _ in range(3)] == [True, True, True]
-    assert worker.historical_quality_failures == 3
-    assert store.historical_lane_state().reason_code == "quality_failure_limit"
-    normal = prepare_transcription_done_job(store, mac_jobs_root, movie="new-111")
-    worker.translator = DiverseMacTranslator()
-
     assert worker.process_one() is True
-    assert store.get_job(normal.id).status is JobStatus.PUBLISH_PENDING
+    assert store.historical_lane_state().consecutive_quality_failures == 1
+
+    worker.translator = DiverseMacTranslator()
+    assert worker.process_one() is True
+
+    assert store.get_job(good.id).status is JobStatus.PUBLISH_PENDING
+    assert store.historical_lane_state().consecutive_quality_failures == 0
 
 
 def test_historical_preservation_uses_full_audio_hash_not_probe(
@@ -811,6 +862,81 @@ def test_restart_after_old_quarantine_rejects_partial_and_retries_translation(
     assert any("interrupted" in path.name for path in rejected)
 
 
+def test_historical_quarantine_never_overwrites_preexisting_collision(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-145")
+    repair = store.get_historical_repair(job.id)
+    desired = store.historical_source_quarantine_path(repair)
+    desired.parent.mkdir(parents=True, exist_ok=True)
+    desired.write_bytes(b"preexisting unrelated quarantine")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+
+    assert worker.process_one() is True
+
+    assert desired.read_bytes() == b"preexisting unrelated quarantine"
+    old_copies = [
+        path
+        for path in desired.parent.glob("*.srt")
+        if hashlib.sha256(path.read_bytes()).hexdigest() == repair.source_english_sha256
+    ]
+    assert len(old_copies) == 1
+    assert paths.english_srt_path_mac.exists()
+
+
+def test_historical_quarantine_resumes_after_link_before_unlink_crash(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    import os
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-146")
+    repair = store.get_historical_repair(job.id)
+    real_unlink = os.unlink
+    crashed = False
+
+    def crash_once(path, *args, **kwargs):
+        nonlocal crashed
+        if path == paths.english_srt_path_mac.name and not crashed:
+            crashed = True
+            raise OSError("simulated crash after durable link")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr("orchestrator.mac_worker.os.unlink", crash_once)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publish_retry_seconds=0,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+
+    assert worker.process_one() is True
+    assert crashed is True
+    assert paths.english_srt_path_mac.exists()
+    assert store.historical_source_quarantine_path(repair).exists()
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RETRY_WAIT
+
+    assert worker.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
+    assert (
+        hashlib.sha256(store.historical_source_quarantine_path(repair).read_bytes()).hexdigest()
+        == repair.source_english_sha256
+    )
+
+
 def test_translation_side_effect_safely_yields_after_same_worker_reclaim(
     sqlite_path, mac_jobs_root
 ):
@@ -962,6 +1088,13 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     assert worker.process_one() is True
     assert [event[0] for event in events] == ["translate", "publish", "catalog"]
     assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert catalog.receipts == [
+        {
+            "expected_subtitle_id": published.published_subtitle_id,
+            "expected_storage_path": published.published_storage_path,
+            "expected_content_sha256": published.published_content_sha256,
+        }
+    ]
     log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
     assert "publish_verified" in log.read_text(encoding="utf-8")
     assert "Distinct English" not in log.read_text(encoding="utf-8")
@@ -997,8 +1130,11 @@ def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
     assert refreshed.metadata_source == "placeholder"
 
 
+@pytest.mark.parametrize(
+    "reason_code", ["catalog_fetch_failed", "public_visibility_mismatch"]
+)
 def test_catalog_failure_retries_without_retranslation_or_reupload(
-    sqlite_path, mac_jobs_root
+    sqlite_path, mac_jobs_root, reason_code
 ):
     from orchestrator.catalog_sync import CatalogSyncError
 
@@ -1015,7 +1151,7 @@ def test_catalog_failure_retries_without_retranslation_or_reupload(
         publisher=RecordingPublisher(events),
         catalog_sync_client=RecordingCatalogSync(
             events,
-            errors=[CatalogSyncError("catalog_fetch_failed"), None],
+            errors=[CatalogSyncError(reason_code), None],
         ),
         catalog_sync_retry_seconds=0,
     )
@@ -1029,7 +1165,7 @@ def test_catalog_failure_retries_without_retranslation_or_reupload(
     assert failed.status is JobStatus.CATALOG_SYNC_PENDING
     assert failed.catalog_sync_attempt_count == 1
     assert failed.next_catalog_sync_attempt_at is not None
-    assert failed.error == "catalog_sync: catalog_fetch_failed"
+    assert failed.error == f"catalog_sync: {reason_code}"
     assert [event[0] for event in events].count("translate") == 1
     assert [event[0] for event in events].count("publish") == 1
 
@@ -1159,6 +1295,49 @@ def test_publisher_quality_failure_is_permanent_and_quarantines_english(
     assert len(list(rejected.glob("*.srt"))) == 1
     assert audio.read_bytes() == b"keep-audio"
     assert worker.consecutive_quality_failures == 1
+
+
+def test_historical_publisher_quality_quarantine_is_deterministic_no_clobber(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, paths = enqueue_historical_worker_job(store, mac_jobs_root, "old-147")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            errors=[SubtitleQualityGateError(["subtitle_changed_after_validation"])]
+        ),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert worker.process_one() is True
+    repair = store.get_historical_repair(job.id)
+    candidate_hash = hashlib.sha256(paths.english_srt_path_mac.read_bytes()).hexdigest()
+    desired = (
+        paths.job_dir_mac
+        / "rejected"
+        / (
+            f"{paths.english_srt_path_mac.stem}.rejected-quality-publisher-"
+            f"{repair.id}-{candidate_hash[:12]}.srt"
+        )
+    )
+    desired.parent.mkdir(exist_ok=True)
+    desired.write_bytes(b"unrelated existing quarantine")
+
+    assert worker.process_one() is True
+
+    assert desired.read_bytes() == b"unrelated existing quarantine"
+    candidate_copies = [
+        path
+        for path in desired.parent.glob("*.srt")
+        if hashlib.sha256(path.read_bytes()).hexdigest() == candidate_hash
+    ]
+    assert len(candidate_copies) == 1
+    assert "collision" in candidate_copies[0].name
 
 
 def test_three_publisher_quality_failures_stop_before_claiming_fourth_pending_job(
@@ -1666,6 +1845,51 @@ def test_catalog_worker_safely_yields_when_lease_is_recovered_and_reclaimed(
     ).read_text(encoding="utf-8")
     assert "catalog_lease_lost" in log
     assert catalog.reclaimed.catalog_lease_token not in log
+
+
+def test_historical_catalog_preservation_failure_is_fenced_after_side_effect(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, _ = enqueue_historical_worker_job(store, mac_jobs_root, "old-153")
+    setup = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="setup-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+    )
+    assert setup.process_one() is True
+    assert setup.process_one() is True
+    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+
+    catalog = ReclaimingCatalogSync(store, job.id)
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="lease-losing-worker",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=catalog,
+        catalog_sync_retry_seconds=0,
+    )
+    monkeypatch.setattr(
+        worker,
+        "_require_historical_preservation_locked",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("changed")),
+    )
+
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.claimed_by == "replacement-worker"
+    assert current.catalog_lease_token == catalog.reclaimed.catalog_lease_token
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
 
 
 @pytest.mark.parametrize("database_failure_stage", ["complete", "fail"])
