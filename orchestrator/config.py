@@ -25,6 +25,10 @@ class MacSettings(BaseSettings):
     jobs_root_mac: Path = Field(default=Path("/Users/ytt/MissAVJobs"), alias="JOBS_ROOT_MAC")
     jobs_root_windows: str = Field(default="M:\\", alias="JOBS_ROOT_WINDOWS")
     mac_download_concurrency: int = Field(default=1, alias="MAC_DOWNLOAD_CONCURRENCY")
+    mac_download_worker_id: str = Field(
+        default="mac-downloader-1",
+        alias="MAC_DOWNLOAD_WORKER_ID",
+    )
     worker_lease_seconds: int = Field(default=1800, alias="WORKER_LEASE_SECONDS")
     max_download_attempts: int = Field(default=3, alias="MAX_DOWNLOAD_ATTEMPTS")
     max_worker_attempts: int = Field(default=3, alias="MAX_WORKER_ATTEMPTS")

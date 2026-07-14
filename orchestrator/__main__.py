@@ -270,20 +270,27 @@ def run_api() -> None:
 
 
 def run_mac_worker() -> None:
-    from orchestrator.config import MacSettings
-    from orchestrator.mac_worker import MacDownloadWorker, run_forever as run_mac_forever
-    from orchestrator.missav_adapter import MissAVAdapter
-    from orchestrator.store import JobStore
+    from orchestrator.config import PROJECT_ROOT, MacSettings
+    from orchestrator.process_lock import SingleInstanceLock
 
-    settings = MacSettings()
-    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
-    store.initialize()
-    worker = MacDownloadWorker(
-        store,
-        MissAVAdapter(settings.missav_pipeline_root),
-        settings.max_download_attempts,
-    )
-    run_mac_forever(worker)
+    lock = SingleInstanceLock(PROJECT_ROOT / "data" / "mac-worker.lock").acquire()
+    try:
+        from orchestrator.mac_worker import MacDownloadWorker, run_forever as run_mac_forever
+        from orchestrator.missav_adapter import MissAVAdapter
+        from orchestrator.store import JobStore
+
+        settings = MacSettings()
+        store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+        store.initialize()
+        worker = MacDownloadWorker(
+            store,
+            MissAVAdapter(settings.missav_pipeline_root),
+            settings.max_download_attempts,
+            worker_id=settings.mac_download_worker_id,
+        )
+        run_mac_forever(worker)
+    finally:
+        lock.release()
 
 
 def _export_windows_runtime_env(settings) -> None:
@@ -375,37 +382,45 @@ def run_mac_translation_smoke_test() -> None:
 
 
 def run_mac_translation_worker() -> None:
-    from orchestrator.config import MacSettings
-    from orchestrator.mac_worker import (
-        MacTranslationWorker,
-        run_translation_forever,
-    )
-    from orchestrator.store import JobStore
-    from orchestrator.translation import SubtitleTranslator
+    from orchestrator.config import PROJECT_ROOT, MacSettings
+    from orchestrator.process_lock import SingleInstanceLock
 
-    settings = MacSettings()
-    publisher = build_supabase_publisher(settings)
-    catalog_sync_client = build_catalog_sync_client(settings)
-    _export_mac_translation_runtime_env(settings)
-    translator = SubtitleTranslator(settings.mac_translate_script_path)
-    _run_mac_translation_smoke(settings, translator)
-    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
-    store.initialize()
-    worker = MacTranslationWorker(
-        store,
-        translator,
-        max_translation_attempts=settings.max_translation_attempts,
-        worker_id=settings.mac_translation_worker_id,
-        lease_seconds=settings.mac_translation_lease_seconds,
-        quality_failure_limit=settings.translation_quality_failure_limit,
-        publisher=publisher,
-        max_publish_attempts=settings.max_publish_attempts,
-        publish_retry_seconds=settings.mac_publish_retry_seconds,
-        catalog_sync_client=catalog_sync_client,
-        max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
-        catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
-    )
-    run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
+    lock = SingleInstanceLock(
+        PROJECT_ROOT / "data" / "mac-translation-worker.lock"
+    ).acquire()
+    try:
+        from orchestrator.mac_worker import (
+            MacTranslationWorker,
+            run_translation_forever,
+        )
+        from orchestrator.store import JobStore
+        from orchestrator.translation import SubtitleTranslator
+
+        settings = MacSettings()
+        publisher = build_supabase_publisher(settings)
+        catalog_sync_client = build_catalog_sync_client(settings)
+        _export_mac_translation_runtime_env(settings)
+        translator = SubtitleTranslator(settings.mac_translate_script_path)
+        _run_mac_translation_smoke(settings, translator)
+        store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+        store.initialize()
+        worker = MacTranslationWorker(
+            store,
+            translator,
+            max_translation_attempts=settings.max_translation_attempts,
+            worker_id=settings.mac_translation_worker_id,
+            lease_seconds=settings.mac_translation_lease_seconds,
+            quality_failure_limit=settings.translation_quality_failure_limit,
+            publisher=publisher,
+            max_publish_attempts=settings.max_publish_attempts,
+            publish_retry_seconds=settings.mac_publish_retry_seconds,
+            catalog_sync_client=catalog_sync_client,
+            max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
+            catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
+        )
+        run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
+    finally:
+        lock.release()
 
 
 def run_mac_translation_worker_once(job_id: str) -> None:

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.javsubtitle.mac-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/.venv/bin/python</string>
+        <string>-m</string>
+        <string>orchestrator</string>
+        <string>mac-worker</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator</string>
+    <key>StandardOutPath</key>
+    <string>/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/logs/mac-worker.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/logs/mac-worker.stderr.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
