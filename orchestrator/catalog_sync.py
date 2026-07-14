@@ -169,6 +169,7 @@ class CatalogSyncClient:
         }:
             kv_keys_deleted = row.get("kvKeysDeleted")
             row_schema_valid = row.get("dryRun") is False
+            allow_alias_cache_keys = False
         elif row_keys == {
             "canonicalCode",
             "d1RowsUpdated",
@@ -177,22 +178,40 @@ class CatalogSyncClient:
         }:
             kv_keys_deleted = row.get("kvKeysTouched")
             row_schema_valid = True
+            allow_alias_cache_keys = True
         else:
             kv_keys_deleted = None
             row_schema_valid = False
+            allow_alias_cache_keys = False
         expected_kv_keys = {
             f"movie:full:{canonical}",
             f"movie:light:{canonical}",
         }
+        kv_keys_valid = (
+            isinstance(kv_keys_deleted, list)
+            and all(isinstance(key, str) for key in kv_keys_deleted)
+            and (
+                (
+                    allow_alias_cache_keys
+                    and expected_kv_keys.issubset(set(kv_keys_deleted))
+                    and all(
+                        key.startswith(("movie:full:", "movie:light:"))
+                        for key in kv_keys_deleted
+                    )
+                )
+                or (
+                    not allow_alias_cache_keys
+                    and len(kv_keys_deleted) == 2
+                    and set(kv_keys_deleted) == expected_kv_keys
+                )
+            )
+        )
         if (
             not row_schema_valid
             or row.get("canonicalCode") != canonical
             or not self._positive_int(d1_rows_updated)
             or not self._positive_int(subtitle_count)
-            or not isinstance(kv_keys_deleted, list)
-            or len(kv_keys_deleted) != 2
-            or any(not isinstance(key, str) for key in kv_keys_deleted)
-            or set(kv_keys_deleted) != expected_kv_keys
+            or not kv_keys_valid
         ):
             raise CatalogSyncError("catalog_response_mismatch")
 

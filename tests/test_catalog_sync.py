@@ -53,6 +53,8 @@ def valid_current_body() -> dict[str, object]:
                 "kvKeysTouched": [
                     f"movie:full:{CANONICAL_CODE}",
                     f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:{CANONICAL_CODE}-uncensored-leak",
+                    f"movie:light:{CANONICAL_CODE}-uncensored-leak",
                 ],
             }
         ],
@@ -210,6 +212,8 @@ def test_sync_accepts_current_catalog_response_schema():
         kv_keys_deleted=(
             f"movie:full:{CANONICAL_CODE}",
             f"movie:light:{CANONICAL_CODE}",
+            f"movie:full:{CANONICAL_CODE}-uncensored-leak",
+            f"movie:light:{CANONICAL_CODE}-uncensored-leak",
         ),
     )
 
