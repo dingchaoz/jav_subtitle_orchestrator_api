@@ -79,6 +79,20 @@ def test_roe_style_known_bad_collapse_is_rejected(tmp_path):
     assert report.dominant_text_ratio == 0.9
 
 
+def test_single_known_bad_phrase_is_rejected(tmp_path):
+    japanese = [f"日本語{i}" for i in range(40)]
+    english = ["I don't know what to do."] + [
+        f"Distinct translated sentence {i}." for i in range(39)
+    ]
+    ja, en = aligned_pair(tmp_path, japanese, english)
+
+    report = validate_translation_quality(ja, en)
+
+    assert report.passed is False
+    assert "known_bad_phrase" in report.reason_codes
+    assert report.known_bad_phrase_count == 1
+
+
 def test_hodv_style_generic_repetition_is_rejected(tmp_path):
     japanese = [f"日本語{i}" for i in range(120)]
     english = ["What are you doing?"] * 110 + [f"Different {i}" for i in range(10)]

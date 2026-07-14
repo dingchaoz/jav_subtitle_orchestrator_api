@@ -540,6 +540,49 @@ def run_enqueue_historical_repair_batch(
     )
 
 
+def run_plan_translation_only_repair_batch(
+    *, allowlist_file: Path, limit: int, output: Path
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+    from orchestrator.subtitle_repair import (
+        plan_translation_only_repair_batch,
+        render_translation_only_repair_batch_report,
+        write_translation_only_repair_plan,
+    )
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plan = plan_translation_only_repair_batch(store, allowlist_file, limit=limit)
+    write_translation_only_repair_plan(output, plan)
+    print(render_translation_only_repair_batch_report(plan))
+
+
+def run_enqueue_translation_only_repair_batch(
+    *, plan_file: Path, confirm_plan_sha256: str
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+    from orchestrator.subtitle_repair import (
+        enqueue_translation_only_repair_batch,
+        read_translation_only_repair_plan,
+    )
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    plan = read_translation_only_repair_plan(plan_file)
+    records = enqueue_translation_only_repair_batch(
+        store,
+        plan,
+        confirm_plan_sha256=confirm_plan_sha256,
+    )
+    identifiers = ",".join(record.id for record in records) or "none"
+    print(
+        f"enqueued=true plan_sha256={plan.plan_sha256} "
+        f"count={len(records)} job_ids={identifiers}"
+    )
+
+
 def run_plan_catalog_repairs(
     *, allowlist: set[str] | None, limit: int
 ) -> None:
@@ -840,6 +883,19 @@ def build_parser() -> argparse.ArgumentParser:
     batch_enqueue.add_argument("--allowlist-file", type=Path, required=True)
     batch_enqueue.add_argument("--plan-file", type=Path, required=True)
     batch_enqueue.add_argument("--confirm-plan-sha256", required=True)
+    translation_batch_plan = subcommands.add_parser(
+        "plan-translation-only-repair-batch"
+    )
+    translation_batch_plan.add_argument("--allowlist-file", type=Path, required=True)
+    translation_batch_plan.add_argument(
+        "--limit", type=int, choices=range(1, 21), required=True
+    )
+    translation_batch_plan.add_argument("--output", type=Path, required=True)
+    translation_batch_enqueue = subcommands.add_parser(
+        "enqueue-translation-only-repair-batch"
+    )
+    translation_batch_enqueue.add_argument("--plan-file", type=Path, required=True)
+    translation_batch_enqueue.add_argument("--confirm-plan-sha256", required=True)
     controller = subcommands.add_parser("historical-repair-controller")
     controller.add_argument("--allowlist-file", type=Path, required=True)
     controller.add_argument(
@@ -935,6 +991,17 @@ def main() -> None:
     elif args.command == "enqueue-historical-repair-batch":
         run_enqueue_historical_repair_batch(
             allowlist_file=args.allowlist_file,
+            plan_file=args.plan_file,
+            confirm_plan_sha256=args.confirm_plan_sha256,
+        )
+    elif args.command == "plan-translation-only-repair-batch":
+        run_plan_translation_only_repair_batch(
+            allowlist_file=args.allowlist_file,
+            limit=args.limit,
+            output=args.output,
+        )
+    elif args.command == "enqueue-translation-only-repair-batch":
+        run_enqueue_translation_only_repair_batch(
             plan_file=args.plan_file,
             confirm_plan_sha256=args.confirm_plan_sha256,
         )

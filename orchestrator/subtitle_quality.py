@@ -233,6 +233,8 @@ def _build_quality_report(
     mojibake_count = sum(raw_english.count(marker) for marker in MOJIBAKE_MARKERS)
     if replacement_count >= 3 or mojibake_count >= 3:
         _append_once(reasons, "encoding_corruption")
+    if known_bad_count > 0:
+        _append_once(reasons, "known_bad_phrase")
     if known_bad_count >= 10 and known_bad_ratio >= 0.05:
         _append_once(reasons, "known_bad_collapse")
     refusal_ratio = refusal_count / line_count if line_count else 0.0
