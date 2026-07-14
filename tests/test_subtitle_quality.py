@@ -79,7 +79,7 @@ def test_roe_style_known_bad_collapse_is_rejected(tmp_path):
     assert report.dominant_text_ratio == 0.9
 
 
-def test_single_known_bad_phrase_is_rejected(tmp_path):
+def test_single_known_bad_phrase_is_warning_not_rejected(tmp_path):
     japanese = [f"日本語{i}" for i in range(40)]
     english = ["I don't know what to do."] + [
         f"Distinct translated sentence {i}." for i in range(39)
@@ -88,8 +88,9 @@ def test_single_known_bad_phrase_is_rejected(tmp_path):
 
     report = validate_translation_quality(ja, en)
 
-    assert report.passed is False
-    assert "known_bad_phrase" in report.reason_codes
+    assert report.passed is True
+    assert "known_bad_phrase" in report.warning_codes
+    assert "known_bad_phrase" not in report.reason_codes
     assert report.known_bad_phrase_count == 1
 
 

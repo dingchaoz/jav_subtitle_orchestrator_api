@@ -233,9 +233,8 @@ def _build_quality_report(
     mojibake_count = sum(raw_english.count(marker) for marker in MOJIBAKE_MARKERS)
     if replacement_count >= 3 or mojibake_count >= 3:
         _append_once(reasons, "encoding_corruption")
-    if known_bad_count > 0:
-        _append_once(reasons, "known_bad_phrase")
     if known_bad_count >= 10 and known_bad_ratio >= 0.05:
+        _append_once(reasons, "known_bad_phrase")
         _append_once(reasons, "known_bad_collapse")
     refusal_ratio = refusal_count / line_count if line_count else 0.0
     if refusal_count >= 3 and refusal_ratio >= 0.02:
@@ -285,6 +284,8 @@ def _build_quality_report(
         gap = abs(audio_duration_seconds - last_timestamp)
         if gap > max(120.0, audio_duration_seconds * 0.10):
             warnings.append("audio_subtitle_duration_gap")
+    if known_bad_count > 0 and "known_bad_phrase" not in reasons:
+        warnings.append("known_bad_phrase")
 
     return QualityReport(
         passed=not reasons,
