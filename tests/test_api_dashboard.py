@@ -83,19 +83,23 @@ def test_dashboard_state_endpoint_serializes_typed_historical_progress(
     assert body["historical_repairs"] == {
         "counts": {
             "total": 1,
+            "planned": 0,
             "pending": 0,
             "running": 1,
             "retry_wait": 0,
+            "paused": 0,
             "succeeded": 0,
             "permanent_failed": 0,
+            "unknown": 0,
         },
-        "active": {
+        "current": {
             "batch_id": "batch_api_001",
             "repair_id": "repair_api_001",
             "job_id": job.id,
             "movie_number": "old-401",
             "stage": "catalog_syncing",
             "state": "running",
+            "reason_code": None,
             "updated_at": "2026-07-05T10:00:00+00:00",
         },
         "lane_paused": False,
@@ -338,6 +342,11 @@ def test_dashboard_contains_safe_read_only_historical_progress_card(
     assert "state.historical_repairs" in html
     assert "state.activity.historical_translation" in html
     assert "renderHistoricalRepairs" in html
+    assert "progress.current" in html
+    assert "counts.planned" in html
+    assert "counts.paused" in html
+    assert "counts.unknown" in html
+    assert "current.state" in html
     assert "history-repair-counts\").textContent" in html
     assert "history-repair-current\").textContent" in html
     assert "history-repair-pause\").textContent" in html

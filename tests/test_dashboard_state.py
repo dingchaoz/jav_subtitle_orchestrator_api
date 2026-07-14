@@ -2,6 +2,8 @@ import json
 import sqlite3
 from contextlib import closing
 
+import pytest
+
 from orchestrator.dashboard import build_dashboard_state, build_job_browser, build_job_detail
 from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
@@ -262,9 +264,9 @@ def test_dashboard_separates_normal_and_historical_translation_activity(
     assert state.activity["historical_translation"]["job_id"] == historical.id
     assert state.activity["historical_translation"]["stage"] == "publishing"
     assert state.activity["historical_translation"]["state"] == "running"
-    assert state.historical_repairs.active is not None
-    assert state.historical_repairs.active.repair_id == repair_id
-    assert state.historical_repairs.active.batch_id == batch_id
+    assert state.historical_repairs.current is not None
+    assert state.historical_repairs.current.repair_id == repair_id
+    assert state.historical_repairs.current.batch_id == batch_id
 
 
 def test_historical_worker_heartbeat_never_appears_as_normal_translation(
@@ -325,12 +327,112 @@ def test_dashboard_historical_repair_counts_cover_each_reported_state(
 
     assert progress.counts.model_dump() == {
         "total": 7,
+        "planned": 1,
         "pending": 1,
         "running": 1,
         "retry_wait": 1,
+        "paused": 1,
         "succeeded": 1,
         "permanent_failed": 1,
+        "unknown": 0,
     }
+    assert sum(
+        count
+        for name, count in progress.counts.model_dump().items()
+        if name != "total"
+    ) == progress.counts.total
+
+
+@pytest.mark.parametrize(
+    ("repair_state", "job_status", "reason_code"),
+    (
+        ("pending", JobStatus.ENGLISH_SRT_READY, None),
+        (
+            "retry_wait",
+            JobStatus.FAILED,
+            "historical_orphaned_transient_retry",
+        ),
+        ("paused", JobStatus.FAILED, "preservation_hash_changed"),
+    ),
+)
+def test_dashboard_reports_nonrunning_nonterminal_repair_as_current(
+    sqlite_path,
+    mac_jobs_root,
+    repair_state,
+    job_status,
+    reason_code,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, repair_id, batch_id = insert_historical_repair(
+        store,
+        sqlite_path,
+        "old-050",
+        repair_state,
+        job_status=job_status,
+        reason_code=reason_code,
+    )
+
+    state = build_dashboard_state(store)
+    current = state.historical_repairs.current
+
+    assert current is not None
+    assert current.batch_id == batch_id
+    assert current.repair_id == repair_id
+    assert current.job_id == job.id
+    assert current.movie_number == "old-050"
+    assert current.state == repair_state
+    assert current.stage == job_status.value
+    assert current.reason_code == reason_code
+    assert state.activity["historical_translation"]["movie_number"] == "old-050"
+    assert state.activity["historical_translation"]["state"] == repair_state
+    assert state.activity["historical_translation"]["stage"] == job_status.value
+
+
+def test_dashboard_current_repair_uses_state_priority_before_creation_time(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    insert_historical_repair(
+        store, sqlite_path, "old-060", "planned",
+        created_at="2026-07-05T10:00:00+00:00",
+    )
+    insert_historical_repair(
+        store, sqlite_path, "old-061", "pending",
+        created_at="2026-07-05T10:00:01+00:00",
+    )
+    retry_job, _, _ = insert_historical_repair(
+        store, sqlite_path, "old-062", "retry_wait",
+        job_status=JobStatus.FAILED,
+        created_at="2026-07-05T10:00:02+00:00",
+    )
+    insert_historical_repair(
+        store, sqlite_path, "old-063", "paused",
+        job_status=JobStatus.FAILED,
+        created_at="2026-07-05T10:00:03+00:00",
+    )
+    running_job, _, _ = insert_historical_repair(
+        store, sqlite_path, "old-064", "running",
+        job_status=JobStatus.PUBLISHING,
+        created_at="2026-07-05T10:00:04+00:00",
+    )
+
+    first = build_dashboard_state(store).historical_repairs.current
+    assert first is not None
+    assert first.job_id == running_job.id
+
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.execute(
+            "UPDATE historical_translation_repairs SET state = 'succeeded' "
+            "WHERE job_id = ?",
+            (running_job.id,),
+        )
+        conn.commit()
+
+    second = build_dashboard_state(store).historical_repairs.current
+    assert second is not None
+    assert second.job_id == retry_job.id
 
 
 def test_dashboard_historical_pause_is_structured_and_unknown_reason_is_safe(
@@ -389,10 +491,10 @@ def test_dashboard_multiple_running_repairs_reports_count_and_earliest_active(
     progress = build_dashboard_state(store).historical_repairs
 
     assert progress.counts.running == 2
-    assert progress.active is not None
-    assert progress.active.job_id == oldest.id
-    assert progress.active.repair_id == oldest_repair_id
-    assert progress.active.stage == "catalog_sync_pending"
+    assert progress.current is not None
+    assert progress.current.job_id == oldest.id
+    assert progress.current.repair_id == oldest_repair_id
+    assert progress.current.stage == "catalog_sync_pending"
 
 
 def test_dashboard_historical_payload_omits_sensitive_record_fields(
@@ -459,7 +561,7 @@ def test_historical_dashboard_snapshot_uses_at_most_two_selects(
 ):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
-    insert_historical_repair(store, sqlite_path, "old-301", "running")
+    insert_historical_repair(store, sqlite_path, "old-301", "pending")
     traced_selects = []
     original_connect = store.connect
 
@@ -476,7 +578,7 @@ def test_historical_dashboard_snapshot_uses_at_most_two_selects(
 
     snapshot = store.historical_repair_dashboard_snapshot()
 
-    assert snapshot.active is not None
+    assert snapshot.current is not None
     assert len(traced_selects) <= 2
 
 
@@ -495,6 +597,65 @@ def test_dashboard_missing_historical_control_row_fails_safe(
     assert progress.reason_code == "historical_controller_state_unavailable"
     assert progress.consecutive_quality_failures == 0
     assert progress.updated_at is None
+
+
+def test_dashboard_orphaned_nonterminal_repair_still_has_safe_current(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job, repair_id, _ = insert_historical_repair(
+        store,
+        sqlite_path,
+        "old-399",
+        "pending",
+    )
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
+        conn.commit()
+
+    progress = build_dashboard_state(store).historical_repairs
+
+    assert progress.counts.pending == 1
+    assert progress.current is not None
+    assert progress.current.repair_id == repair_id
+    assert progress.current.job_id == job.id
+    assert progress.current.stage == "historical_error"
+
+
+def test_dashboard_unknown_legacy_repair_state_fails_closed_in_counts(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    insert_historical_repair(
+        store,
+        sqlite_path,
+        "old-398",
+        "legacy_unknown",
+    )
+
+    state = build_dashboard_state(store)
+    counts = state.historical_repairs.counts
+
+    assert counts.total == 1
+    assert counts.permanent_failed == 0
+    assert counts.unknown == 1
+    assert sum(
+        count
+        for name, count in counts.model_dump().items()
+        if name != "total"
+    ) == counts.total
+    assert state.historical_repairs.current is not None
+    assert state.historical_repairs.current.state == "unknown"
+    assert state.historical_repairs.current.reason_code == "historical_error"
+    assert state.activity["historical_translation"]["state"] == "unknown"
+    assert "legacy_unknown" not in json.dumps(
+        {
+            "historical_repairs": state.historical_repairs.model_dump(mode="json"),
+            "activity": state.activity["historical_translation"],
+        }
+    )
 
 
 def test_build_dashboard_state_uses_deterministic_recency_for_same_second_ties(

@@ -8,8 +8,8 @@ from pathlib import Path
 from orchestrator.models import (
     DashboardJobSummary,
     DashboardStateResponse,
-    HistoricalRepairDashboardActive,
     HistoricalRepairDashboardCounts,
+    HistoricalRepairDashboardCurrent,
     HistoricalRepairDashboardProgress,
     JobBrowserItem,
     JobBrowserResponse,
@@ -81,9 +81,12 @@ SAFE_HISTORICAL_DASHBOARD_REASONS = frozenset(
         "catalog_sync_failed",
         "historical_controller_state_unavailable",
         "historical_lane_paused",
+        "historical_orphaned_terminal_state",
+        "historical_orphaned_transient_retry",
         "operator_pause",
         "plan_digest_changed",
         "preservation_hash_changed",
+        "publication_attempts_exhausted",
         "publication_configuration_missing",
         "public_visibility_failed",
         "public_visibility_mismatch",
@@ -93,7 +96,13 @@ SAFE_HISTORICAL_DASHBOARD_REASONS = frozenset(
         "quarantine_failed",
         "supabase_verification_failed",
         "translation_worker_count_mismatch",
+        "translation_attempts_exhausted",
+        "catalog_receipt_invalid",
+        "catalog_sync_attempts_exhausted",
     }
+)
+SAFE_HISTORICAL_REPAIR_STATES = frozenset(
+    {"planned", "pending", "running", "retry_wait", "paused"}
 )
 
 
@@ -323,30 +332,44 @@ def _safe_historical_reason(reason_code: str | None) -> str | None:
     return "historical_error"
 
 
+def _safe_historical_state(state: str) -> str:
+    if state in SAFE_HISTORICAL_REPAIR_STATES:
+        return state
+    return "unknown"
+
+
 def _historical_progress(
     snapshot: HistoricalRepairDashboardSnapshot,
 ) -> HistoricalRepairDashboardProgress:
-    active = snapshot.active
+    current = snapshot.current
     return HistoricalRepairDashboardProgress(
         counts=HistoricalRepairDashboardCounts(
             total=snapshot.total,
+            planned=snapshot.planned,
             pending=snapshot.pending,
             running=snapshot.running,
             retry_wait=snapshot.retry_wait,
+            paused=snapshot.paused,
             succeeded=snapshot.succeeded,
             permanent_failed=snapshot.permanent_failed,
+            unknown=snapshot.unknown,
         ),
-        active=(
-            HistoricalRepairDashboardActive(
-                batch_id=active.batch_id,
-                repair_id=active.repair_id,
-                job_id=active.job_id,
-                movie_number=active.movie_number,
-                stage=active.stage,
-                state=active.state,
-                updated_at=active.updated_at,
+        current=(
+            HistoricalRepairDashboardCurrent(
+                batch_id=current.batch_id,
+                repair_id=current.repair_id,
+                job_id=current.job_id,
+                movie_number=current.movie_number,
+                stage=current.stage,
+                state=_safe_historical_state(current.state),
+                reason_code=(
+                    "historical_error"
+                    if current.state not in SAFE_HISTORICAL_REPAIR_STATES
+                    else _safe_historical_reason(current.reason_code)
+                ),
+                updated_at=current.updated_at,
             )
-            if active is not None
+            if current is not None
             else None
         ),
         lane_paused=snapshot.lane_paused,
@@ -359,8 +382,8 @@ def _historical_progress(
 def _historical_activity_payload(
     snapshot: HistoricalRepairDashboardSnapshot,
 ) -> dict[str, str | None]:
-    active = snapshot.active
-    if active is None:
+    current = snapshot.current
+    if current is None:
         return {
             "status": "paused" if snapshot.lane_paused else "idle",
             "movie_number": None,
@@ -371,13 +394,13 @@ def _historical_activity_payload(
             "state": None,
         }
     return {
-        "status": active.stage,
-        "movie_number": active.movie_number,
-        "job_id": active.job_id,
-        "worker_id": active.worker_id,
-        "updated_at": active.updated_at,
-        "stage": active.stage,
-        "state": active.state,
+        "status": current.stage,
+        "movie_number": current.movie_number,
+        "job_id": current.job_id,
+        "worker_id": current.worker_id,
+        "updated_at": current.updated_at,
+        "stage": current.stage,
+        "state": _safe_historical_state(current.state),
     }
 
 
@@ -1100,7 +1123,7 @@ def dashboard_html() -> str:
         <div class="health-value" id="history-repair-status">Loading</div>
         <div class="health-meta" id="history-repair-meta">Fetching state</div>
         <div class="health-meta" id="history-repair-counts">No counts yet</div>
-        <div class="health-meta" id="history-repair-current">No active repair</div>
+        <div class="health-meta" id="history-repair-current">No current repair</div>
         <div class="health-meta" id="history-repair-pause">Pause state unknown</div>
       </article>
       <article class="health-card">
@@ -1334,22 +1357,22 @@ def dashboard_html() -> str:
     function renderHistoricalRepairs(state) {
       const progress = state.historical_repairs || {};
       const counts = progress.counts || {};
-      const active = progress.active || null;
+      const current = progress.current || null;
       const activity = state.activity.historical_translation || {};
       const paused = Boolean(progress.lane_paused);
       const status = paused
         ? "Paused"
-        : (active ? text(activity.stage, active.stage) : "Idle");
+        : (current ? text(activity.stage, current.stage) : "Idle");
       const statusElement = document.getElementById("history-repair-status");
       statusElement.textContent = status;
       statusElement.className = `health-value ${paused ? "status-error" : workerStatusClass(activity.status)}`;
       document.getElementById("history-repair-meta").textContent =
         `Updated ${formatDate(progress.updated_at)}`;
       document.getElementById("history-repair-counts").textContent =
-        `Total ${text(counts.total, "0")}; pending ${text(counts.pending, "0")}; running ${text(counts.running, "0")}; retry ${text(counts.retry_wait, "0")}; succeeded ${text(counts.succeeded, "0")}; failed ${text(counts.permanent_failed, "0")}`;
-      document.getElementById("history-repair-current").textContent = active
-        ? `${active.movie_number}; ${active.stage}; batch ${active.batch_id}; job ${active.job_id}`
-        : "No active historical repair";
+        `Total ${text(counts.total, "0")}; planned ${text(counts.planned, "0")}; pending ${text(counts.pending, "0")}; running ${text(counts.running, "0")}; retry ${text(counts.retry_wait, "0")}; paused ${text(counts.paused, "0")}; succeeded ${text(counts.succeeded, "0")}; failed ${text(counts.permanent_failed, "0")}; unknown ${text(counts.unknown, "0")}`;
+      document.getElementById("history-repair-current").textContent = current
+        ? `${current.movie_number}; state ${current.state}; stage ${current.stage}; batch ${current.batch_id}; job ${current.job_id}; reason ${text(current.reason_code, "none")}`
+        : "No current historical repair";
       document.getElementById("history-repair-pause").textContent = paused
         ? `Paused: ${text(progress.reason_code, "historical_error")}; consecutive quality failures ${text(progress.consecutive_quality_failures, "0")}`
         : `Lane active; consecutive quality failures ${text(progress.consecutive_quality_failures, "0")}`;

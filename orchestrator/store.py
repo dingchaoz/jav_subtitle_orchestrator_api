@@ -392,13 +392,14 @@ class HistoricalLaneState:
 
 
 @dataclass(frozen=True)
-class HistoricalRepairDashboardActive:
+class HistoricalRepairDashboardCurrent:
     batch_id: str
     repair_id: str
     job_id: str
     movie_number: str
     stage: str
     state: str
+    reason_code: str | None
     worker_id: str | None
     updated_at: str
 
@@ -406,16 +407,19 @@ class HistoricalRepairDashboardActive:
 @dataclass(frozen=True)
 class HistoricalRepairDashboardSnapshot:
     total: int
+    planned: int
     pending: int
     running: int
     retry_wait: int
+    paused: int
     succeeded: int
     permanent_failed: int
+    unknown: int
     lane_paused: bool
     reason_code: str | None
     consecutive_quality_failures: int
     updated_at: str | None
-    active: HistoricalRepairDashboardActive | None
+    current: HistoricalRepairDashboardCurrent | None
 
 
 def _create_historical_translation_repairs_table(
@@ -2353,16 +2357,24 @@ class JobStore:
                 """
                 SELECT
                   COUNT(*) AS total,
+                  COALESCE(SUM(CASE WHEN state = 'planned' THEN 1 ELSE 0 END), 0)
+                    AS planned,
                   COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0)
                     AS pending,
                   COALESCE(SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END), 0)
                     AS running,
                   COALESCE(SUM(CASE WHEN state = 'retry_wait' THEN 1 ELSE 0 END), 0)
                     AS retry_wait,
+                  COALESCE(SUM(CASE WHEN state = 'paused' THEN 1 ELSE 0 END), 0)
+                    AS paused,
                   COALESCE(SUM(CASE WHEN state = 'succeeded' THEN 1 ELSE 0 END), 0)
                     AS succeeded,
                   COALESCE(SUM(CASE WHEN state = 'permanent_failed' THEN 1 ELSE 0 END), 0)
                     AS permanent_failed,
+                  COALESCE(SUM(CASE WHEN state NOT IN (
+                    'planned', 'pending', 'running', 'retry_wait', 'paused',
+                    'succeeded', 'permanent_failed'
+                  ) THEN 1 ELSE 0 END), 0) AS unknown,
                   (SELECT COUNT(*) FROM historical_repair_control
                      WHERE singleton = 1) AS control_present,
                   (SELECT paused FROM historical_repair_control
@@ -2378,43 +2390,68 @@ class JobStore:
                 """
             ).fetchone()
             assert aggregate is not None
-            active_row = None
-            if aggregate["running"]:
-                active_row = conn.execute(
+            current_row = None
+            nonterminal = sum(
+                aggregate[state]
+                for state in (
+                    "planned",
+                    "pending",
+                    "running",
+                    "retry_wait",
+                    "paused",
+                    "unknown",
+                )
+            )
+            if nonterminal:
+                current_row = conn.execute(
                     """
                     SELECT r.batch_id, r.id AS repair_id, r.job_id,
-                           r.movie_code, r.state, j.status AS stage,
-                           j.claimed_by AS worker_id, j.updated_at
+                           r.movie_code, r.state, r.reason_code,
+                           COALESCE(j.status, 'historical_error') AS stage,
+                           j.claimed_by AS worker_id,
+                           COALESCE(j.updated_at, r.updated_at) AS updated_at
                     FROM historical_translation_repairs AS r
-                    JOIN jobs AS j ON j.id = r.job_id
-                    WHERE r.state = 'running'
-                    ORDER BY r.created_at ASC, r.id ASC
+                    LEFT JOIN jobs AS j ON j.id = r.job_id
+                    WHERE r.state NOT IN ('succeeded', 'permanent_failed')
+                    ORDER BY CASE r.state
+                               WHEN 'running' THEN 0
+                               WHEN 'retry_wait' THEN 1
+                               WHEN 'pending' THEN 2
+                               WHEN 'paused' THEN 3
+                               WHEN 'planned' THEN 4
+                               ELSE 5
+                             END,
+                             r.created_at ASC, r.id ASC
                     LIMIT 1
                     """
                 ).fetchone()
 
         control_present = bool(aggregate["control_present"])
-        active = (
-            HistoricalRepairDashboardActive(
-                batch_id=active_row["batch_id"],
-                repair_id=active_row["repair_id"],
-                job_id=active_row["job_id"],
-                movie_number=active_row["movie_code"],
-                stage=active_row["stage"],
-                state=active_row["state"],
-                worker_id=active_row["worker_id"],
-                updated_at=active_row["updated_at"],
+        current = (
+            HistoricalRepairDashboardCurrent(
+                batch_id=current_row["batch_id"],
+                repair_id=current_row["repair_id"],
+                job_id=current_row["job_id"],
+                movie_number=current_row["movie_code"],
+                stage=current_row["stage"],
+                state=current_row["state"],
+                reason_code=current_row["reason_code"],
+                worker_id=current_row["worker_id"],
+                updated_at=current_row["updated_at"],
             )
-            if active_row is not None
+            if current_row is not None
             else None
         )
         return HistoricalRepairDashboardSnapshot(
             total=aggregate["total"],
+            planned=aggregate["planned"],
             pending=aggregate["pending"],
             running=aggregate["running"],
             retry_wait=aggregate["retry_wait"],
+            paused=aggregate["paused"],
             succeeded=aggregate["succeeded"],
             permanent_failed=aggregate["permanent_failed"],
+            unknown=aggregate["unknown"],
             lane_paused=(
                 bool(aggregate["lane_paused"]) if control_present else True
             ),
@@ -2429,7 +2466,7 @@ class JobStore:
                 else 0
             ),
             updated_at=(aggregate["control_updated_at"] if control_present else None),
-            active=active,
+            current=current,
         )
 
     def record_historical_quality_failure(self, limit: int) -> HistoricalLaneState:

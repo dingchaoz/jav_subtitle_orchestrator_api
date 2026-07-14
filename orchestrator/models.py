@@ -161,20 +161,24 @@ class WorkerHealthSummary(BaseModel):
 
 class HistoricalRepairDashboardCounts(BaseModel):
     total: int = 0
+    planned: int = 0
     pending: int = 0
     running: int = 0
     retry_wait: int = 0
+    paused: int = 0
     succeeded: int = 0
     permanent_failed: int = 0
+    unknown: int = 0
 
 
-class HistoricalRepairDashboardActive(BaseModel):
+class HistoricalRepairDashboardCurrent(BaseModel):
     batch_id: str
     repair_id: str
     job_id: str
     movie_number: str
     stage: str
     state: str
+    reason_code: str | None = None
     updated_at: str
 
 
@@ -182,7 +186,7 @@ class HistoricalRepairDashboardProgress(BaseModel):
     counts: HistoricalRepairDashboardCounts = Field(
         default_factory=HistoricalRepairDashboardCounts
     )
-    active: HistoricalRepairDashboardActive | None = None
+    current: HistoricalRepairDashboardCurrent | None = None
     lane_paused: bool = False
     reason_code: str | None = None
     consecutive_quality_failures: int = 0
