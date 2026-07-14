@@ -3,7 +3,7 @@ import os
 import plistlib
 import sys
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -332,6 +332,51 @@ def test_mac_downloader_worker_id_is_stable_and_configurable(monkeypatch):
     assert configured.mac_download_worker_id == "mac-downloader-stable"
 
 
+@pytest.mark.parametrize("preserve_worker_error", [False, True])
+def test_release_worker_lock_cleanup_error_semantics(
+    caplog,
+    preserve_worker_error,
+):
+    from orchestrator import __main__ as cli
+
+    cleanup_error = RuntimeError("lock cleanup failed")
+
+    class FailingLock:
+        def release(self):
+            raise cleanup_error
+
+    if not preserve_worker_error:
+        with pytest.raises(RuntimeError, match="^lock cleanup failed$") as caught:
+            cli._release_worker_lock(
+                FailingLock(),
+                preserve_worker_error=False,
+            )
+        assert caught.value is cleanup_error
+        return
+
+    caplog.set_level("ERROR", logger=cli.LOGGER.name)
+    preserved_worker_error = None
+    try:
+        raise RuntimeError("worker failed")
+    except RuntimeError as worker_error:
+        preserved_worker_error = worker_error
+        cli._release_worker_lock(
+            FailingLock(),
+            preserve_worker_error=True,
+        )
+
+    assert str(preserved_worker_error) == "worker failed"
+    cleanup_records = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "worker lock cleanup failed while preserving worker error"
+    ]
+    assert len(cleanup_records) == 1
+    assert cleanup_records[0].exc_info is not None
+    assert cleanup_records[0].exc_info[1] is cleanup_error
+
+
 def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
     monkeypatch, tmp_path
 ):
@@ -624,46 +669,15 @@ def test_translation_runtime_preserves_worker_error_when_lock_release_also_fails
     assert events[-2:] == ["run_forever", "lock_release"]
 
 
-def test_one_shot_translation_entrypoint_executes_without_importing_process_lock(
-    monkeypatch, tmp_path
-):
+def test_one_shot_cli_dispatcher_does_not_import_process_lock(monkeypatch):
     from orchestrator import __main__ as cli
 
     events: list[str] = []
-    ready_status = object()
 
     class ExplodingProcessLockModule(ModuleType):
         def __getattr__(self, name):
-            raise AssertionError(f"one-shot imported process_lock.{name}")
+            raise AssertionError(f"dispatcher imported process_lock.{name}")
 
-    FakeSettings = translation_settings_type(tmp_path)
-
-    class FakeStore:
-        def __init__(self, *_args):
-            events.append("store")
-
-        def initialize(self):
-            events.append("store_initialize")
-
-        def get_job(self, job_id):
-            events.append(f"get_job:{job_id}")
-            return SimpleNamespace(status=ready_status)
-
-    class FakeTranslator:
-        def __init__(self, _script):
-            events.append("translator")
-
-    class FakeWorker:
-        def __init__(self, _store, _translator, **_kwargs):
-            events.append("worker")
-
-        def process_job_id(self, job_id):
-            events.append(f"process_job_id:{job_id}")
-
-    monkeypatch.setattr(cli, "build_supabase_publisher", lambda _settings: object())
-    monkeypatch.setattr(cli, "build_catalog_sync_client", lambda _settings: object())
-    monkeypatch.setattr(cli, "_export_mac_translation_runtime_env", lambda _settings: None)
-    monkeypatch.setattr(cli, "_run_mac_translation_smoke", lambda _settings, _translator: None)
     exploding_process_lock = ExplodingProcessLockModule("orchestrator.process_lock")
     monkeypatch.setitem(
         sys.modules,
@@ -678,35 +692,30 @@ def test_one_shot_translation_entrypoint_executes_without_importing_process_lock
         exploding_process_lock,
         raising=False,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "orchestrator.config",
-        module_with(MacSettings=FakeSettings),
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda: events.append("configure_logging"),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "orchestrator.mac_worker",
-        module_with(MacTranslationWorker=FakeWorker),
+    monkeypatch.setattr(
+        cli,
+        "run_mac_translation_worker_once",
+        lambda job_id: events.append(f"run_once:{job_id}"),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "orchestrator.models",
-        module_with(JobStatus=SimpleNamespace(ENGLISH_SRT_READY=ready_status)),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "orchestrator.store",
-        module_with(JobStore=FakeStore),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "orchestrator.translation",
-        module_with(SubtitleTranslator=FakeTranslator),
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "orchestrator",
+            "mac-translation-worker-once",
+            "--job-id",
+            "job-safe",
+        ],
     )
 
-    cli.run_mac_translation_worker_once("job-safe")
+    cli.main()
 
-    assert events[-2:] == ["process_job_id:job-safe", "get_job:job-safe"]
+    assert events == ["configure_logging", "run_once:job-safe"]
 
 
 def test_launchd_installer_is_scoped_to_exact_worker_services():
@@ -719,10 +728,10 @@ def test_launchd_installer_is_scoped_to_exact_worker_services():
     assert "set -euo pipefail" in script
     assert f"{downloader}.plist" in script
     assert f"{translator}.plist" in script
-    assert f'plutil -lint "$SOURCE_DOWNLOADER" >/dev/null' in script
-    assert f'plutil -lint "$SOURCE_TRANSLATOR" >/dev/null' in script
-    assert 'plutil -lint "$SOURCE_DOWNLOADER" >/dev/null 2>&1' not in script
-    assert 'plutil -lint "$SOURCE_TRANSLATOR" >/dev/null 2>&1' not in script
+    assert f'plutil -lint -s "$SOURCE_DOWNLOADER"' in script
+    assert f'plutil -lint -s "$SOURCE_TRANSLATOR"' in script
+    assert 'plutil -lint -s "$SOURCE_DOWNLOADER" >/dev/null' not in script
+    assert 'plutil -lint -s "$SOURCE_TRANSLATOR" >/dev/null' not in script
     assert 'launchctl bootout "$DOMAIN/$DOWNLOADER_LABEL"' in script
     assert 'launchctl bootout "$DOMAIN/$TRANSLATOR_LABEL"' in script
     assert 'launchctl bootstrap "$DOMAIN" "$DEST_DOWNLOADER"' in script
