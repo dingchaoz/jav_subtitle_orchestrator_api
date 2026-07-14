@@ -216,6 +216,7 @@ cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
     MAC_TRANSLATION_PUBLISH_ENABLED
   .venv/bin/python - <<'PY'
 import re
+import socket
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -242,6 +243,10 @@ def production_url(value: object) -> bool:
         address = ip_address(host)
     except ValueError:
         address = None
+    try:
+        legacy_ipv4_host = address is None and bool(socket.inet_aton(host))
+    except OSError:
+        legacy_ipv4_host = False
     loopback = address is not None and address.is_loopback
     numeric_host = re.fullmatch(r"[0-9.]+", host) is not None
     noncanonical_numeric_host = numeric_host and address is None
@@ -255,6 +260,7 @@ def production_url(value: object) -> bool:
     placeholder_host = (
         not host
         or loopback
+        or legacy_ipv4_host
         or noncanonical_numeric_host
         or decimal_integer_host
         or host in {"example", "invalid", "test", "localhost"}
