@@ -11,8 +11,8 @@ DOWNLOADER_LABEL="com.javsubtitle.mac-worker"
 TRANSLATOR_LABEL="com.javsubtitle.mac-translation-worker"
 DOMAIN="gui/$(id -u)"
 
-plutil -lint "$SOURCE_DOWNLOADER"
-plutil -lint "$SOURCE_TRANSLATOR"
+plutil -lint "$SOURCE_DOWNLOADER" >/dev/null
+plutil -lint "$SOURCE_TRANSLATOR" >/dev/null
 
 mkdir -p "$LAUNCH_AGENTS" "$ROOT/logs"
 install -m 0644 "$SOURCE_DOWNLOADER" "$DEST_DOWNLOADER"
@@ -21,10 +21,11 @@ install -m 0644 "$SOURCE_TRANSLATOR" "$DEST_TRANSLATOR"
 if launchctl print "$DOMAIN/$DOWNLOADER_LABEL" >/dev/null 2>&1; then
     launchctl bootout "$DOMAIN/$DOWNLOADER_LABEL"
 fi
+launchctl bootstrap "$DOMAIN" "$DEST_DOWNLOADER"
+
 if launchctl print "$DOMAIN/$TRANSLATOR_LABEL" >/dev/null 2>&1; then
     launchctl bootout "$DOMAIN/$TRANSLATOR_LABEL"
 fi
-launchctl bootstrap "$DOMAIN" "$DEST_DOWNLOADER"
 launchctl bootstrap "$DOMAIN" "$DEST_TRANSLATOR"
 
 printf 'label=%s\n' "$DOWNLOADER_LABEL"

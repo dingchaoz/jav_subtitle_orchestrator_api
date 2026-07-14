@@ -269,11 +269,21 @@ def run_api() -> None:
     uvicorn.run(app, host=settings.host, port=settings.port)
 
 
+def _release_worker_lock(lock, *, preserve_worker_error: bool) -> None:
+    try:
+        lock.release()
+    except BaseException:
+        if not preserve_worker_error:
+            raise
+        LOGGER.exception("worker lock cleanup failed while preserving worker error")
+
+
 def run_mac_worker() -> None:
     from orchestrator.config import PROJECT_ROOT, MacSettings
     from orchestrator.process_lock import SingleInstanceLock
 
     lock = SingleInstanceLock(PROJECT_ROOT / "data" / "mac-worker.lock").acquire()
+    worker_failed = False
     try:
         from orchestrator.mac_worker import MacDownloadWorker, run_forever as run_mac_forever
         from orchestrator.missav_adapter import MissAVAdapter
@@ -289,8 +299,11 @@ def run_mac_worker() -> None:
             worker_id=settings.mac_download_worker_id,
         )
         run_mac_forever(worker)
+    except BaseException:
+        worker_failed = True
+        raise
     finally:
-        lock.release()
+        _release_worker_lock(lock, preserve_worker_error=worker_failed)
 
 
 def _export_windows_runtime_env(settings) -> None:
@@ -388,6 +401,7 @@ def run_mac_translation_worker() -> None:
     lock = SingleInstanceLock(
         PROJECT_ROOT / "data" / "mac-translation-worker.lock"
     ).acquire()
+    worker_failed = False
     try:
         from orchestrator.mac_worker import (
             MacTranslationWorker,
@@ -419,8 +433,11 @@ def run_mac_translation_worker() -> None:
             catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
         )
         run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
+    except BaseException:
+        worker_failed = True
+        raise
     finally:
-        lock.release()
+        _release_worker_lock(lock, preserve_worker_error=worker_failed)
 
 
 def run_mac_translation_worker_once(job_id: str) -> None:

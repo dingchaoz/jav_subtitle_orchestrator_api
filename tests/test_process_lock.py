@@ -1,9 +1,9 @@
-import inspect
+import fcntl
 import os
 import plistlib
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -22,6 +22,94 @@ def module_with(**attributes: object) -> ModuleType:
     for name, value in attributes.items():
         setattr(module, name, value)
     return module
+
+
+def recording_lock_type(events: list[object], *, release_error: BaseException | None = None):
+    class RecordingLock:
+        def __init__(self, path):
+            events.append(("lock_path", path))
+
+        def acquire(self):
+            events.append("lock_acquire")
+            return self
+
+        def release(self):
+            events.append("lock_release")
+            if release_error is not None:
+                raise release_error
+
+    return RecordingLock
+
+
+def translation_settings_type(tmp_path: Path, events: list[object] | None = None):
+    class FakeTranslationSettings:
+        def __init__(self):
+            if events is not None:
+                events.append("settings")
+            self.db_path = tmp_path / "jobs.sqlite3"
+            self.jobs_root_mac = tmp_path / "jobs"
+            self.jobs_root_windows = "M:\\"
+            self.mac_translate_script_path = "translate.py"
+            self.mac_translation_worker_id = "mac-translation-stable"
+            self.mac_translation_lease_seconds = 1800
+            self.max_translation_attempts = 3
+            self.translation_quality_failure_limit = 3
+            self.max_publish_attempts = 10
+            self.mac_publish_retry_seconds = 30
+            self.max_catalog_sync_attempts = 10
+            self.catalog_sync_retry_seconds = 30
+            self.mac_translation_poll_interval_seconds = 10
+
+    return FakeTranslationSettings
+
+
+class FailingPersistenceHandle:
+    def __init__(self, handle, failing_operation: str):
+        self.handle = handle
+        self.failing_operation = failing_operation
+
+    @property
+    def closed(self) -> bool:
+        return self.handle.closed
+
+    def fileno(self) -> int:
+        return self.handle.fileno()
+
+    def seek(self, offset: int):
+        if self.failing_operation == "seek":
+            raise OSError("pid seek failed")
+        return self.handle.seek(offset)
+
+    def truncate(self):
+        if self.failing_operation == "truncate":
+            raise OSError("pid truncate failed")
+        return self.handle.truncate()
+
+    def write(self, value: str):
+        if self.failing_operation == "write":
+            raise OSError("pid write failed")
+        return self.handle.write(value)
+
+    def flush(self):
+        if self.failing_operation == "flush":
+            raise OSError("pid flush failed")
+        return self.handle.flush()
+
+    def close(self):
+        return self.handle.close()
+
+
+class FailingCloseHandle:
+    def __init__(self, error: BaseException):
+        self.error = error
+        self.close_calls = 0
+
+    def fileno(self) -> int:
+        return 123
+
+    def close(self) -> None:
+        self.close_calls += 1
+        raise self.error
 
 
 def test_second_lock_for_same_worker_is_rejected(tmp_path):
@@ -47,6 +135,108 @@ def test_lock_creates_parent_writes_pid_and_release_is_idempotent(tmp_path):
     lock.release()
     replacement = SingleInstanceLock(lock_path).acquire()
     replacement.release()
+
+
+@pytest.mark.parametrize("failing_operation", ["seek", "truncate", "write", "flush"])
+def test_pid_persistence_failure_releases_lock_and_propagates_original_error(
+    tmp_path, monkeypatch, failing_operation
+):
+    from orchestrator.process_lock import SingleInstanceLock
+
+    lock_path = tmp_path / "worker.lock"
+    real_open = Path.open
+    wrapped_handles: list[FailingPersistenceHandle] = []
+
+    def fail_first_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if path == lock_path and not wrapped_handles:
+            wrapped = FailingPersistenceHandle(handle, failing_operation)
+            wrapped_handles.append(wrapped)
+            return wrapped
+        return handle
+
+    monkeypatch.setattr(Path, "open", fail_first_open)
+    lock = SingleInstanceLock(lock_path)
+
+    with pytest.raises(OSError, match=f"^pid {failing_operation} failed$"):
+        lock.acquire()
+
+    assert lock.handle is None
+    assert wrapped_handles[0].closed is True
+    replacement = SingleInstanceLock(lock_path).acquire()
+    replacement.release()
+
+
+def test_release_closes_and_detaches_handle_when_unlock_fails(tmp_path, monkeypatch):
+    from orchestrator.process_lock import SingleInstanceLock
+
+    lock_path = tmp_path / "worker.lock"
+    lock = SingleInstanceLock(lock_path).acquire()
+    handle = lock.handle
+    real_flock = fcntl.flock
+    unlock_error = OSError("unlock failed")
+
+    def fail_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise unlock_error
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fail_unlock)
+    try:
+        with pytest.raises(OSError, match="^unlock failed$") as caught:
+            lock.release()
+    finally:
+        monkeypatch.setattr(fcntl, "flock", real_flock)
+        if handle is not None and not handle.closed:
+            handle.close()
+
+    assert caught.value is unlock_error
+    assert lock.handle is None
+    assert handle is not None and handle.closed is True
+    replacement = SingleInstanceLock(lock_path).acquire()
+    replacement.release()
+
+
+def test_release_detaches_handle_and_does_not_retry_after_close_failure(monkeypatch, tmp_path):
+    from orchestrator.process_lock import SingleInstanceLock
+
+    close_error = OSError("close failed")
+    handle = FailingCloseHandle(close_error)
+    lock = SingleInstanceLock(tmp_path / "worker.lock")
+    lock.handle = handle
+    monkeypatch.setattr(fcntl, "flock", lambda _fd, _operation: None)
+
+    with pytest.raises(OSError, match="^close failed$") as caught:
+        lock.release()
+
+    assert caught.value is close_error
+    assert lock.handle is None
+    lock.release()
+    assert handle.close_calls == 1
+
+
+def test_release_preserves_unlock_error_when_unlock_and_close_both_fail(
+    monkeypatch, tmp_path
+):
+    from orchestrator.process_lock import SingleInstanceLock
+
+    unlock_error = OSError("unlock failed")
+    close_error = OSError("close failed")
+    handle = FailingCloseHandle(close_error)
+    lock = SingleInstanceLock(tmp_path / "worker.lock")
+    lock.handle = handle
+
+    def fail_unlock(_fd, _operation):
+        raise unlock_error
+
+    monkeypatch.setattr(fcntl, "flock", fail_unlock)
+
+    with pytest.raises(OSError, match="^unlock failed$") as caught:
+        lock.release()
+
+    assert caught.value is unlock_error
+    assert lock.handle is None
+    assert handle.close_calls == 1
 
 
 def test_different_worker_locks_can_be_held_and_reacquired_together(tmp_path):
@@ -148,17 +338,7 @@ def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
     from orchestrator import __main__ as cli
 
     events: list[object] = []
-
-    class FakeLock:
-        def __init__(self, path):
-            events.append(("lock_path", path))
-
-        def acquire(self):
-            events.append("lock_acquire")
-            return self
-
-        def release(self):
-            events.append("lock_release")
+    FakeLock = recording_lock_type(events)
 
     class FakeSettings:
         def __init__(self):
@@ -228,17 +408,7 @@ def test_downloader_runtime_releases_lock_when_store_initialization_fails(
     from orchestrator import __main__ as cli
 
     events: list[object] = []
-
-    class FakeLock:
-        def __init__(self, path):
-            events.append(("lock_path", path))
-
-        def acquire(self):
-            events.append("lock_acquire")
-            return self
-
-        def release(self):
-            events.append("lock_release")
+    FakeLock = recording_lock_type(events)
 
     class FakeSettings:
         def __init__(self):
@@ -300,34 +470,8 @@ def test_translation_runtime_holds_a_distinct_lock_before_smoke_or_store(
     from orchestrator import __main__ as cli
 
     events: list[object] = []
-
-    class FakeLock:
-        def __init__(self, path):
-            events.append(("lock_path", path))
-
-        def acquire(self):
-            events.append("lock_acquire")
-            return self
-
-        def release(self):
-            events.append("lock_release")
-
-    class FakeSettings:
-        def __init__(self):
-            events.append("settings")
-            self.db_path = tmp_path / "jobs.sqlite3"
-            self.jobs_root_mac = tmp_path / "jobs"
-            self.jobs_root_windows = "M:\\"
-            self.mac_translate_script_path = "translate.py"
-            self.mac_translation_worker_id = "mac-translation-stable"
-            self.mac_translation_lease_seconds = 1800
-            self.max_translation_attempts = 3
-            self.translation_quality_failure_limit = 3
-            self.max_publish_attempts = 10
-            self.mac_publish_retry_seconds = 30
-            self.max_catalog_sync_attempts = 10
-            self.catalog_sync_retry_seconds = 30
-            self.mac_translation_poll_interval_seconds = 10
+    FakeLock = recording_lock_type(events)
+    FakeSettings = translation_settings_type(tmp_path, events)
 
     class FakeStore:
         def __init__(self, *_args):
@@ -409,40 +553,17 @@ def test_translation_runtime_holds_a_distinct_lock_before_smoke_or_store(
     assert events[-2:] == ["run_forever", "lock_release"]
 
 
-def test_translation_runtime_releases_lock_when_run_forever_fails(
+def test_translation_runtime_preserves_worker_error_when_lock_release_also_fails(
     monkeypatch, tmp_path
 ):
     from orchestrator import __main__ as cli
 
     events: list[object] = []
-
-    class FakeLock:
-        def __init__(self, path):
-            events.append(("lock_path", path))
-
-        def acquire(self):
-            events.append("lock_acquire")
-            return self
-
-        def release(self):
-            events.append("lock_release")
-
-    class FakeSettings:
-        def __init__(self):
-            events.append("settings")
-            self.db_path = tmp_path / "jobs.sqlite3"
-            self.jobs_root_mac = tmp_path / "jobs"
-            self.jobs_root_windows = "M:\\"
-            self.mac_translate_script_path = "translate.py"
-            self.mac_translation_worker_id = "mac-translation-stable"
-            self.mac_translation_lease_seconds = 1800
-            self.max_translation_attempts = 3
-            self.translation_quality_failure_limit = 3
-            self.max_publish_attempts = 10
-            self.mac_publish_retry_seconds = 30
-            self.max_catalog_sync_attempts = 10
-            self.catalog_sync_retry_seconds = 30
-            self.mac_translation_poll_interval_seconds = 10
+    FakeLock = recording_lock_type(
+        events,
+        release_error=RuntimeError("lock release failed"),
+    )
+    FakeSettings = translation_settings_type(tmp_path, events)
 
     class FakeStore:
         def __init__(self, *_args):
@@ -503,13 +624,89 @@ def test_translation_runtime_releases_lock_when_run_forever_fails(
     assert events[-2:] == ["run_forever", "lock_release"]
 
 
-def test_one_shot_translation_entrypoint_does_not_take_persistent_lock():
-    from orchestrator.__main__ import run_mac_translation_worker_once
+def test_one_shot_translation_entrypoint_executes_without_importing_process_lock(
+    monkeypatch, tmp_path
+):
+    from orchestrator import __main__ as cli
 
-    source = inspect.getsource(run_mac_translation_worker_once)
+    events: list[str] = []
+    ready_status = object()
 
-    assert "SingleInstanceLock" not in source
-    assert "mac-translation-worker.lock" not in source
+    class ExplodingProcessLockModule(ModuleType):
+        def __getattr__(self, name):
+            raise AssertionError(f"one-shot imported process_lock.{name}")
+
+    FakeSettings = translation_settings_type(tmp_path)
+
+    class FakeStore:
+        def __init__(self, *_args):
+            events.append("store")
+
+        def initialize(self):
+            events.append("store_initialize")
+
+        def get_job(self, job_id):
+            events.append(f"get_job:{job_id}")
+            return SimpleNamespace(status=ready_status)
+
+    class FakeTranslator:
+        def __init__(self, _script):
+            events.append("translator")
+
+    class FakeWorker:
+        def __init__(self, _store, _translator, **_kwargs):
+            events.append("worker")
+
+        def process_job_id(self, job_id):
+            events.append(f"process_job_id:{job_id}")
+
+    monkeypatch.setattr(cli, "build_supabase_publisher", lambda _settings: object())
+    monkeypatch.setattr(cli, "build_catalog_sync_client", lambda _settings: object())
+    monkeypatch.setattr(cli, "_export_mac_translation_runtime_env", lambda _settings: None)
+    monkeypatch.setattr(cli, "_run_mac_translation_smoke", lambda _settings, _translator: None)
+    exploding_process_lock = ExplodingProcessLockModule("orchestrator.process_lock")
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.process_lock",
+        exploding_process_lock,
+    )
+    import orchestrator as orchestrator_package
+
+    monkeypatch.setattr(
+        orchestrator_package,
+        "process_lock",
+        exploding_process_lock,
+        raising=False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.config",
+        module_with(MacSettings=FakeSettings),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.mac_worker",
+        module_with(MacTranslationWorker=FakeWorker),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.models",
+        module_with(JobStatus=SimpleNamespace(ENGLISH_SRT_READY=ready_status)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.store",
+        module_with(JobStore=FakeStore),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.translation",
+        module_with(SubtitleTranslator=FakeTranslator),
+    )
+
+    cli.run_mac_translation_worker_once("job-safe")
+
+    assert events[-2:] == ["process_job_id:job-safe", "get_job:job-safe"]
 
 
 def test_launchd_installer_is_scoped_to_exact_worker_services():
@@ -522,8 +719,10 @@ def test_launchd_installer_is_scoped_to_exact_worker_services():
     assert "set -euo pipefail" in script
     assert f"{downloader}.plist" in script
     assert f"{translator}.plist" in script
-    assert f'plutil -lint "$SOURCE_DOWNLOADER"' in script
-    assert f'plutil -lint "$SOURCE_TRANSLATOR"' in script
+    assert f'plutil -lint "$SOURCE_DOWNLOADER" >/dev/null' in script
+    assert f'plutil -lint "$SOURCE_TRANSLATOR" >/dev/null' in script
+    assert 'plutil -lint "$SOURCE_DOWNLOADER" >/dev/null 2>&1' not in script
+    assert 'plutil -lint "$SOURCE_TRANSLATOR" >/dev/null 2>&1' not in script
     assert 'launchctl bootout "$DOMAIN/$DOWNLOADER_LABEL"' in script
     assert 'launchctl bootout "$DOMAIN/$TRANSLATOR_LABEL"' in script
     assert 'launchctl bootstrap "$DOMAIN" "$DEST_DOWNLOADER"' in script
@@ -534,3 +733,28 @@ def test_launchd_installer_is_scoped_to_exact_worker_services():
     assert ".env" not in script
     assert "token" not in script.lower()
     assert "api" not in script.lower()
+
+
+def test_launchd_installer_completes_downloader_before_stopping_translator():
+    script = (
+        PROJECT_ROOT / "scripts" / "install_mac_worker_launchd.sh"
+    ).read_text(encoding="utf-8")
+
+    downloader_bootout = script.index(
+        'launchctl bootout "$DOMAIN/$DOWNLOADER_LABEL"'
+    )
+    downloader_bootstrap = script.index(
+        'launchctl bootstrap "$DOMAIN" "$DEST_DOWNLOADER"'
+    )
+    translator_bootout = script.index(
+        'launchctl bootout "$DOMAIN/$TRANSLATOR_LABEL"'
+    )
+    translator_bootstrap = script.index(
+        'launchctl bootstrap "$DOMAIN" "$DEST_TRANSLATOR"'
+    )
+    assert (
+        downloader_bootout
+        < downloader_bootstrap
+        < translator_bootout
+        < translator_bootstrap
+    )
