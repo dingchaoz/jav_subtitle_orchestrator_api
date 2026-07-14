@@ -583,6 +583,50 @@ def run_enqueue_translation_only_repair_batch(
     )
 
 
+def run_translation_only_repair_supervisor(
+    *,
+    allowlist_file: Path,
+    work_dir: Path,
+    batch_size: int,
+    max_jobs: int,
+    execute: bool,
+    confirm_remaining_count: int | None,
+    verify_public_api: bool,
+    poll_interval_seconds: int,
+    batch_timeout_seconds: int,
+) -> None:
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+    from orchestrator.translation_only_supervisor import (
+        TranslationOnlySupervisorConfig,
+        run_translation_only_supervisor,
+    )
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    result = run_translation_only_supervisor(
+        store,
+        TranslationOnlySupervisorConfig(
+            allowlist_file=allowlist_file,
+            work_dir=work_dir,
+            batch_size=batch_size,
+            max_jobs=max_jobs,
+            execute=execute,
+            confirm_remaining_count=confirm_remaining_count,
+            verify_public_api=verify_public_api,
+            poll_interval_seconds=poll_interval_seconds,
+            batch_timeout_seconds=batch_timeout_seconds,
+        ),
+    )
+    print(
+        f"action={result.action} remaining_count={result.remaining_count} "
+        f"enqueued={result.enqueued_count} completed={result.completed_count} "
+        f"failed={result.failed_count} batches={result.batches} "
+        f"receipt_file={result.receipt_file or ''} "
+        f"reason_code={result.reason_code or ''}"
+    )
+
+
 def run_plan_catalog_repairs(
     *, allowlist: set[str] | None, limit: int
 ) -> None:
@@ -896,6 +940,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     translation_batch_enqueue.add_argument("--plan-file", type=Path, required=True)
     translation_batch_enqueue.add_argument("--confirm-plan-sha256", required=True)
+    translation_supervisor = subcommands.add_parser(
+        "run-translation-only-repair-supervisor"
+    )
+    translation_supervisor.add_argument("--allowlist-file", type=Path, required=True)
+    translation_supervisor.add_argument("--work-dir", type=Path, required=True)
+    translation_supervisor.add_argument(
+        "--batch-size", type=int, choices=range(1, 21), required=True
+    )
+    translation_supervisor.add_argument("--max-jobs", type=int, required=True)
+    translation_supervisor.add_argument("--execute", action="store_true")
+    translation_supervisor.add_argument("--confirm-remaining-count", type=int)
+    translation_supervisor.add_argument("--verify-public-api", action="store_true")
+    translation_supervisor.add_argument(
+        "--poll-interval-seconds", type=int, default=30
+    )
+    translation_supervisor.add_argument(
+        "--batch-timeout-seconds", type=int, default=3600
+    )
     controller = subcommands.add_parser("historical-repair-controller")
     controller.add_argument("--allowlist-file", type=Path, required=True)
     controller.add_argument(
@@ -1004,6 +1066,18 @@ def main() -> None:
         run_enqueue_translation_only_repair_batch(
             plan_file=args.plan_file,
             confirm_plan_sha256=args.confirm_plan_sha256,
+        )
+    elif args.command == "run-translation-only-repair-supervisor":
+        run_translation_only_repair_supervisor(
+            allowlist_file=args.allowlist_file,
+            work_dir=args.work_dir,
+            batch_size=args.batch_size,
+            max_jobs=args.max_jobs,
+            execute=args.execute,
+            confirm_remaining_count=args.confirm_remaining_count,
+            verify_public_api=args.verify_public_api,
+            poll_interval_seconds=args.poll_interval_seconds,
+            batch_timeout_seconds=args.batch_timeout_seconds,
         )
     elif args.command == "historical-repair-controller":
         raise SystemExit(
