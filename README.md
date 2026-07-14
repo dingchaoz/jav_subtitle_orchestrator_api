@@ -16,20 +16,18 @@ Version 1 target:
 
 ## Metadata-resilient publication
 
-When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the Mac path after Windows
-transcription is:
+The complete normal production path is:
 
 ```text
-transcription_done
-→ translating
-→ quality gate
-→ publish_pending
-→ publishing
-→ ensure public.movies (MissAV/local metadata or code-only placeholder)
-→ upsert the English_AI SRT in Storage
-→ upsert and verify movie_languages
-→ english_srt_ready
+audio_ready → transcription_claimed → transcribing → transcription_done
+→ translating → publish_pending → publishing
+→ catalog_sync_pending → catalog_syncing → english_srt_ready
 ```
+
+Windows owns the transcription states. The single Mac translation worker owns
+translation, its quality gate, verified Supabase publication, and javsubtitle.com
+catalog synchronization. `english_srt_ready` is the terminal production state only
+after both remote systems verify successfully.
 
 When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker remains in
 local-only compatibility mode. It skips `publish_pending`, `publishing`, catalog
@@ -39,13 +37,21 @@ the local English SRT passed the quality gate, not that Supabase was verified.
 A code-only `placeholder` catalog row is a successful publication result, not a
 translation failure. It has a stable movie UUID and can be enriched later without
 changing subtitle ownership when publication is enabled. Publication retries
-preserve the quality-approved English SRT and audio instead of translating again.
+preserve the quality-approved English SRT and audio instead of translating again;
+catalog retries resume from `catalog_sync_pending` without republishing or
+retranslating.
 
 The repository migration and worker flow do not imply that the migration has been
-deployed. Production RPC behavior remains unverified until the Task 10 deployment
-and one-canary gate is explicitly approved and completed. See the
+deployed. Production behavior remains unverified until a separately approved
+deployment and one-canary gate are completed. See the
 [Mac setup and deployment runbook](docs/setup/mac.md) for failure semantics,
-dry-run planning, and approval boundaries.
+exact audio recovery, immutable dry-run plans, the normal-first historical
+controller, launchd operations, pause/resume, rollback, and approval boundaries.
+
+The historical repair allowlist currently has 340 lines, but that is input evidence,
+not an affected-job count. The authoritative affected count is `eligible_total` in a
+fresh `plan-historical-repair-batch` dry-run; report its `already_repaired`,
+`ineligible`, and `blocked` totals alongside it.
 
 ## Version 1 Run Commands
 

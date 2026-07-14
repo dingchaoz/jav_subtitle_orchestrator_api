@@ -16,6 +16,7 @@ MISSAV_PIPELINE_ROOT=/Users/ytt/Documents/startup/MissAV-Pipeline
 JOBS_ROOT_MAC=/Users/ytt/MissAVJobs
 JOBS_ROOT_WINDOWS=M:\
 MAC_DOWNLOAD_CONCURRENCY=1
+MAC_DOWNLOAD_WORKER_ID=mac-downloader-1
 WORKER_LEASE_SECONDS=1800
 MAX_DOWNLOAD_ATTEMPTS=3
 MAX_WORKER_ATTEMPTS=3
@@ -35,6 +36,10 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=replace-with-server-side-key
 SUPABASE_SUBTITLE_BUCKET=subtitles
 SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
+JAVSUBTITLE_API_BASE=https://your-javsubtitle-api.example
+JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-server-side-admin-api-token
+CATALOG_SYNC_RETRY_SECONDS=30
+MAX_CATALOG_SYNC_ATTEMPTS=10
 LOCAL_AUDIT_TIMEOUT_SECONDS=30
 SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 ```
@@ -71,6 +76,9 @@ python -m orchestrator mac-translation-smoke-test
 ```
 
 The command must exit 0. It does not claim jobs. If it fails, keep the translation worker stopped; the downloader and Windows transcription worker can continue filling `transcription_done`.
+The safe smoke uses exactly ten fixed non-production sentences and logs only
+aggregate quality data. Require `cues=10`, `unique_ratio` at least `0.500`, and
+`known_bad=0`; never log or report the translated cue text.
 
 6. In a third terminal, start the Mac translation worker:
 
@@ -80,28 +88,30 @@ source .venv/bin/activate
 python -m orchestrator mac-translation-worker
 ```
 
-When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the publication state flow is:
+When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the complete production state flow is:
 
 ```text
-transcription_done
-→ translating
-→ quality gate
-→ publish_pending
-→ publishing
-→ ensure public.movies (MissAV/local metadata or code-only placeholder)
-→ upsert the English_AI SRT in Storage
-→ upsert and verify movie_languages
-→ english_srt_ready
+audio_ready → transcription_claimed → transcribing → transcription_done
+→ translating → publish_pending → publishing
+→ catalog_sync_pending → catalog_syncing → english_srt_ready
 ```
+
+Windows owns `transcription_claimed` through `transcription_done`. The one Mac
+translation worker then runs translation and the quality gate, verifies the
+Supabase Storage/catalog publication, enters `catalog_sync_pending`, synchronizes
+the exact movie through the javsubtitle.com admin API, verifies the public movie
+API, and only then marks `english_srt_ready`.
 
 When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker uses the
 local-only compatibility flow. After the quality gate it skips `publish_pending`,
-`publishing`, catalog resolution, Storage, and `movie_languages`, and moves directly
-to `english_srt_ready`. In this mode, ready means only that the local English SRT is
-quality-approved; it does not mean Supabase publication or verification occurred.
+`publishing`, catalog resolution, Storage, `movie_languages`,
+`catalog_sync_pending`, and `catalog_syncing`, and moves directly to
+`english_srt_ready`. In this mode, ready means only that the local English SRT is
+quality-approved; it does not mean Supabase or javsubtitle.com verification
+occurred.
 
-With publication enabled, `english_srt_ready` means both publication and
-verification completed. A
+With publication enabled, `english_srt_ready` means Supabase publication and
+javsubtitle.com synchronization/visibility verification all completed. A
 `metadata_status=placeholder` result is successful: when neither usable local
 metadata nor a MissAV catalog match is available, the RPC creates a code-only
 `public.movies` row, publication continues, and later metadata enrichment keeps
@@ -120,10 +130,105 @@ Failure handling is separated by stage:
   `MAX_PUBLISH_ATTEMPTS`, the job becomes `failed` while retaining those files.
 - A Storage or `movie_languages` verification failure never marks the job
   `english_srt_ready`; it follows the same bounded publication retry behavior.
+- A transient javsubtitle.com sync or public-API verification failure moves the job
+  to `catalog_sync_pending`. Its independent retry repeats only the Supabase
+  verification and exact catalog sync; it does not retranslate, delete audio, or
+  replace the verified English SRT. Authentication failures and exhausted catalog
+  retries hard-pause the historical lane.
 
 `MAX_PUBLISH_ATTEMPTS` bounds publication attempts independently of translation.
 `MAC_PUBLISH_RETRY_SECONDS` controls the delay before a pending publication may be
 claimed again.
+`MAX_CATALOG_SYNC_ATTEMPTS` and `CATALOG_SYNC_RETRY_SECONDS` independently bound
+catalog synchronization after Supabase publication.
+
+## Recover one interrupted audio download
+
+This is an exact-job recovery for a stale `downloading_audio` row, not a selector or
+general retry. First stop only the downloader, prove that the exact job is unclaimed,
+identify the adapter's staged WAV, and calculate its SHA-256 without printing audio
+or metadata. Then bind the operation to all three required values:
+
+```bash
+JOB_ID=job_exact_id
+MOVIE=abc-001
+STAGED=/Users/ytt/MissAVJobs/$MOVIE/audio/$MOVIE.wav
+EXPECTED_SHA256=$(shasum -a 256 "$STAGED" | awk '{print $1}')
+.venv/bin/python -m orchestrator recover-interrupted-audio \
+  --job-id "$JOB_ID" \
+  --movie "$MOVIE" \
+  --expected-sha256 "$EXPECTED_SHA256"
+```
+
+The command requires the row to remain unclaimed in `downloading_audio`, rejects
+symlinks and path mismatches, accepts only a nonempty 16 kHz mono 16-bit PCM WAV
+with the exact digest, atomically moves it to `audio.wav`, and advances only that
+job to `audio_ready`. Its receipt contains only job/movie/status, SHA-256, size,
+duration, and `reused_final`. If a crash happened after the move but before the
+database commit, rerunning the identical command validates and reuses that exact
+final file; it never redownloads or overwrites it. Any failed precondition leaves
+the row and staged evidence unchanged. There is no batch, delete, or force option.
+
+## launchd worker installation and status
+
+The installer is deliberately scoped to exactly the downloader and translation
+worker labels. The plists use the production checkout, its `.venv`, stable worker
+IDs from `.env`, ten-second restart throttling, and separate logs under `logs/`.
+Before installation, identify and stop only duplicate terminal instances of those
+two worker commands. Do not stop the API, Windows worker, or tunnel.
+
+```bash
+cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+pgrep -fal '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-worker$'
+pgrep -fal \
+  '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-translation-worker$'
+./scripts/install_mac_worker_launchd.sh
+```
+
+The script lints and installs both plists, bootstraps the downloader first, and then
+replaces only the two managed launchd services. Check each exact label and confirm
+one PID per command:
+
+```bash
+DOMAIN=gui/$(id -u)
+launchctl print "$DOMAIN/com.javsubtitle.mac-worker" |
+  rg 'state =|pid =|last exit code'
+launchctl print "$DOMAIN/com.javsubtitle.mac-translation-worker" |
+  rg 'state =|pid =|last exit code'
+pgrep -fal '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-worker$'
+pgrep -fal \
+  '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-translation-worker$'
+```
+
+The historical controller is not installed by this script and must never be
+mistaken for a third worker.
+
+Before starting either launchd service in production, check required configuration
+presence without printing values, then run the fixed safe smoke. Stop if any name is
+missing or the smoke exits nonzero:
+
+```bash
+cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+set -a
+source .env
+set +a
+missing=0
+for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
+  JAVSUBTITLE_API_BASE JAVSUBTITLE_ADMIN_API_TOKEN; do
+  if [[ -n "$(printenv "$name" 2>/dev/null)" ]]; then
+    printf '%s=present\n' "$name"
+  else
+    printf '%s=missing\n' "$name"
+    missing=1
+  fi
+done
+(( missing == 0 ))
+.venv/bin/python -m orchestrator mac-translation-smoke-test
+```
+
+The smoke must exit 0 and report `cues=10`, `unique_ratio>=0.500`, and
+`known_bad=0`. Its fixed safe sentences are not job subtitles. Never print the
+environment values or include translated cue text in a report.
 
 ## Historical repair planning (dry-run only)
 
@@ -141,6 +246,159 @@ Each line identifies the job and movie, preserves the Japanese SRT, names the
 planned `rejected/` quarantine path for the old English SRT, and states whether a
 later authorized repair would requeue or overwrite. There is no apply mode and no
 `force=True` path in this command.
+
+## Immutable historical batch plan and enqueue
+
+Use the batch planner for the authoritative eligibility totals and immutable enqueue
+artifact. Keep the output directory private. The planner reads a bounded allowlist,
+the job database, and exact file snapshots; it writes only the requested local plan
+file and does not change jobs, repair records, subtitles, audio, or remote systems.
+
+```bash
+ALLOWLIST=/absolute/path/repair-allowlist.txt
+REPORT_DIR=/absolute/private/path/historical-repair
+mkdir -p -m 700 "$REPORT_DIR"
+.venv/bin/python -m orchestrator plan-historical-repair-batch \
+  --allowlist-file "$ALLOWLIST" \
+  --limit 5 \
+  --output "$REPORT_DIR/batch-001-plan.json"
+```
+
+The current audit allowlist contains 340 lines. That number is input evidence only,
+not an affected-job count and not execution authorization. The fresh dry-run's
+`eligible_total` is the authoritative affected count. Always retain and report
+`allowlist_entries`, `eligible_total`, `selected`, `already_repaired`, `ineligible`,
+and `blocked`; `--limit` bounds only `selected` (1 through 20), while eligibility is
+calculated across the full allowlist.
+
+The JSON plan binds the allowlist path and content digest, scan digest, exact job
+status/timestamp, and Japanese, English, and true byte-for-byte audio hashes. Review
+the safe one-line report, keep the JSON private, and enqueue only after separate
+approval by confirming its exact digest:
+
+```bash
+PLAN="$REPORT_DIR/batch-001-plan.json"
+PLAN_SHA=$(jq -er .plan_sha256 "$PLAN")
+.venv/bin/python -m orchestrator enqueue-historical-repair-batch \
+  --allowlist-file "$ALLOWLIST" \
+  --plan-file "$PLAN" \
+  --confirm-plan-sha256 "$PLAN_SHA"
+```
+
+Enqueue atomically rejects a changed plan, allowlist, database snapshot, or source
+file. A successful enqueue creates only immutable pending repair records; it does
+not reset a job stage or move a file until the single translation worker later
+claims that exact record. An exact replay is idempotent. Never edit the plan JSON,
+substitute a different allowlist path, use `force=True`, or treat an old dry-run as
+current authority.
+
+## Normal-first historical controller
+
+Start the controller only after exactly one healthy launchd translation worker has
+passed startup smoke and the explicitly approved initial batch is terminal. The
+controller uses the same immutable planning/enqueue checks, starts with at most five
+records, and enqueues at most 20 in later batches:
+
+```bash
+.venv/bin/python -m orchestrator historical-repair-controller \
+  --allowlist-file "$ALLOWLIST" \
+  --initial-batch-size 5 \
+  --batch-size 20 \
+  --poll-interval-seconds 30
+```
+
+This process only makes bounded queue decisions; the one translation worker still
+executes one unit at a time. Every cycle first yields while any normal translation,
+publication, or catalog-sync backlog exists, then waits for the prior historical
+batch to become terminal before planning another. A normal job arriving during one
+already-running historical unit is selected before the next historical record.
+There is never a second TranslateLocally process.
+
+Each stdout line is a path-free JSON receipt with `action`, `reason_code`, plan and
+allowlist hashes, and counts. `waiting` is healthy and keeps polling; `complete`
+exits 0. A fixed-safe `hard_pause=true` exits 2 immediately. A changed allowlist,
+worker-count or heartbeat mismatch, preservation failure, three consecutive
+historical quality failures, authentication/policy failure, or inconsistent counts
+must be investigated rather than bypassed.
+
+## Pause, resume, and rollback
+
+There is no pause or resume CLI. For a deliberate pause, first interrupt only the
+exact `historical-repair-controller` process and retain its last JSON receipt. Then
+use the real durable store operation and print only the safe before/after lane state:
+
+```bash
+.venv/bin/python - <<'PY'
+from orchestrator.config import MacSettings
+from orchestrator.store import JobStore
+
+settings = MacSettings()
+store = JobStore(
+    settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows
+)
+store.initialize()
+before = store.historical_lane_state()
+after = store.pause_historical_lane("operator_pause")
+print(
+    f"before_paused={str(before.paused).lower()} "
+    f"before_reason={before.reason_code or 'none'} "
+    f"after_paused={str(after.paused).lower()} "
+    f"after_reason={after.reason_code or 'none'} "
+    f"updated_at={after.updated_at}"
+)
+PY
+```
+
+The durable pause blocks new historical claims and controller enqueues but leaves
+normal work available. It does not cancel a historical unit already executing in
+the worker. Let that unit reach a recorded terminal/retry boundary unless the
+incident requires stopping the exact translation launchd service.
+
+Resume only after recording the pause reason, fixing it, confirming the allowlist
+is unchanged, checking exactly one translation process and fresh heartbeat, and
+rerunning `mac-translation-smoke-test`. The store operation below clears the reason
+and resets the historical consecutive-quality-failure counter; retain its receipt,
+then restart the controller with the identical allowlist and batch arguments:
+
+```bash
+.venv/bin/python - <<'PY'
+from orchestrator.config import MacSettings
+from orchestrator.store import JobStore
+
+settings = MacSettings()
+store = JobStore(
+    settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows
+)
+store.initialize()
+before = store.historical_lane_state()
+after = store.resume_historical_lane()
+print(
+    f"before_paused={str(before.paused).lower()} "
+    f"before_reason={before.reason_code or 'none'} "
+    f"after_paused={str(after.paused).lower()} "
+    f"after_reason={after.reason_code or 'none'} "
+    f"quality_failures={after.consecutive_quality_failures} "
+    f"updated_at={after.updated_at}"
+)
+PY
+```
+
+Rollback means stopping further historical expansion, not destructively pretending
+completed remote or filesystem changes never happened:
+
+1. Interrupt the controller, durably pause the lane as above, and capture its last
+   JSON receipt plus `/dashboard/state` historical counts.
+2. Leave pending/retry/terminal repair records in SQLite. Do not manually change job
+   statuses, clear translation origins, or reset download/transcription stages.
+3. Preserve Japanese SRTs, `audio.wav`, accepted English SRTs, and every file under
+   `rejected/`. Do not delete, overwrite, requeue, or use `force=True`.
+4. With the lane paused, the translation worker may continue normal jobs. If code
+   itself must be rolled back, stop only that launchd service, deploy a separately
+   reviewed database-compatible rollback commit, rerun compile/tests and the smoke
+   gate, then restore exactly one translation worker. Never roll back SQLite or
+   Supabase from a filesystem backup while workers are live.
+5. Resume history only through the explicit audited operation above. Otherwise keep
+   the durable pause and repair forward from the retained evidence.
 
 ## Catalog publication repair planning (dry-run only)
 
@@ -203,8 +461,9 @@ have been confirmed:
   Supabase project. RPC execute access has been verified as denied for `anon` and
   `authenticated`, and allowed only for `service_role`.
 - The production `.env` contains the real `SUPABASE_URL` and
-  `SUPABASE_SERVICE_ROLE_KEY`. Check only that they are present; never print the
-  service key or place it in logs, screenshots, shell history, or reports.
+  `SUPABASE_SERVICE_ROLE_KEY`, plus `JAVSUBTITLE_API_BASE` and
+  `JAVSUBTITLE_ADMIN_API_TOKEN`. Check only that all four are present; never print
+  either secret or place it in logs, screenshots, shell history, or reports.
 - `MAC_TRANSLATION_PUBLISH_ENABLED=true`,
   `SUPABASE_SUBTITLE_BUCKET=subtitles`, and
   `SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90` are set for the one-shot process.
@@ -270,9 +529,8 @@ deletion.
 ### Deployment approval gate
 
 The repository contains the reviewed migration for the catalog RPC, but this
-runbook does **not** state or assume that it has been deployed. Production behavior
-of the RPC is unverified until Task 10. Before changing production, stop and obtain
-explicit approval for this ordered sequence:
+runbook does **not** state or assume that it has been deployed. Before changing
+production, stop and obtain explicit approval for this ordered sequence:
 
 1. Apply only the reviewed migration, then verify RPC privileges and behavior.
 2. Run exactly one approved canary and verify its stable catalog UUID, Storage hash,
@@ -291,6 +549,10 @@ enable verified server-side publication only on the production Mac:
 MAC_TRANSLATION_PUBLISH_ENABLED=true
 SUPABASE_SUBTITLE_BUCKET=subtitles
 SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
+JAVSUBTITLE_API_BASE=https://your-production-api.example
+JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-server-side-admin-api-token
+CATALOG_SYNC_RETRY_SECONDS=30
+MAX_CATALOG_SYNC_ATTEMPTS=10
 ```
 
 Keep the Supabase service key server-side. Stop the general translation worker and
