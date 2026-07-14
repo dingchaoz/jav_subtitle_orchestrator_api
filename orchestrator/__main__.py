@@ -775,6 +775,34 @@ def run_recover_interrupted_audio(
     )
 
 
+def run_repair_interrupted_audio_wav(
+    *,
+    job_id: str,
+    movie: str,
+    expected_sha256: str,
+) -> None:
+    from orchestrator.audio_recovery import repair_interrupted_audio_wav
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    settings = MacSettings()
+    store = JobStore(settings.db_path, settings.jobs_root_mac, settings.jobs_root_windows)
+    store.initialize()
+    receipt = repair_interrupted_audio_wav(
+        store,
+        job_id=job_id,
+        movie=movie,
+        expected_sha256=expected_sha256,
+    )
+    print(
+        f"job_id={receipt.job_id} movie={receipt.movie_code} "
+        f"status={receipt.status.value} "
+        f"original_sha256={receipt.original_sha256} "
+        f"canonical_sha256={receipt.canonical_sha256} "
+        f"size={receipt.size_bytes} duration={receipt.duration_seconds:.6f}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m orchestrator")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -789,6 +817,10 @@ def build_parser() -> argparse.ArgumentParser:
     audio_recovery.add_argument("--job-id", required=True)
     audio_recovery.add_argument("--movie", required=True)
     audio_recovery.add_argument("--expected-sha256", required=True)
+    audio_repair = subcommands.add_parser("repair-interrupted-audio-wav")
+    audio_repair.add_argument("--job-id", required=True)
+    audio_repair.add_argument("--movie", required=True)
+    audio_repair.add_argument("--expected-sha256", required=True)
     repair_parser = subcommands.add_parser(
         "plan-historical-subtitle-repair",
         help="print a read-only translation-stage repair plan",
@@ -879,6 +911,12 @@ def main() -> None:
         run_windows_worker()
     elif args.command == "recover-interrupted-audio":
         run_recover_interrupted_audio(
+            job_id=args.job_id,
+            movie=args.movie,
+            expected_sha256=args.expected_sha256,
+        )
+    elif args.command == "repair-interrupted-audio-wav":
+        run_repair_interrupted_audio_wav(
             job_id=args.job_id,
             movie=args.movie,
             expected_sha256=args.expected_sha256,

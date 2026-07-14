@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import orchestrator.audio_recovery as audio_recovery
 from orchestrator.audio_recovery import (
     AudioRecoveryError,
     recover_interrupted_audio,
@@ -30,6 +31,36 @@ def _write_pcm_wav(path: Path, *, frames: int = 16_000) -> str:
         output.setframerate(16_000)
         output.writeframes(samples)
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_placeholder_size_pcm_wav(path: Path, *, frames: int = 16_000) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    samples = b"\x01\x00" * frames
+    fmt_payload = struct.pack(
+        "<HHIIHH",
+        1,
+        1,
+        16_000,
+        32_000,
+        2,
+        16,
+    )
+    payload = (
+        b"RIFF"
+        + struct.pack("<I", 0xFFFFFFFF)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt_payload))
+        + fmt_payload
+        + b"LIST"
+        + struct.pack("<I", 4)
+        + b"INFO"
+        + b"data"
+        + struct.pack("<I", 0xFFFFFFFF)
+        + samples
+    )
+    path.write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _prepare_job(
@@ -741,6 +772,76 @@ def test_truncated_trailing_riff_chunk_is_rejected_without_changes(
     assert _snapshot(store, job.id, mac_jobs_root) == before
 
 
+def test_repair_placeholder_size_pcm_wav_finalizes_without_changing_original_staged(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+) -> None:
+    store, job, paths, staged, _digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    original_digest = _write_placeholder_size_pcm_wav(staged)
+    original_payload = staged.read_bytes()
+
+    with pytest.raises(AudioRecoveryError, match="^invalid_pcm_wav$"):
+        recover_interrupted_audio(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=original_digest,
+        )
+
+    receipt = audio_recovery.repair_interrupted_audio_wav(
+        store,
+        job_id=job.id,
+        movie="abc-001",
+        expected_sha256=original_digest,
+    )
+
+    assert receipt.job_id == job.id
+    assert receipt.movie_code == "abc-001"
+    assert receipt.status is JobStatus.AUDIO_READY
+    assert receipt.final_path == paths.audio_path_mac
+    assert receipt.original_sha256 == original_digest
+    assert receipt.canonical_sha256 != original_digest
+    assert receipt.size_bytes == paths.audio_path_mac.stat().st_size
+    assert receipt.duration_seconds == pytest.approx(1.0)
+    assert staged.read_bytes() == original_payload
+    assert paths.audio_path_mac.is_file()
+    assert validate_pcm_wav(
+        paths.audio_path_mac,
+        expected_sha256=receipt.canonical_sha256,
+    ).duration_seconds == pytest.approx(1.0)
+
+    refreshed = store.get_job(job.id)
+    assert refreshed is not None
+    assert refreshed.status is JobStatus.AUDIO_READY
+    assert refreshed.audio_path_mac == str(paths.audio_path_mac)
+
+
+def test_repair_rejects_unaligned_placeholder_payload_without_changes(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+) -> None:
+    store, job, _paths, staged, _digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    original_digest = _write_placeholder_size_pcm_wav(staged)
+    staged.write_bytes(staged.read_bytes() + b"x")
+    digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+    before = _snapshot(store, job.id, mac_jobs_root)
+
+    with pytest.raises(AudioRecoveryError, match="^invalid_pcm_wav$"):
+        audio_recovery.repair_interrupted_audio_wav(
+            store,
+            job_id=job.id,
+            movie="abc-001",
+            expected_sha256=digest,
+        )
+
+    assert digest != original_digest
+    assert _snapshot(store, job.id, mac_jobs_root) == before
+
+
 def test_cli_parser_requires_exact_audio_recovery_arguments() -> None:
     from orchestrator.__main__ import build_parser
 
@@ -781,6 +882,31 @@ def test_cli_parser_requires_exact_audio_recovery_arguments() -> None:
             parser.parse_args(command)
 
 
+def test_cli_parser_requires_exact_audio_repair_arguments() -> None:
+    from orchestrator.__main__ import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "repair-interrupted-audio-wav",
+            "--job-id",
+            "job_exact",
+            "--movie",
+            "abc-001",
+            "--expected-sha256",
+            "a" * 64,
+        ]
+    )
+
+    assert args.command == "repair-interrupted-audio-wav"
+    assert args.job_id == "job_exact"
+    assert args.movie == "abc-001"
+    assert args.expected_sha256 == "a" * 64
+    assert not hasattr(args, "force")
+    assert not hasattr(args, "batch")
+    assert not hasattr(args, "delete")
+
+
 def test_cli_prints_only_safe_audio_recovery_receipt_fields(
     sqlite_path: Path,
     mac_jobs_root: Path,
@@ -810,4 +936,38 @@ def test_cli_prints_only_safe_audio_recovery_receipt_fields(
         f"job_id={job.id} movie=abc-001 status=audio_ready "
         f"sha256={digest} size=32044 duration=1.000000 reused_final=false"
     )
+    assert "path=" not in output
+
+
+def test_cli_prints_only_safe_audio_repair_receipt_fields(
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store, job, _paths, staged, _digest = _prepare_job(
+        sqlite_path, mac_jobs_root
+    )
+    original_digest = _write_placeholder_size_pcm_wav(staged)
+
+    class Settings:
+        db_path = sqlite_path
+        jobs_root_mac = mac_jobs_root
+        jobs_root_windows = "M:\\"
+
+    monkeypatch.setattr("orchestrator.config.MacSettings", Settings)
+    from orchestrator.__main__ import run_repair_interrupted_audio_wav
+
+    run_repair_interrupted_audio_wav(
+        job_id=job.id,
+        movie="abc-001",
+        expected_sha256=original_digest,
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith(
+        f"job_id={job.id} movie=abc-001 status=audio_ready "
+        f"original_sha256={original_digest} canonical_sha256="
+    )
+    assert " size=32044 duration=1.000000" in output
     assert "path=" not in output
