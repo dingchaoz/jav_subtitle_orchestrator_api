@@ -196,13 +196,25 @@ installer, enter the production checkout. Let `MacSettings` load that checkout's
 `.env`; never source the file into a shell. The preflight below prints only safe
 status words, rejects empty or known placeholder/example values, requires
 publication to be enabled, and runs the fixed smoke only after every configuration
-check passes:
+check passes. It first unsets only the four remote credentials and the publish flag
+so interactive-shell exports cannot override the production checkout's `.env`.
+The preflight, smoke, and later launchd services therefore use the same file-backed
+configuration. Do not unset `TRANSLATELOCALLY_PATH` or `TRANSLATELOCALLY_MODEL`;
+`MacSettings` loads them from the same `.env` and exports them for the smoke runtime.
 
 ```bash
 cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
 (
   set -e
+  unset \
+    SUPABASE_URL \
+    SUPABASE_SERVICE_ROLE_KEY \
+    JAVSUBTITLE_API_BASE \
+    JAVSUBTITLE_ADMIN_API_TOKEN \
+    MAC_TRANSLATION_PUBLISH_ENABLED
   .venv/bin/python - <<'PY'
+import re
+from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -222,13 +234,25 @@ def production_url(value: object) -> bool:
         host = (parsed.hostname or "").lower()
     except ValueError:
         return False
+    try:
+        loopback = ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    host_tokens = {
+        token
+        for label in host.split(".")
+        for token in re.split(r"[-_]", label)
+        if token
+    }
     placeholder_host = (
         not host
-        or host.endswith(".example")
-        or host in {"example.com", "www.example.com"}
-        or any("example" in label for label in host.split("."))
-        or "your-project" in host
-        or any(label.startswith("your-") for label in host.split("."))
+        or loopback
+        or host in {"example", "invalid", "test", "localhost"}
+        or host.endswith((".example", ".invalid", ".test", ".localhost"))
+        or bool(
+            host_tokens
+            & {"example", "placeholder", "dummy", "fake", "test", "your"}
+        )
     )
     return (
         parsed.scheme == "https"
@@ -246,11 +270,37 @@ def production_secret(value: object) -> bool:
         return False
     raw = value.strip()
     lowered = raw.lower()
+    tokens = {
+        token for token in re.split(r"[^a-z0-9]+", lowered) if token
+    }
     return not (
-        lowered.startswith(
-            ("replace-with-", "your-", "example", "change-me", "changeme")
+        len(raw) < 16
+        or lowered.startswith(
+            (
+                "replace-with-",
+                "your-",
+                "example-",
+                "placeholder-",
+                "placeholder_",
+                "dummy-",
+                "dummy_",
+                "fake-",
+                "fake_",
+                "test-",
+                "test_",
+                "change-me",
+                "changeme",
+            )
         )
-        or lowered in {"token", "secret"}
+        or lowered in {
+            "token",
+            "secret",
+            "placeholder",
+            "dummy",
+            "fake",
+            "test",
+        }
+        or bool(tokens & {"placeholder", "dummy", "fake", "test"})
         or "<" in raw
         or ">" in raw
     )
