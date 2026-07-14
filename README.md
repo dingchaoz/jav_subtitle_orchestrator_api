@@ -10,13 +10,15 @@ docs/superpowers/specs/2026-07-04-jav-subtitle-orchestrator-design.md
 
 Version 1 target:
 
-- Mac hosts the API, job database, SMB job folder, downloads, Japanese-to-English translation, and the translation quality gate.
-- Windows NVIDIA laptop polls the Mac API, reads audio over SMB, writes Japanese SRT, and hands the job back as `transcription_done`.
+- Mac hosts the API, job database, SMB job folder, downloads, Japanese-to-English
+  translation, and the translation quality gate.
+- Windows NVIDIA laptop polls the Mac API, reads audio over SMB, writes Japanese
+  SRT, and hands the job back as `transcription_done`.
 - SQLite stores queue state for one or many movie IDs.
 
 ## Metadata-resilient publication
 
-The complete normal production path is:
+The post-download production path is:
 
 ```text
 audio_ready → transcription_claimed → transcribing → transcription_done
@@ -31,8 +33,9 @@ after both remote systems verify successfully.
 
 When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker remains in
 local-only compatibility mode. It skips `publish_pending`, `publishing`, catalog
-resolution, Storage, and `movie_languages`; `english_srt_ready` then means only that
-the local English SRT passed the quality gate, not that Supabase was verified.
+resolution, Storage, `movie_languages`, `catalog_sync_pending`, and
+`catalog_syncing`; `english_srt_ready` then means only that the local English SRT
+passed the quality gate, not that Supabase or javsubtitle.com was verified.
 
 A code-only `placeholder` catalog row is a successful publication result, not a
 translation failure. It has a stable movie UUID and can be enriched later without
@@ -86,4 +89,4 @@ Setup details:
 - [Windows setup](docs/setup/windows.md)
 - [SMB setup](docs/setup/smb.md)
 - [TranslateLocally setup](docs/setup/translatelocally.md)
-- [Codex translation batch helper](docs/setup/codex-translation.md)
+- [Cloudflare tunnel setup](docs/setup/cloudflare-tunnel.md)

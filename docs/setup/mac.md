@@ -14,7 +14,7 @@ ORCHESTRATOR_PORT=8000
 ORCHESTRATOR_DB_PATH=/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator/data/jobs.sqlite3
 MISSAV_PIPELINE_ROOT=/Users/ytt/Documents/startup/MissAV-Pipeline
 JOBS_ROOT_MAC=/Users/ytt/MissAVJobs
-JOBS_ROOT_WINDOWS=M:\
+JOBS_ROOT_WINDOWS="M:\\"
 MAC_DOWNLOAD_CONCURRENCY=1
 MAC_DOWNLOAD_WORKER_ID=mac-downloader-1
 WORKER_LEASE_SECONDS=1800
@@ -31,7 +31,7 @@ MAC_PUBLISH_RETRY_SECONDS=30
 MAC_TRANSLATION_POLL_INTERVAL_SECONDS=10
 TRANSLATION_QUALITY_FAILURE_LIMIT=3
 MAC_TRANSLATION_PUBLISH_ENABLED=false
-SUBTITLE_AUDIT_VISIBILITY_ENABLED=true
+SUBTITLE_AUDIT_VISIBILITY_ENABLED=false
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=replace-with-server-side-key
 SUPABASE_SUBTITLE_BUCKET=subtitles
@@ -47,7 +47,9 @@ SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 The Supabase key is server-side only. Never place it in dashboard HTML, browser
 JavaScript, logs, screenshots, or committed files. If audit visibility is disabled
 or credentials are absent, the jobs dashboard continues working and the Subtitle
-Quality panel shows unavailable.
+Quality panel shows unavailable. `SUBTITLE_AUDIT_VISIBILITY_ENABLED=false` is the
+default; enable it only as a separate, reviewed decision after server-side
+credentials and exposure boundaries have been verified.
 
 3. Install and run the API:
 
@@ -75,7 +77,9 @@ source .venv/bin/activate
 python -m orchestrator mac-translation-smoke-test
 ```
 
-The command must exit 0. It does not claim jobs. If it fails, keep the translation worker stopped; the downloader and Windows transcription worker can continue filling `transcription_done`.
+The command must exit 0. It does not claim jobs. If it fails, keep the translation
+worker stopped; the downloader and Windows transcription worker can continue
+filling `transcription_done`.
 The safe smoke uses exactly ten fixed non-production sentences and logs only
 aggregate quality data. Require `cues=10`, `unique_ratio` at least `0.500`, and
 `known_bad=0`; never log or report the translated cue text.
@@ -88,7 +92,8 @@ source .venv/bin/activate
 python -m orchestrator mac-translation-worker
 ```
 
-When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the complete production state flow is:
+When `MAC_TRANSLATION_PUBLISH_ENABLED=true`, the post-download production state
+flow is:
 
 ```text
 audio_ready → transcription_claimed → transcribing → transcription_done
@@ -148,9 +153,14 @@ catalog synchronization after Supabase publication.
 ## Recover one interrupted audio download
 
 This is an exact-job recovery for a stale `downloading_audio` row, not a selector or
-general retry. First stop only the downloader, prove that the exact job is unclaimed,
+general retry. Before running it, obtain independent approval that names the exact
+job ID, canonical movie code, and staged WAV SHA-256. If any of those three approved
+values is absent or differs from current evidence, stop. This recovery approval
+does not authorize a restart, requeue, worker change, or any other job.
+
+After approval, stop only the downloader, prove that the exact job is unclaimed,
 identify the adapter's staged WAV, and calculate its SHA-256 without printing audio
-or metadata. Then bind the operation to all three required values:
+or metadata. Then bind the operation to all three approved values:
 
 ```bash
 JOB_ID=job_exact_id
@@ -171,6 +181,9 @@ duration, and `reused_final`. If a crash happened after the move but before the
 database commit, rerunning the identical command validates and reuses that exact
 final file; it never redownloads or overwrites it. Any failed precondition leaves
 the row and staged evidence unchanged. There is no batch, delete, or force option.
+After a successful command, report its safe receipt and stop for the next explicit
+instruction. Do not restart a worker, requeue a job, or continue into launchd or
+historical repair as a side effect of recovery approval.
 
 ## launchd worker installation and status
 
@@ -179,40 +192,132 @@ worker labels. The plists use the production checkout, its `.venv`, stable worke
 IDs from `.env`, ten-second restart throttling, and separate logs under `logs/`.
 
 Before inspecting or stopping terminal worker processes, and before invoking the
-installer, check all four required configuration names without printing their
-values and run the fixed safe smoke:
+installer, enter the production checkout. Let `MacSettings` load that checkout's
+`.env`; never source the file into a shell. The preflight below prints only safe
+status words, rejects empty or known placeholder/example values, requires
+publication to be enabled, and runs the fixed smoke only after every configuration
+check passes:
 
 ```bash
 cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
 (
   set -e
-  set -a
-  source .env
-  set +a
-  missing=0
-  for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
-    JAVSUBTITLE_API_BASE JAVSUBTITLE_ADMIN_API_TOKEN; do
-    if [[ -n "$(printenv "$name" 2>/dev/null)" ]]; then
-      printf '%s=present\n' "$name"
-    else
-      printf '%s=missing\n' "$name"
-      missing=1
-    fi
-  done
-  (( missing == 0 ))
+  .venv/bin/python - <<'PY'
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from orchestrator.config import PROJECT_ROOT, MacSettings
+
+EXPECTED_ROOT = Path(
+    "/Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator"
+).resolve()
+
+
+def production_url(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    raw = value.strip()
+    try:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    placeholder_host = (
+        not host
+        or host.endswith(".example")
+        or host in {"example.com", "www.example.com"}
+        or any("example" in label for label in host.split("."))
+        or "your-project" in host
+        or any(label.startswith("your-") for label in host.split("."))
+    )
+    return (
+        parsed.scheme == "https"
+        and not placeholder_host
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def production_secret(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    raw = value.strip()
+    lowered = raw.lower()
+    return not (
+        lowered.startswith(
+            ("replace-with-", "your-", "example", "change-me", "changeme")
+        )
+        or lowered in {"token", "secret"}
+        or "<" in raw
+        or ">" in raw
+    )
+
+
+try:
+    settings = MacSettings()
+except Exception:
+    settings = None
+
+root_ready = (
+    settings is not None
+    and Path.cwd().resolve() == EXPECTED_ROOT
+    and PROJECT_ROOT.resolve() == EXPECTED_ROOT
+)
+checks = (
+    ("PRODUCTION_CHECKOUT", root_ready),
+    (
+        "SUPABASE_URL",
+        settings is not None and production_url(settings.supabase_url),
+    ),
+    (
+        "SUPABASE_SERVICE_ROLE_KEY",
+        settings is not None
+        and production_secret(settings.supabase_service_role_key),
+    ),
+    (
+        "JAVSUBTITLE_API_BASE",
+        settings is not None and production_url(settings.javsubtitle_api_base),
+    ),
+    (
+        "JAVSUBTITLE_ADMIN_API_TOKEN",
+        settings is not None
+        and production_secret(settings.javsubtitle_admin_api_token),
+    ),
+)
+publish_enabled = (
+    settings is not None
+    and settings.mac_translation_publish_enabled is True
+)
+for name, ready in checks:
+    print(f"{name}={'present' if ready else 'missing_or_placeholder'}")
+print(
+    "MAC_TRANSLATION_PUBLISH_ENABLED="
+    + ("enabled" if publish_enabled else "disabled")
+)
+raise SystemExit(0 if all(ready for _, ready in checks) and publish_enabled else 1)
+PY
   .venv/bin/python -m orchestrator mac-translation-smoke-test
 )
 ```
 
-The subshell must exit 0, all four names must report `present`, and the smoke must
-report `cues=10`, `unique_ratio>=0.500`, and `known_bad=0`. Its fixed safe sentences
-are not job subtitles. Never print environment values or include translated cue
-text in a report. If any name is missing or the smoke exits nonzero, stop: do not
-run the installer and do not install, bootstrap, or start either worker.
+The subshell must exit 0, the checkout and all four configuration names must report
+`present`, the publish flag must report `enabled`, and the smoke must report
+`cues=10`, `unique_ratio>=0.500`, and `known_bad=0`. Its fixed safe sentences are
+not job subtitles. Never print environment values or include translated cue text in
+a report. If any check reports `missing_or_placeholder`, publication reports
+`disabled`, or the smoke exits nonzero, stop: do not run the installer and do not
+install, bootstrap, or start either worker.
 
-Only after that complete preflight succeeds, identify and stop any exact terminal
-instances of the two worker commands that would duplicate the launchd services. Do
-not stop the API, Windows worker, or tunnel. Then invoke the installer:
+Only after that complete preflight succeeds, obtain separate installation approval
+that explicitly names both labels: `com.javsubtitle.mac-worker` and
+`com.javsubtitle.mac-translation-worker`. Without approval for those exact two
+labels, stop; preflight success alone does not authorize install, bootstrap, or
+start. After approval, identify and stop any exact terminal instances of the two
+worker commands that would duplicate the launchd services. Do not stop the API,
+Windows worker, or tunnel. Then invoke the installer:
 
 ```bash
 pgrep -fal '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-worker$'
@@ -238,7 +343,9 @@ pgrep -fal \
 ```
 
 The historical controller is not installed by this script and must never be
-mistaken for a third worker.
+mistaken for a third worker. After installation, report the exact two labels and
+their PIDs, then stop for the next explicit instruction. Do not automatically start
+the controller or enqueue/execute historical repair work.
 
 ## Historical repair planning (dry-run only)
 
@@ -620,8 +727,9 @@ placeholder catalog result is allowed and successful.
 
 After local, Supabase, CDN, and `https://javsubtitle.com` verification succeeds,
 restart the normal `mac-translation-worker`. This procedure authorizes one canary
-only. Do not prepare another historical job or begin a five-to-ten-job batch without
-new approval.
+only. Do not prepare another historical job or begin any approved batch without new
+approval. The controller limit remains at most five records for its initial batch
+and at most 20 for later batches within the explicitly approved scope.
 
 7. Submit a batch:
 
