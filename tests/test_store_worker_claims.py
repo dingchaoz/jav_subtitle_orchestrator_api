@@ -1482,7 +1482,12 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
         canonical_code="abc-023",
         d1_rows_updated=1,
         subtitle_count=1,
-        kv_keys_deleted=("movie:full:abc-023", "movie:light:abc-023"),
+        kv_keys_deleted=(
+            "movie:full:abc-023",
+            "movie:light:abc-023",
+            "movie:full:abc-023-uncensored-leak",
+            "movie:light:abc-023-uncensored-leak",
+        ),
     )
     assert ready.status is JobStatus.ENGLISH_SRT_READY
     assert ready.claimed_by is None

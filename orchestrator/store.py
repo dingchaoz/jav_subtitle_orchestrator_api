@@ -4181,8 +4181,12 @@ class JobStore:
         }
         if (
             not isinstance(kv_keys_deleted, tuple)
-            or len(kv_keys_deleted) != 2
-            or set(kv_keys_deleted) != expected_keys
+            or not expected_keys.issubset(set(kv_keys_deleted))
+            or any(
+                not isinstance(key, str)
+                or not key.startswith(("movie:full:", "movie:light:"))
+                for key in kv_keys_deleted
+            )
         ):
             raise ValueError("catalog result cache keys do not match")
 
