@@ -99,6 +99,14 @@ def run_translation_only_supervisor(
         if not plan.items:
             break
         selected_count = len(plan.items)
+        _emit_progress(
+            batch=batch_index,
+            event="enqueue",
+            selected=selected_count,
+            enqueued_total=enqueued_count,
+            completed_total=completed_count,
+            failed_total=failed_count,
+        )
         records = enqueue_translation_only_repair_batch(
             store,
             plan,
@@ -112,44 +120,46 @@ def run_translation_only_supervisor(
             poll_interval_seconds=config.poll_interval_seconds,
             batch_timeout_seconds=config.batch_timeout_seconds,
             sleep_fn=sleep_fn,
+            progress_fn=lambda snapshot: _emit_progress(
+                batch=batch_index,
+                event="poll",
+                selected=selected_count,
+                enqueued_total=enqueued_count,
+                completed_total=completed_count,
+                failed_total=failed_count,
+                **snapshot,
+            ),
         )
-        if wait_result.failed:
-            failed_count += len(wait_result.failed)
-            _append_receipt(
-                receipt_file,
-                {
-                    "batch": batch_index,
-                    "plan_sha256": plan.plan_sha256,
-                    "status": "failed",
-                    "failed": wait_result.failed,
-                },
-            )
-            return TranslationOnlySupervisorResult(
-                action="stopped",
-                remaining_count=remaining_count,
-                enqueued_count=enqueued_count,
-                completed_count=completed_count,
-                failed_count=failed_count,
-                batches=batch_index,
-                plan_files=tuple(plan_files),
-                receipt_file=str(receipt_file),
-                reason_code="batch_failed",
-            )
+        failed_count += len(wait_result.failed)
         verified = verify_translation_only_batch(
             store,
-            job_ids,
+            list(wait_result.ready),
             verify_public_api=config.verify_public_api,
             public_api_base_url=config.public_api_base_url,
         )
         completed_count += len(verified)
+        status = "verified_with_failures" if wait_result.failed else "verified"
         _append_receipt(
             receipt_file,
             {
                 "batch": batch_index,
                 "plan_sha256": plan.plan_sha256,
-                "status": "verified",
+                "status": status,
                 "movies": sorted(verified),
+                "failed": list(wait_result.failed),
+                "ready_count": len(wait_result.ready),
+                "failed_count": len(wait_result.failed),
             },
+        )
+        _emit_progress(
+            batch=batch_index,
+            event=status,
+            selected=selected_count,
+            ready=len(wait_result.ready),
+            failed=len(wait_result.failed),
+            enqueued_total=enqueued_count,
+            completed_total=completed_count,
+            failed_total=failed_count,
         )
         if selected_count < config.batch_size or enqueued_count >= config.max_jobs:
             break
@@ -189,6 +199,7 @@ def wait_for_translation_only_batch(
     poll_interval_seconds: int,
     batch_timeout_seconds: int,
     sleep_fn: Callable[[float], None] = time.sleep,
+    progress_fn: Callable[[dict[str, int]], None] | None = None,
 ) -> BatchWaitResult:
     deadline = time.monotonic() + batch_timeout_seconds
     while True:
@@ -205,7 +216,15 @@ def wait_for_translation_only_batch(
                 failed.append(job_id)
             else:
                 nonterminal += 1
-        if failed or nonterminal == 0:
+        if progress_fn is not None:
+            progress_fn(
+                {
+                    "ready": len(ready),
+                    "failed": len(failed),
+                    "pending": nonterminal,
+                }
+            )
+        if nonterminal == 0:
             return BatchWaitResult(ready=tuple(ready), failed=tuple(failed))
         if time.monotonic() >= deadline:
             raise TimeoutError("translation_only_batch_timeout")
@@ -283,3 +302,10 @@ def _append_receipt(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True) + "\n")
+
+
+def _emit_progress(**fields: object) -> None:
+    print(
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+        flush=True,
+    )

@@ -10,6 +10,7 @@ from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
 from orchestrator.translation_only_supervisor import (
+    BatchWaitResult,
     TranslationOnlySupervisorConfig,
     run_translation_only_supervisor,
     verify_translation_only_batch,
@@ -68,6 +69,45 @@ def _make_ready_job(store: JobStore, root: Path, movie: str, *, bad: bool = True
     return store.get_job(job.id), paths
 
 
+def _mark_ready(store: JobStore, job_id: str, root: Path, movie: str) -> None:
+    paths = build_job_paths(movie, root, "M:\\")
+    (paths.job_dir_mac / "logs").mkdir(parents=True, exist_ok=True)
+    (paths.job_dir_mac / "logs" / "quality.log").write_text(
+        json.dumps({"passed": True, "reason_codes": []}) + "\n",
+        encoding="utf-8",
+    )
+    with store.connection() as connection:
+        connection.execute(
+            """
+            UPDATE jobs
+            SET status = ?, claimed_by = NULL, published_subtitle_id = ?,
+                published_storage_path = ?, published_content_sha256 = ?,
+                published_file_size = ?, error = NULL
+            WHERE id = ?
+            """,
+            (
+                JobStatus.ENGLISH_SRT_READY.value,
+                f"subtitle-{movie}",
+                f"{movie}/{movie}/{movie}-English_AI.srt",
+                "b" * 64,
+                paths.english_srt_path_mac.stat().st_size,
+                job_id,
+            ),
+        )
+
+
+def _mark_failed(store: JobStore, job_id: str) -> None:
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = ?, claimed_by = NULL, error = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "translating: quality_gate_failed:dominant_text_collapse",
+                job_id,
+            ),
+        )
+
+
 def test_supervisor_dry_run_does_not_enqueue(sqlite_path, mac_jobs_root, tmp_path):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()
@@ -117,6 +157,66 @@ def test_supervisor_execute_requires_exact_remaining_confirmation(
         )
 
     assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_supervisor_continues_after_isolated_job_failure(
+    sqlite_path, mac_jobs_root, tmp_path, monkeypatch, capsys
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    first, _ = _make_ready_job(store, mac_jobs_root, "abc-001")
+    second, _ = _make_ready_job(store, mac_jobs_root, "abc-002")
+    third, _ = _make_ready_job(store, mac_jobs_root, "abc-003")
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("abc-001\nabc-002\nabc-003\n", encoding="utf-8")
+
+    def fake_wait(store_arg, job_ids, **_kwargs):
+        assert store_arg is store
+        ready: list[str] = []
+        failed: list[str] = []
+        for job_id in job_ids:
+            job = store.get_job(job_id)
+            assert job is not None
+            if job_id == second.id:
+                _mark_failed(store, job_id)
+                failed.append(job_id)
+            else:
+                _mark_ready(store, job_id, mac_jobs_root, job.normalized_movie_number)
+                ready.append(job_id)
+        return BatchWaitResult(ready=tuple(ready), failed=tuple(failed))
+
+    monkeypatch.setattr(
+        "orchestrator.translation_only_supervisor.wait_for_translation_only_batch",
+        fake_wait,
+    )
+
+    result = run_translation_only_supervisor(
+        store,
+        TranslationOnlySupervisorConfig(
+            allowlist_file=allowlist,
+            work_dir=tmp_path / "work",
+            batch_size=2,
+            max_jobs=3,
+            execute=True,
+            confirm_remaining_count=3,
+        ),
+    )
+
+    assert result.action == "completed"
+    assert result.enqueued_count == 3
+    assert result.completed_count == 2
+    assert result.failed_count == 1
+    assert result.batches == 2
+    assert store.get_job(first.id).status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_job(second.id).status is JobStatus.FAILED
+    assert store.get_job(third.id).status is JobStatus.ENGLISH_SRT_READY
+    output = capsys.readouterr().out
+    assert "batch=1" in output
+    assert "failed=1" in output
+    receipts = Path(result.receipt_file).read_text(encoding="utf-8").splitlines()
+    assert len(receipts) == 2
+    assert json.loads(receipts[0])["status"] == "verified_with_failures"
+    assert json.loads(receipts[1])["status"] == "verified"
 
 
 def test_verify_translation_only_batch_checks_db_and_quality_log(
