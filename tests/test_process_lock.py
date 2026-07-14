@@ -49,6 +49,30 @@ def test_lock_creates_parent_writes_pid_and_release_is_idempotent(tmp_path):
     replacement.release()
 
 
+def test_different_worker_locks_can_be_held_and_reacquired_together(tmp_path):
+    from orchestrator.process_lock import SingleInstanceLock
+
+    downloader_path = tmp_path / "mac-worker.lock"
+    translator_path = tmp_path / "mac-translation-worker.lock"
+    downloader = SingleInstanceLock(downloader_path).acquire()
+    translator = SingleInstanceLock(translator_path).acquire()
+    try:
+        assert downloader_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+        assert translator_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    finally:
+        downloader.release()
+        translator.release()
+
+    replacement_downloader = SingleInstanceLock(downloader_path).acquire()
+    replacement_translator = SingleInstanceLock(translator_path).acquire()
+    try:
+        assert replacement_downloader.handle is not None
+        assert replacement_translator.handle is not None
+    finally:
+        replacement_downloader.release()
+        replacement_translator.release()
+
+
 def test_launchd_plists_keep_workers_separate():
     downloader = load_plist(
         "deployment/launchd/com.javsubtitle.mac-worker.plist"
@@ -198,6 +222,78 @@ def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
     assert events[-2:] == ["run_forever", "lock_release"]
 
 
+def test_downloader_runtime_releases_lock_when_store_initialization_fails(
+    monkeypatch, tmp_path
+):
+    from orchestrator import __main__ as cli
+
+    events: list[object] = []
+
+    class FakeLock:
+        def __init__(self, path):
+            events.append(("lock_path", path))
+
+        def acquire(self):
+            events.append("lock_acquire")
+            return self
+
+        def release(self):
+            events.append("lock_release")
+
+    class FakeSettings:
+        def __init__(self):
+            events.append("settings")
+            self.db_path = tmp_path / "jobs.sqlite3"
+            self.jobs_root_mac = tmp_path / "jobs"
+            self.jobs_root_windows = "M:\\"
+
+    class FailingStore:
+        def __init__(self, *_args):
+            events.append("store")
+
+        def initialize(self):
+            events.append("store_initialize")
+            raise RuntimeError("store initialization failed")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.config",
+        module_with(MacSettings=FakeSettings, PROJECT_ROOT=tmp_path),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.process_lock",
+        module_with(SingleInstanceLock=FakeLock),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.mac_worker",
+        module_with(MacDownloadWorker=object, run_forever=lambda _worker: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.missav_adapter",
+        module_with(MissAVAdapter=object),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.store",
+        module_with(JobStore=FailingStore),
+    )
+
+    with pytest.raises(RuntimeError, match="^store initialization failed$"):
+        cli.run_mac_worker()
+
+    assert events == [
+        ("lock_path", tmp_path / "data" / "mac-worker.lock"),
+        "lock_acquire",
+        "settings",
+        "store",
+        "store_initialize",
+        "lock_release",
+    ]
+
+
 def test_translation_runtime_holds_a_distinct_lock_before_smoke_or_store(
     monkeypatch, tmp_path
 ):
@@ -310,6 +406,100 @@ def test_translation_runtime_holds_a_distinct_lock_before_smoke_or_store(
     assert events.index("lock_acquire") < events.index("smoke")
     assert events.index("lock_acquire") < events.index("store_initialize")
     assert ("worker_id", "mac-translation-stable") in events
+    assert events[-2:] == ["run_forever", "lock_release"]
+
+
+def test_translation_runtime_releases_lock_when_run_forever_fails(
+    monkeypatch, tmp_path
+):
+    from orchestrator import __main__ as cli
+
+    events: list[object] = []
+
+    class FakeLock:
+        def __init__(self, path):
+            events.append(("lock_path", path))
+
+        def acquire(self):
+            events.append("lock_acquire")
+            return self
+
+        def release(self):
+            events.append("lock_release")
+
+    class FakeSettings:
+        def __init__(self):
+            events.append("settings")
+            self.db_path = tmp_path / "jobs.sqlite3"
+            self.jobs_root_mac = tmp_path / "jobs"
+            self.jobs_root_windows = "M:\\"
+            self.mac_translate_script_path = "translate.py"
+            self.mac_translation_worker_id = "mac-translation-stable"
+            self.mac_translation_lease_seconds = 1800
+            self.max_translation_attempts = 3
+            self.translation_quality_failure_limit = 3
+            self.max_publish_attempts = 10
+            self.mac_publish_retry_seconds = 30
+            self.max_catalog_sync_attempts = 10
+            self.catalog_sync_retry_seconds = 30
+            self.mac_translation_poll_interval_seconds = 10
+
+    class FakeStore:
+        def __init__(self, *_args):
+            events.append("store")
+
+        def initialize(self):
+            events.append("store_initialize")
+
+    class FakeTranslator:
+        def __init__(self, _script):
+            events.append("translator")
+
+    class FakeWorker:
+        def __init__(self, _store, _translator, **_kwargs):
+            events.append("worker")
+
+    def failing_run_forever(_worker, _poll_interval):
+        events.append("run_forever")
+        raise RuntimeError("translation loop failed")
+
+    monkeypatch.setattr(cli, "build_supabase_publisher", lambda _settings: object())
+    monkeypatch.setattr(cli, "build_catalog_sync_client", lambda _settings: object())
+    monkeypatch.setattr(cli, "_export_mac_translation_runtime_env", lambda _settings: None)
+    monkeypatch.setattr(cli, "_run_mac_translation_smoke", lambda _settings, _translator: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.config",
+        module_with(MacSettings=FakeSettings, PROJECT_ROOT=tmp_path),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.process_lock",
+        module_with(SingleInstanceLock=FakeLock),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.mac_worker",
+        module_with(
+            MacTranslationWorker=FakeWorker,
+            run_translation_forever=failing_run_forever,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.store",
+        module_with(JobStore=FakeStore),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "orchestrator.translation",
+        module_with(SubtitleTranslator=FakeTranslator),
+    )
+
+    with pytest.raises(RuntimeError, match="^translation loop failed$"):
+        cli.run_mac_translation_worker()
+
+    assert events.count("lock_release") == 1
     assert events[-2:] == ["run_forever", "lock_release"]
 
 
