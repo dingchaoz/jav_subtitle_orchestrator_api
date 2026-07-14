@@ -124,17 +124,20 @@ Failure handling is separated by stage:
   called.
 - Missing or unusable metadata does not reject a quality-approved translation. A
   code-only placeholder is used and publication continues.
-- A transient Supabase failure returns the job to `publish_pending` using the
-  independent publication retry counter. The validated English SRT and audio stay
-  in place, and the worker does not translate again. After
-  `MAX_PUBLISH_ATTEMPTS`, the job becomes `failed` while retaining those files.
-- A Storage or `movie_languages` verification failure never marks the job
-  `english_srt_ready`; it follows the same bounded publication retry behavior.
-- A transient javsubtitle.com sync or public-API verification failure moves the job
-  to `catalog_sync_pending`. Its independent retry repeats only the Supabase
-  verification and exact catalog sync; it does not retranslate, delete audio, or
-  replace the verified English SRT. Authentication failures and exhausted catalog
-  retries hard-pause the historical lane.
+- A transient Supabase publication, Storage upload/verification, or
+  `movie_languages` upsert/verification failure returns the job to
+  `publish_pending` using the independent publication retry counter. The validated
+  English SRT and audio stay in place, and the worker does not translate again.
+  After `MAX_PUBLISH_ATTEMPTS`, the job becomes `failed` while retaining those
+  files.
+- Successful Supabase publication stores its verified receipt and advances the job
+  to `catalog_sync_pending`. From that point, a javsubtitle.com exact catalog-sync
+  or public-API visibility failure remains in or returns to
+  `catalog_sync_pending`. Its independent retry revalidates the durable Supabase
+  receipt and repeats only the exact sync/visibility checks; it does not
+  retranslate, republish Supabase, delete audio, or replace the verified English
+  SRT. Authentication failures and exhausted catalog retries hard-pause the
+  historical lane.
 
 `MAX_PUBLISH_ATTEMPTS` bounds publication attempts independently of translation.
 `MAC_PUBLISH_RETRY_SECONDS` controls the delay before a pending publication may be
@@ -174,20 +177,54 @@ the row and staged evidence unchanged. There is no batch, delete, or force optio
 The installer is deliberately scoped to exactly the downloader and translation
 worker labels. The plists use the production checkout, its `.venv`, stable worker
 IDs from `.env`, ten-second restart throttling, and separate logs under `logs/`.
-Before installation, identify and stop only duplicate terminal instances of those
-two worker commands. Do not stop the API, Windows worker, or tunnel.
+
+Before inspecting or stopping terminal worker processes, and before invoking the
+installer, check all four required configuration names without printing their
+values and run the fixed safe smoke:
 
 ```bash
 cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+(
+  set -e
+  set -a
+  source .env
+  set +a
+  missing=0
+  for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
+    JAVSUBTITLE_API_BASE JAVSUBTITLE_ADMIN_API_TOKEN; do
+    if [[ -n "$(printenv "$name" 2>/dev/null)" ]]; then
+      printf '%s=present\n' "$name"
+    else
+      printf '%s=missing\n' "$name"
+      missing=1
+    fi
+  done
+  (( missing == 0 ))
+  .venv/bin/python -m orchestrator mac-translation-smoke-test
+)
+```
+
+The subshell must exit 0, all four names must report `present`, and the smoke must
+report `cues=10`, `unique_ratio>=0.500`, and `known_bad=0`. Its fixed safe sentences
+are not job subtitles. Never print environment values or include translated cue
+text in a report. If any name is missing or the smoke exits nonzero, stop: do not
+run the installer and do not install, bootstrap, or start either worker.
+
+Only after that complete preflight succeeds, identify and stop any exact terminal
+instances of the two worker commands that would duplicate the launchd services. Do
+not stop the API, Windows worker, or tunnel. Then invoke the installer:
+
+```bash
 pgrep -fal '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-worker$'
 pgrep -fal \
   '^(.*/)?python(3(\.[0-9]+)?)? -m orchestrator mac-translation-worker$'
+# Stop only exact terminal duplicates found above; then confirm they are absent.
 ./scripts/install_mac_worker_launchd.sh
 ```
 
 The script lints and installs both plists, bootstraps the downloader first, and then
-replaces only the two managed launchd services. Check each exact label and confirm
-one PID per command:
+replaces only the two managed launchd services. After it exits 0, check each exact
+label and confirm one PID per command:
 
 ```bash
 DOMAIN=gui/$(id -u)
@@ -202,33 +239,6 @@ pgrep -fal \
 
 The historical controller is not installed by this script and must never be
 mistaken for a third worker.
-
-Before starting either launchd service in production, check required configuration
-presence without printing values, then run the fixed safe smoke. Stop if any name is
-missing or the smoke exits nonzero:
-
-```bash
-cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
-set -a
-source .env
-set +a
-missing=0
-for name in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY \
-  JAVSUBTITLE_API_BASE JAVSUBTITLE_ADMIN_API_TOKEN; do
-  if [[ -n "$(printenv "$name" 2>/dev/null)" ]]; then
-    printf '%s=present\n' "$name"
-  else
-    printf '%s=missing\n' "$name"
-    missing=1
-  fi
-done
-(( missing == 0 ))
-.venv/bin/python -m orchestrator mac-translation-smoke-test
-```
-
-The smoke must exit 0 and report `cues=10`, `unique_ratio>=0.500`, and
-`known_bad=0`. Its fixed safe sentences are not job subtitles. Never print the
-environment values or include translated cue text in a report.
 
 ## Historical repair planning (dry-run only)
 
@@ -294,10 +304,18 @@ current authority.
 
 ## Normal-first historical controller
 
-Start the controller only after exactly one healthy launchd translation worker has
-passed startup smoke and the explicitly approved initial batch is terminal. The
-controller uses the same immutable planning/enqueue checks, starts with at most five
-records, and enqueues at most 20 in later batches:
+Do not start the controller until the new-production canary has completed the full
+state flow through `english_srt_ready`, all local/Supabase/catalog/visibility checks
+have succeeded, and its evidence report has been written. Historical repair then
+requires a separate explicit batch approval; successful canary approval alone is
+not authorization. Also require exactly one healthy launchd translation worker and
+a passing startup smoke.
+
+With no existing historical repair records, the controller itself creates the
+immutable plan and enqueues the first approved batch of at most five records. The
+single translation worker executes those records one at a time. After that batch is
+terminal, the controller may automatically plan and enqueue later batches of at
+most 20 within the explicitly approved controller/allowlist scope:
 
 ```bash
 .venv/bin/python -m orchestrator historical-repair-controller \
@@ -313,6 +331,11 @@ publication, or catalog-sync backlog exists, then waits for the prior historical
 batch to become terminal before planning another. A normal job arriving during one
 already-running historical unit is selected before the next historical record.
 There is never a second TranslateLocally process.
+
+The manual immutable enqueue command in the preceding section is an alternative
+explicitly approved first-batch path, not an extra batch. If it was used, the
+controller detects those pending records and waits for them; it does not recreate
+or duplicate the first batch.
 
 Each stdout line is a path-free JSON receipt with `action`, `reason_code`, plan and
 allowlist hashes, and counts. `waiting` is healthy and keeps polling; `complete`
@@ -584,11 +607,16 @@ The one-shot worker runs startup smoke and can claim only that exact ID. It move
 the old English SRT into `rejected/`, retains it, preserves Japanese SRT and any
 preexisting `audio.wav`, and preserves audio absence when historical cleanup already
 removed it. It translates, runs the pair quality gate, upserts Supabase, and verifies
-Storage SHA-256 plus the `movie_languages` catalog record before marking ready. A
-quality failure never creates catalog data or uploads and is permanent. A transient
-publishing or verification failure returns to `publish_pending` under the bounded,
-independent publication retry counter; it never triggers retranslation. A
-code-only placeholder catalog result is allowed and successful.
+Storage SHA-256 plus the `movie_languages` catalog record before entering
+`catalog_sync_pending`. A quality failure never creates catalog data or uploads and
+is permanent. A transient Supabase publication, Storage, or `movie_languages`
+verification failure returns to `publish_pending` under the bounded, independent
+publication retry counter. Once Supabase publication has succeeded, a
+javsubtitle.com exact catalog-sync or public-API visibility failure remains in or
+returns to `catalog_sync_pending`; its retry only revalidates the stored verified
+Supabase receipt and repeats the exact sync/visibility checks. Neither retry path
+retranslates, and the catalog path never republishes Supabase. A code-only
+placeholder catalog result is allowed and successful.
 
 After local, Supabase, CDN, and `https://javsubtitle.com` verification succeeds,
 restart the normal `mac-translation-worker`. This procedure authorizes one canary
