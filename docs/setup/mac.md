@@ -198,9 +198,11 @@ status words, rejects empty or known placeholder/example values, requires
 publication to be enabled, and runs the fixed smoke only after every configuration
 check passes. It first unsets only the four remote credentials and the publish flag
 so interactive-shell exports cannot override the production checkout's `.env`.
-The preflight, smoke, and later launchd services therefore use the same file-backed
-configuration. Do not unset `TRANSLATELOCALLY_PATH` or `TRANSLATELOCALLY_MODEL`;
-`MacSettings` loads them from the same `.env` and exports them for the smoke runtime.
+The preflight process and smoke process each construct their own `MacSettings` and
+read that same production `.env`; the later launchd services do the same. Do not
+unset `TRANSLATELOCALLY_PATH` or `TRANSLATELOCALLY_MODEL`. The smoke process's own
+`MacSettings` loads those values and exports them for its translation runtime; the
+preflight process does not export them.
 
 ```bash
 cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
@@ -231,13 +233,19 @@ def production_url(value: object) -> bool:
     raw = value.strip()
     try:
         parsed = urlsplit(raw)
-        host = (parsed.hostname or "").lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
     except ValueError:
         return False
+    if not host:
+        return False
     try:
-        loopback = ip_address(host).is_loopback
+        address = ip_address(host)
     except ValueError:
-        loopback = False
+        address = None
+    loopback = address is not None and address.is_loopback
+    numeric_host = re.fullmatch(r"[0-9.]+", host) is not None
+    noncanonical_numeric_host = numeric_host and address is None
+    decimal_integer_host = host.isdecimal()
     host_tokens = {
         token
         for label in host.split(".")
@@ -247,6 +255,8 @@ def production_url(value: object) -> bool:
     placeholder_host = (
         not host
         or loopback
+        or noncanonical_numeric_host
+        or decimal_integer_host
         or host in {"example", "invalid", "test", "localhost"}
         or host.endswith((".example", ".invalid", ".test", ".localhost"))
         or bool(
