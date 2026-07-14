@@ -138,8 +138,14 @@ class CatalogSyncClient:
             raise CatalogSyncError("catalog_response_invalid")
 
         result_rows = body.get("results")
+        body_keys = set(body)
+        allowed_body_keys = {"success", "requested", "synced", "failed", "results"}
+        if body_keys == allowed_body_keys | {"dryRun"}:
+            dry_run_valid = body.get("dryRun") is False
+        else:
+            dry_run_valid = body_keys == allowed_body_keys
         if (
-            set(body) != {"success", "requested", "synced", "failed", "results"}
+            not dry_run_valid
             or body.get("success") is not True
             or not self._exact_int(body.get("requested"), 1)
             or not self._exact_int(body.get("synced"), 1)
@@ -153,22 +159,34 @@ class CatalogSyncClient:
         row = result_rows[0]
         d1_rows_updated = row.get("d1RowsUpdated")
         subtitle_count = row.get("subtitleCount")
-        kv_keys_deleted = row.get("kvKeysDeleted")
+        row_keys = set(row)
+        if row_keys == {
+            "canonicalCode",
+            "d1RowsUpdated",
+            "subtitleCount",
+            "kvKeysDeleted",
+            "dryRun",
+        }:
+            kv_keys_deleted = row.get("kvKeysDeleted")
+            row_schema_valid = row.get("dryRun") is False
+        elif row_keys == {
+            "canonicalCode",
+            "d1RowsUpdated",
+            "subtitleCount",
+            "kvKeysTouched",
+        }:
+            kv_keys_deleted = row.get("kvKeysTouched")
+            row_schema_valid = True
+        else:
+            kv_keys_deleted = None
+            row_schema_valid = False
         expected_kv_keys = {
             f"movie:full:{canonical}",
             f"movie:light:{canonical}",
         }
         if (
-            set(row)
-            != {
-                "canonicalCode",
-                "d1RowsUpdated",
-                "subtitleCount",
-                "kvKeysDeleted",
-                "dryRun",
-            }
+            not row_schema_valid
             or row.get("canonicalCode") != canonical
-            or row.get("dryRun") is not False
             or not self._positive_int(d1_rows_updated)
             or not self._positive_int(subtitle_count)
             or not isinstance(kv_keys_deleted, list)

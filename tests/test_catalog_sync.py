@@ -38,6 +38,27 @@ def valid_body() -> dict[str, object]:
     }
 
 
+def valid_current_body() -> dict[str, object]:
+    return {
+        "success": True,
+        "requested": 1,
+        "synced": 1,
+        "failed": [],
+        "dryRun": False,
+        "results": [
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "d1RowsUpdated": 2,
+                "subtitleCount": 3,
+                "kvKeysTouched": [
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+            }
+        ],
+    }
+
+
 def valid_public_body() -> dict[str, object]:
     return {
         "canonicalCode": CANONICAL_CODE,
@@ -177,6 +198,20 @@ def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
             {"timeout": 17, "allow_redirects": False},
         ),
     ]
+
+
+def test_sync_accepts_current_catalog_response_schema():
+    result = sync_with_response(200, body=valid_current_body())
+
+    assert result == CatalogSyncResult(
+        canonical_code=CANONICAL_CODE,
+        d1_rows_updated=2,
+        subtitle_count=3,
+        kv_keys_deleted=(
+            f"movie:full:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+        ),
+    )
 
 
 @pytest.mark.parametrize(
