@@ -159,11 +159,44 @@ class WorkerHealthSummary(BaseModel):
     last_error: str | None = None
 
 
+class HistoricalRepairDashboardCounts(BaseModel):
+    total: int = 0
+    pending: int = 0
+    running: int = 0
+    retry_wait: int = 0
+    succeeded: int = 0
+    permanent_failed: int = 0
+
+
+class HistoricalRepairDashboardActive(BaseModel):
+    batch_id: str
+    repair_id: str
+    job_id: str
+    movie_number: str
+    stage: str
+    state: str
+    updated_at: str
+
+
+class HistoricalRepairDashboardProgress(BaseModel):
+    counts: HistoricalRepairDashboardCounts = Field(
+        default_factory=HistoricalRepairDashboardCounts
+    )
+    active: HistoricalRepairDashboardActive | None = None
+    lane_paused: bool = False
+    reason_code: str | None = None
+    consecutive_quality_failures: int = 0
+    updated_at: str | None = None
+
+
 class DashboardStateResponse(BaseModel):
     api: dict[str, str | bool]
     activity: dict[str, dict[str, str | None]]
     counts: dict[str, int]
-    workers: list[WorkerHealthSummary] = []
+    historical_repairs: HistoricalRepairDashboardProgress = Field(
+        default_factory=HistoricalRepairDashboardProgress
+    )
+    workers: list[WorkerHealthSummary] = Field(default_factory=list)
     latest_jobs: list[DashboardJobSummary]
     active_errors: list[DashboardJobSummary]
 

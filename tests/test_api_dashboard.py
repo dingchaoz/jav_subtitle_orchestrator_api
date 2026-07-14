@@ -1,8 +1,50 @@
+import sqlite3
+from contextlib import closing
+
 from fastapi.testclient import TestClient
 
 from orchestrator.api import create_app
 from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
+
+
+def insert_running_historical_repair(store, sqlite_path, movie_code):
+    job = store.submit_job(movie_code, priority=100, force=False).job
+    with closing(sqlite3.connect(sqlite_path)) as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, translation_origin = 'historical', "
+            "claimed_by = 'mac-translation-1', updated_at = ? WHERE id = ?",
+            (
+                JobStatus.CATALOG_SYNCING.value,
+                "2026-07-05T10:00:00+00:00",
+                job.id,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO historical_translation_repairs (
+              id, batch_id, job_id, movie_code, allowlist_sha256, state,
+              attempt_count, next_attempt_at, reason_code, japanese_sha256,
+              audio_probe_snapshot_sha256, audio_sha256,
+              source_english_sha256, english_sha256, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'running', 1, NULL, NULL, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                "repair_api_001",
+                "batch_api_001",
+                job.id,
+                movie_code,
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "5" * 64,
+                "2026-07-05T10:00:00+00:00",
+                "2026-07-05T10:00:00+00:00",
+            ),
+        )
+        conn.commit()
+    return job
 
 
 def test_dashboard_state_endpoint_returns_counts_latest_jobs_and_errors(
@@ -24,6 +66,45 @@ def test_dashboard_state_endpoint_returns_counts_latest_jobs_and_errors(
     assert body["counts"]["failed"] == 1
     assert [job["movie_number"] for job in body["active_errors"]] == ["ktb-095"]
     assert {job["movie_number"] for job in body["latest_jobs"]} == {"ktb-096", "ktb-095"}
+
+
+def test_dashboard_state_endpoint_serializes_typed_historical_progress(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = insert_running_historical_repair(store, sqlite_path, "old-401")
+    client = TestClient(create_app(store))
+
+    response = client.get("/dashboard/state")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["historical_repairs"] == {
+        "counts": {
+            "total": 1,
+            "pending": 0,
+            "running": 1,
+            "retry_wait": 0,
+            "succeeded": 0,
+            "permanent_failed": 0,
+        },
+        "active": {
+            "batch_id": "batch_api_001",
+            "repair_id": "repair_api_001",
+            "job_id": job.id,
+            "movie_number": "old-401",
+            "stage": "catalog_syncing",
+            "state": "running",
+            "updated_at": "2026-07-05T10:00:00+00:00",
+        },
+        "lane_paused": False,
+        "reason_code": None,
+        "consecutive_quality_failures": 0,
+        "updated_at": body["historical_repairs"]["updated_at"],
+    }
+    assert body["activity"]["historical_translation"]["job_id"] == job.id
+    assert body["activity"]["historical_translation"]["stage"] == "catalog_syncing"
 
 
 def test_dashboard_state_includes_claimed_worker_and_error_in_latest_jobs(
@@ -236,3 +317,37 @@ def test_dashboard_shows_only_read_only_historical_repair_guidance(
     assert "plan-historical-subtitle-repair" in html
     assert "--allowlist abc-001 --limit 1" in html
     assert "repair/apply" not in html
+
+
+def test_dashboard_contains_safe_read_only_historical_progress_card(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    html = TestClient(create_app(store)).get("/dashboard").text
+
+    assert "History repair" in html
+    for element_id in (
+        "history-repair-status",
+        "history-repair-meta",
+        "history-repair-counts",
+        "history-repair-current",
+        "history-repair-pause",
+    ):
+        assert f'id="{element_id}"' in html
+    assert "state.historical_repairs" in html
+    assert "state.activity.historical_translation" in html
+    assert "renderHistoricalRepairs" in html
+    assert "history-repair-counts\").textContent" in html
+    assert "history-repair-current\").textContent" in html
+    assert "history-repair-pause\").textContent" in html
+    assert "history-repair-counts\").innerHTML" not in html
+    assert "history-repair-current\").innerHTML" not in html
+    assert "history-repair-pause\").innerHTML" not in html
+    for forbidden_control in (
+        "history-repair-resume",
+        "history-repair-requeue",
+        "history-repair-delete",
+        "history-repair-upload",
+    ):
+        assert forbidden_control not in html

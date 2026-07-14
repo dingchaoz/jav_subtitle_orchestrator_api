@@ -8,6 +8,9 @@ from pathlib import Path
 from orchestrator.models import (
     DashboardJobSummary,
     DashboardStateResponse,
+    HistoricalRepairDashboardActive,
+    HistoricalRepairDashboardCounts,
+    HistoricalRepairDashboardProgress,
     JobBrowserItem,
     JobBrowserResponse,
     JobDetailResponse,
@@ -17,7 +20,13 @@ from orchestrator.models import (
     JobStatus,
     WorkerHealthSummary,
 )
-from orchestrator.store import JobRecord, JobStore, WorkerStatusRecord
+from orchestrator.store import (
+    NORMAL_TRANSLATION_ORIGIN,
+    HistoricalRepairDashboardSnapshot,
+    JobRecord,
+    JobStore,
+    WorkerStatusRecord,
+)
 
 
 MAC_ACTIVE_STATUSES = {
@@ -34,6 +43,8 @@ MAC_TRANSLATION_STATUSES = {
     JobStatus.TRANSLATING,
     JobStatus.PUBLISH_PENDING,
     JobStatus.PUBLISHING,
+    JobStatus.CATALOG_SYNC_PENDING,
+    JobStatus.CATALOG_SYNCING,
 }
 
 SUBTITLE_PROCESSING_STATUSES = {
@@ -53,10 +64,37 @@ ACTIVE_BROWSER_STATUSES = {
     JobStatus.TRANSLATING,
     JobStatus.PUBLISH_PENDING,
     JobStatus.PUBLISHING,
+    JobStatus.CATALOG_SYNC_PENDING,
+    JobStatus.CATALOG_SYNCING,
 }
 
 IN_PROGRESS_BROWSER_STATUSES = ACTIVE_BROWSER_STATUSES - {JobStatus.QUEUED}
 JOB_BROWSER_VIEWS = {"active", "queued", "ready", "failed", "all"}
+
+SAFE_HISTORICAL_DASHBOARD_REASONS = frozenset(
+    {
+        "allowlist_changed",
+        "catalog_auth_failed",
+        "catalog_redirect_rejected",
+        "catalog_response_invalid",
+        "catalog_response_mismatch",
+        "catalog_sync_failed",
+        "historical_controller_state_unavailable",
+        "historical_lane_paused",
+        "operator_pause",
+        "plan_digest_changed",
+        "preservation_hash_changed",
+        "publication_configuration_missing",
+        "public_visibility_failed",
+        "public_visibility_mismatch",
+        "public_visibility_redirect_rejected",
+        "public_visibility_response_invalid",
+        "quality_failure_limit",
+        "quarantine_failed",
+        "supabase_verification_failed",
+        "translation_worker_count_mismatch",
+    }
+)
 
 
 def job_summary(job: JobRecord) -> DashboardJobSummary:
@@ -120,8 +158,18 @@ def dashboard_recency_key(job: JobRecord) -> tuple[str, str, str]:
     return (job.updated_at, job.created_at, job.id)
 
 
-def _latest_active_job(jobs: list[JobRecord], statuses: set[JobStatus]) -> JobRecord | None:
-    candidates = [job for job in jobs if job.status in statuses]
+def _latest_active_job(
+    jobs: list[JobRecord],
+    statuses: set[JobStatus],
+    *,
+    origin: str | None = None,
+) -> JobRecord | None:
+    candidates = [
+        job
+        for job in jobs
+        if job.status in statuses
+        and (origin is None or job.translation_origin == origin)
+    ]
     if not candidates:
         return None
     return sorted(candidates, key=dashboard_recency_key, reverse=True)[0]
@@ -222,9 +270,28 @@ def _role_activity_payload(
     fallback_job: JobRecord | None,
     workers: list[WorkerHealthSummary],
     role: str,
+    *,
+    allowed_job_ids: set[str] | None = None,
 ) -> dict[str, str | None]:
-    matching = [worker for worker in workers if worker.role == role]
-    processing = [worker for worker in matching if worker.state == "processing"]
+    matching = [
+        worker
+        for worker in workers
+        if worker.role == role
+        and (
+            allowed_job_ids is None
+            or worker.current_job_id is None
+            or worker.current_job_id in allowed_job_ids
+        )
+    ]
+    processing = [
+        worker
+        for worker in matching
+        if worker.state == "processing"
+        and (
+            allowed_job_ids is None
+            or worker.current_job_id in allowed_job_ids
+        )
+    ]
     if processing:
         worker = processing[0]
         return {
@@ -248,6 +315,72 @@ def _role_activity_payload(
     return _activity_payload(None)
 
 
+def _safe_historical_reason(reason_code: str | None) -> str | None:
+    if reason_code is None:
+        return None
+    if reason_code in SAFE_HISTORICAL_DASHBOARD_REASONS:
+        return reason_code
+    return "historical_error"
+
+
+def _historical_progress(
+    snapshot: HistoricalRepairDashboardSnapshot,
+) -> HistoricalRepairDashboardProgress:
+    active = snapshot.active
+    return HistoricalRepairDashboardProgress(
+        counts=HistoricalRepairDashboardCounts(
+            total=snapshot.total,
+            pending=snapshot.pending,
+            running=snapshot.running,
+            retry_wait=snapshot.retry_wait,
+            succeeded=snapshot.succeeded,
+            permanent_failed=snapshot.permanent_failed,
+        ),
+        active=(
+            HistoricalRepairDashboardActive(
+                batch_id=active.batch_id,
+                repair_id=active.repair_id,
+                job_id=active.job_id,
+                movie_number=active.movie_number,
+                stage=active.stage,
+                state=active.state,
+                updated_at=active.updated_at,
+            )
+            if active is not None
+            else None
+        ),
+        lane_paused=snapshot.lane_paused,
+        reason_code=_safe_historical_reason(snapshot.reason_code),
+        consecutive_quality_failures=snapshot.consecutive_quality_failures,
+        updated_at=snapshot.updated_at,
+    )
+
+
+def _historical_activity_payload(
+    snapshot: HistoricalRepairDashboardSnapshot,
+) -> dict[str, str | None]:
+    active = snapshot.active
+    if active is None:
+        return {
+            "status": "paused" if snapshot.lane_paused else "idle",
+            "movie_number": None,
+            "job_id": None,
+            "worker_id": None,
+            "updated_at": snapshot.updated_at,
+            "stage": None,
+            "state": None,
+        }
+    return {
+        "status": active.stage,
+        "movie_number": active.movie_number,
+        "job_id": active.job_id,
+        "worker_id": active.worker_id,
+        "updated_at": active.updated_at,
+        "stage": active.stage,
+        "state": active.state,
+    }
+
+
 def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> DashboardStateResponse:
     jobs = store.list_jobs()
     counts = Counter(job.status.value for job in jobs)
@@ -257,10 +390,22 @@ def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> Dashboa
         for job in sorted(jobs, key=dashboard_recency_key, reverse=True)
         if job_has_active_error(job)
     ]
-    mac_job = _latest_active_job(jobs, MAC_ACTIVE_STATUSES)
-    processing_job = _latest_active_job(jobs, SUBTITLE_PROCESSING_STATUSES)
-    windows_job = _latest_active_job(jobs, WINDOWS_TRANSCRIPTION_STATUSES)
-    translation_job = _latest_active_job(jobs, MAC_TRANSLATION_STATUSES)
+    mac_job = _latest_active_job(
+        jobs, MAC_ACTIVE_STATUSES, origin=NORMAL_TRANSLATION_ORIGIN
+    )
+    processing_job = _latest_active_job(
+        jobs, SUBTITLE_PROCESSING_STATUSES, origin=NORMAL_TRANSLATION_ORIGIN
+    )
+    windows_job = _latest_active_job(
+        jobs, WINDOWS_TRANSCRIPTION_STATUSES, origin=NORMAL_TRANSLATION_ORIGIN
+    )
+    translation_job = _latest_active_job(
+        jobs, MAC_TRANSLATION_STATUSES, origin=NORMAL_TRANSLATION_ORIGIN
+    )
+    normal_job_ids = {
+        job.id for job in jobs if job.translation_origin == NORMAL_TRANSLATION_ORIGIN
+    }
+    historical_snapshot = store.historical_repair_dashboard_snapshot()
     now = datetime.now(UTC).replace(microsecond=0)
     workers = [
         worker_health_summary(worker, now=now)
@@ -279,10 +424,23 @@ def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> Dashboa
             "mac_download": _role_activity_payload(mac_job, workers, "mac_downloader"),
             "windows": _windows_activity_payload(windows_job, workers),
             "translation": _role_activity_payload(
-                translation_job, workers, "mac_translator"
+                translation_job,
+                workers,
+                "mac_translator",
+                allowed_job_ids=normal_job_ids,
+            ),
+            "mac_translation": _role_activity_payload(
+                translation_job,
+                workers,
+                "mac_translator",
+                allowed_job_ids=normal_job_ids,
+            ),
+            "historical_translation": _historical_activity_payload(
+                historical_snapshot
             ),
         },
         counts=dict(counts),
+        historical_repairs=_historical_progress(historical_snapshot),
         workers=workers,
         latest_jobs=[job_summary(job) for job in latest],
         active_errors=[job_summary(job) for job in errors],
@@ -938,6 +1096,14 @@ def dashboard_html() -> str:
         <div class="health-meta" id="translation-meta">Fetching state</div>
       </article>
       <article class="health-card">
+        <div class="health-title">History repair</div>
+        <div class="health-value" id="history-repair-status">Loading</div>
+        <div class="health-meta" id="history-repair-meta">Fetching state</div>
+        <div class="health-meta" id="history-repair-counts">No counts yet</div>
+        <div class="health-meta" id="history-repair-current">No active repair</div>
+        <div class="health-meta" id="history-repair-pause">Pause state unknown</div>
+      </article>
+      <article class="health-card">
         <div class="health-title">Active errors</div>
         <div class="health-value" id="errors-status">Loading</div>
         <div class="health-meta" id="errors-meta">Fetching state</div>
@@ -1165,6 +1331,30 @@ def dashboard_html() -> str:
       return workerStatusClass(activity.status);
     }
 
+    function renderHistoricalRepairs(state) {
+      const progress = state.historical_repairs || {};
+      const counts = progress.counts || {};
+      const active = progress.active || null;
+      const activity = state.activity.historical_translation || {};
+      const paused = Boolean(progress.lane_paused);
+      const status = paused
+        ? "Paused"
+        : (active ? text(activity.stage, active.stage) : "Idle");
+      const statusElement = document.getElementById("history-repair-status");
+      statusElement.textContent = status;
+      statusElement.className = `health-value ${paused ? "status-error" : workerStatusClass(activity.status)}`;
+      document.getElementById("history-repair-meta").textContent =
+        `Updated ${formatDate(progress.updated_at)}`;
+      document.getElementById("history-repair-counts").textContent =
+        `Total ${text(counts.total, "0")}; pending ${text(counts.pending, "0")}; running ${text(counts.running, "0")}; retry ${text(counts.retry_wait, "0")}; succeeded ${text(counts.succeeded, "0")}; failed ${text(counts.permanent_failed, "0")}`;
+      document.getElementById("history-repair-current").textContent = active
+        ? `${active.movie_number}; ${active.stage}; batch ${active.batch_id}; job ${active.job_id}`
+        : "No active historical repair";
+      document.getElementById("history-repair-pause").textContent = paused
+        ? `Paused: ${text(progress.reason_code, "historical_error")}; consecutive quality failures ${text(progress.consecutive_quality_failures, "0")}`
+        : `Lane active; consecutive quality failures ${text(progress.consecutive_quality_failures, "0")}`;
+    }
+
     function renderHealth(state) {
       setHealth(
         "api",
@@ -1175,7 +1365,7 @@ def dashboard_html() -> str:
 
       const mac = state.activity.mac_download || state.activity.mac || {};
       const windowsActivity = state.activity.windows || {};
-      const translationActivity = state.activity.translation || {};
+      const translationActivity = state.activity.mac_translation || state.activity.translation || {};
       const windowsWorkers = (state.workers || []).filter(
         (worker) => worker.role === "windows" || worker.role === "windows_transcriber"
       );
@@ -1215,6 +1405,7 @@ def dashboard_html() -> str:
           : "No active Mac translation job",
         windowsHealthClass(translationWorker, translationActivity)
       );
+      renderHistoricalRepairs(state);
       setHealth(
         "errors",
         String(errors.length),
