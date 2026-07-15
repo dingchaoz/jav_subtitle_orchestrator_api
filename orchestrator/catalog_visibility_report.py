@@ -36,8 +36,8 @@ MAX_CHECKPOINT_LINE_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 100
 _SECURE_DIR_FD_SUPPORTED = all(
     operation in os.supports_dir_fd
-    for operation in (os.open, os.mkdir, os.unlink, os.link)
-)
+    for operation in (os.open, os.mkdir, os.unlink, os.link, os.stat)
+) and os.stat in os.supports_follow_symlinks and os.listdir in os.supports_fd
 _CHECKPOINT_PROCESS_LOCK = threading.RLock()
 
 _MANIFEST_FILE_NAME = "audit-manifest.json"
@@ -569,14 +569,104 @@ def _validate_regular_fd(descriptor: int, label: str) -> os.stat_result:
     return file_stat
 
 
-def _open_existing_leaf(directory_fd: int, name: str, flags: int, label: str) -> int:
+def _open_leaf_without_link_validation(
+    directory_fd: int,
+    name: str,
+    flags: int,
+    label: str,
+) -> int:
     try:
         descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory_fd)
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
             raise
         raise ValueError(f"{label} cannot be opened safely") from exc
+    file_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(file_stat.st_mode):
+        _close_ignoring_error(descriptor)
+        raise ValueError(f"{label} is not a regular file")
+    return descriptor
+
+
+def _open_existing_leaf(directory_fd: int, name: str, flags: int, label: str) -> int:
+    descriptor = _open_leaf_without_link_validation(
+        directory_fd,
+        name,
+        flags,
+        label,
+    )
     try:
+        _validate_regular_fd(descriptor, label)
+        return descriptor
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+
+
+def _recover_owned_temp_hardlink(
+    directory_fd: int,
+    final_name: str,
+    final_fd: int,
+    label: str,
+) -> None:
+    final_stat = os.fstat(final_fd)
+    expected_mode = 0o600
+    if (
+        not stat.S_ISREG(final_stat.st_mode)
+        or final_stat.st_nlink != 2
+        or final_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(final_stat.st_mode) != expected_mode
+    ):
+        raise ValueError(f"{label} has an unsafe hardlink")
+    pattern = re.compile(
+        rf"^\.{re.escape(final_name)}\.[0-9a-f]{{32}}\.tmp$"
+    )
+    temp_names = [name for name in os.listdir(directory_fd) if pattern.fullmatch(name)]
+    if len(temp_names) != 1:
+        raise ValueError(f"{label} has an unsafe hardlink")
+    temp_name = temp_names[0]
+    temp_stat = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(temp_stat.st_mode)
+        or temp_stat.st_dev != final_stat.st_dev
+        or temp_stat.st_ino != final_stat.st_ino
+        or temp_stat.st_nlink != 2
+        or temp_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(temp_stat.st_mode) != expected_mode
+    ):
+        raise ValueError(f"{label} has an unsafe hardlink")
+    os.unlink(temp_name, dir_fd=directory_fd)
+    _fsync_directory_fd(directory_fd)
+    recovered = os.fstat(final_fd)
+    if (
+        recovered.st_dev != final_stat.st_dev
+        or recovered.st_ino != final_stat.st_ino
+        or recovered.st_nlink != 1
+    ):
+        raise ValueError(f"{label} hardlink recovery failed")
+
+
+def _open_artifact_leaf(
+    directory_fd: int,
+    name: str,
+    flags: int,
+    label: str,
+) -> int:
+    descriptor = _open_leaf_without_link_validation(
+        directory_fd,
+        name,
+        flags,
+        label,
+    )
+    try:
+        file_stat = os.fstat(descriptor)
+        if file_stat.st_nlink == 2:
+            _recover_owned_temp_hardlink(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+            )
         _validate_regular_fd(descriptor, label)
         return descriptor
     except BaseException:
@@ -603,10 +693,18 @@ def _read_fd_limited(descriptor: int, label: str, limit: int) -> bytes:
     return data
 
 
-def _safe_read_bytes(path: Path, label: str = "audit file") -> bytes:
+def _safe_read_bytes(
+    path: Path,
+    label: str = "audit file",
+    *,
+    recover_owned_temp: bool = False,
+) -> bytes:
     parent, name = _leaf_parent(path)
     with _pinned_directory(parent, create=False) as directory_fd:
-        descriptor = _open_existing_leaf(directory_fd, name, os.O_RDONLY, label)
+        if recover_owned_temp:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        opener = _open_artifact_leaf if recover_owned_temp else _open_existing_leaf
+        descriptor = opener(directory_fd, name, os.O_RDONLY, label)
         try:
             data = _read_fd_limited(descriptor, label, MAX_AUDIT_DOCUMENT_BYTES)
         except BaseException:
@@ -666,6 +764,29 @@ def _unlink_at_ignoring_error(directory_fd: int, name: str) -> None:
         pass
 
 
+def _remove_just_installed_final(
+    directory_fd: int,
+    temp_name: str,
+    final_name: str,
+) -> None:
+    try:
+        temp_stat = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+        final_stat = os.stat(final_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            stat.S_ISREG(temp_stat.st_mode)
+            and stat.S_ISREG(final_stat.st_mode)
+            and temp_stat.st_dev == final_stat.st_dev
+            and temp_stat.st_ino == final_stat.st_ino
+            and temp_stat.st_nlink == final_stat.st_nlink == 2
+            and temp_stat.st_uid == final_stat.st_uid == os.geteuid()
+            and stat.S_IMODE(temp_stat.st_mode) == 0o600
+            and stat.S_IMODE(final_stat.st_mode) == 0o600
+        ):
+            os.unlink(final_name, dir_fd=directory_fd)
+    except OSError:
+        pass
+
+
 def _atomic_install_no_clobber(
     directory_fd: int,
     final_name: str,
@@ -707,6 +828,12 @@ def _atomic_install_no_clobber(
         return installed
     except BaseException:
         _close_ignoring_error(descriptor)
+        if installed:
+            _remove_just_installed_final(
+                directory_fd,
+                temp_name,
+                final_name,
+            )
         _unlink_at_ignoring_error(directory_fd, temp_name)
         try:
             _fsync_directory_fd(directory_fd)
@@ -739,7 +866,7 @@ def write_audit_manifest(
         )
         if installed:
             return
-        descriptor = _open_existing_leaf(
+        descriptor = _open_artifact_leaf(
             directory_fd,
             _MANIFEST_FILE_NAME,
             os.O_RDWR,
@@ -760,7 +887,11 @@ def write_audit_manifest(
 
 def load_audit_manifest(path: str | os.PathLike[str]) -> AuditManifest:
     payload = _decode_json(
-        _safe_read_bytes(Path(path), "audit manifest"),
+        _safe_read_bytes(
+            Path(path),
+            "audit manifest",
+            recover_owned_temp=True,
+        ),
         "audit manifest",
     )
     return _manifest_from_obj(payload)
@@ -845,7 +976,8 @@ def _match_finding_to_manifest(
 
 
 def _load_manifest_at(directory_fd: int) -> AuditManifest:
-    descriptor = _open_existing_leaf(
+    fcntl.flock(directory_fd, fcntl.LOCK_EX)
+    descriptor = _open_artifact_leaf(
         directory_fd,
         _MANIFEST_FILE_NAME,
         os.O_RDONLY,
@@ -968,21 +1100,27 @@ def _append_audit_finding_locked(
         original_size: int | None = None
         row_durable = False
         try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            _validate_regular_fd(descriptor, "audit checkpoint")
+            existing = _load_findings_from_fd(descriptor, manifest)
             original_size = _validate_regular_fd(
                 descriptor,
                 "audit checkpoint",
             ).st_size
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            existing = _load_findings_from_fd(descriptor, manifest)
             if finding.candidate.job_id in {
                 item.candidate.job_id for item in existing
             }:
                 raise ValueError("audit checkpoint already contains this job finding")
             os.fchmod(descriptor, 0o600)
+            _validate_regular_fd(descriptor, "audit checkpoint")
             written = os.write(descriptor, row)
             if written != len(row):
                 raise OSError("audit checkpoint append was incomplete")
+            if os.fstat(descriptor).st_nlink != 1:
+                raise ValueError("audit checkpoint hardlink race detected")
             os.fsync(descriptor)
+            if os.fstat(descriptor).st_nlink != 1:
+                raise ValueError("audit checkpoint hardlink race detected")
             row_durable = True
             if created:
                 _fsync_directory_fd(directory_fd)
@@ -1127,7 +1265,7 @@ def _finalize_audit_report_locked(
         )
         if installed:
             return report
-        descriptor = _open_existing_leaf(
+        descriptor = _open_artifact_leaf(
             directory_fd,
             _REPORT_FILE_NAME,
             os.O_RDWR,
@@ -1155,7 +1293,11 @@ def finalize_audit_report(output_dir: str | os.PathLike[str]) -> AuditReport:
 def load_audit_report(path: str | os.PathLike[str]) -> AuditReport:
     return _report_from_obj(
         _decode_json(
-            _safe_read_bytes(Path(path), "audit report"),
+            _safe_read_bytes(
+                Path(path),
+                "audit report",
+                recover_owned_temp=True,
+            ),
             "audit report",
         )
     )

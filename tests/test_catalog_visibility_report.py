@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import stat
@@ -1093,3 +1094,146 @@ def test_parent_traversal_is_rejected(
 
     with pytest.raises(ValueError):
         write_audit_manifest(unsafe, manifest)
+
+
+def test_waiting_writer_rollback_preserves_prior_locked_append(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    second = replace(
+        candidate,
+        job_id="job-2",
+        movie_code="abc-001",
+        subtitle_id="11111111-2222-4333-8444-555555555555",
+        storage_path="abc/abc-001/abc-001-English_AI.srt",
+    )
+    manifest = write_manifest(tmp_path, candidate, second)
+    real_flock = fcntl.flock
+    real_fsync = os.fsync
+    waiting_fd = None
+    interleaved = False
+    first = finding(candidate)
+    first_row = (
+        canonical_line(
+            {
+                "schema_version": 1,
+                "candidate": asdict(first.candidate),
+                "status": first.status,
+                "reason_code": first.reason_code,
+                "observed_subtitle_ids": list(first.observed_subtitle_ids),
+            }
+        )
+        + "\n"
+    ).encode()
+
+    def interleaving_flock(descriptor: int, operation: int):
+        nonlocal waiting_fd, interleaved
+        if (
+            operation == fcntl.LOCK_EX
+            and not interleaved
+            and stat.S_ISREG(os.fstat(descriptor).st_mode)
+        ):
+            interleaved = True
+            waiting_fd = descriptor
+            prior_fd = os.open(
+                tmp_path / "audit-findings.jsonl", os.O_WRONLY | os.O_APPEND
+            )
+            try:
+                assert os.write(prior_fd, first_row) == len(first_row)
+                real_fsync(prior_fd)
+            finally:
+                os.close(prior_fd)
+        return real_flock(descriptor, operation)
+
+    def fail_waiting_writer_fsync(descriptor: int):
+        if interleaved and descriptor == waiting_fd:
+            raise OSError("injected waiting writer fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(fcntl, "flock", interleaving_flock)
+    monkeypatch.setattr(os, "fsync", fail_waiting_writer_fsync)
+    with pytest.raises(OSError, match="waiting writer"):
+        append_audit_finding(tmp_path, finding(second, "missing"))
+
+    assert load_audit_findings(tmp_path, manifest) == (first,)
+
+
+def test_owned_manifest_temp_hardlink_is_recovered_after_crash_window(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = make_manifest(tmp_path, candidate)
+    real_unlink = os.unlink
+
+    def fail_install_cleanup(path, *args, **kwargs):
+        name = os.fspath(path)
+        if name == "audit-manifest.json" or name.startswith(
+            ".audit-manifest.json."
+        ):
+            raise OSError("simulated crash-window unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", fail_install_cleanup)
+    with pytest.raises(OSError, match="crash-window"):
+        write_audit_manifest(tmp_path, manifest)
+    final_path = tmp_path / "audit-manifest.json"
+    assert final_path.stat().st_nlink == 2
+    assert len(list(tmp_path.glob(".audit-manifest.json.*.tmp"))) == 1
+
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    assert load_audit_manifest(final_path) == manifest
+    assert final_path.stat().st_nlink == 1
+    assert not list(tmp_path.glob(".audit-manifest.json.*.tmp"))
+
+
+@pytest.mark.parametrize("link_stage", ["after_write", "after_fsync"])
+def test_checkpoint_post_write_hardlink_race_rolls_back_without_data_loss(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    monkeypatch,
+    link_stage: str,
+):
+    second = replace(
+        candidate,
+        job_id="job-2",
+        movie_code="abc-001",
+        subtitle_id="11111111-2222-4333-8444-555555555555",
+        storage_path="abc/abc-001/abc-001-English_AI.srt",
+    )
+    manifest = write_manifest(tmp_path, candidate, second)
+    append_audit_finding(tmp_path, finding(candidate))
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    external = tmp_path / f"external-{link_stage}"
+    before = checkpoint.read_bytes()
+    checkpoint_inode = checkpoint.stat().st_ino
+    real_write = os.write
+    real_fsync = os.fsync
+    linked = False
+
+    def is_checkpoint(descriptor: int) -> bool:
+        return os.fstat(descriptor).st_ino == checkpoint_inode
+
+    def racing_write(descriptor: int, data: bytes):
+        nonlocal linked
+        written = real_write(descriptor, data)
+        if link_stage == "after_write" and not linked and is_checkpoint(descriptor):
+            os.link(checkpoint, external)
+            linked = True
+        return written
+
+    def racing_fsync(descriptor: int):
+        nonlocal linked
+        result = real_fsync(descriptor)
+        if link_stage == "after_fsync" and not linked and is_checkpoint(descriptor):
+            os.link(checkpoint, external)
+            linked = True
+        return result
+
+    monkeypatch.setattr(os, "write", racing_write)
+    monkeypatch.setattr(os, "fsync", racing_fsync)
+    with pytest.raises(ValueError, match="hardlink|private"):
+        append_audit_finding(tmp_path, finding(second, "missing"))
+
+    assert linked is True
+    assert checkpoint.read_bytes() == before
+    assert external.read_bytes() == before
+    external.unlink()
+    assert load_audit_findings(tmp_path, manifest) == (finding(candidate),)
