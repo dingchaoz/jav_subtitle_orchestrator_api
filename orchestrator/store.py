@@ -4617,6 +4617,16 @@ class JobStore:
                 raise CatalogLeaseLostError(
                     "historical catalog lease is lost"
                 )
+            _validate_verified_supabase_receipt(
+                movie_code=job.normalized_movie_number,
+                movie_uuid=job.catalog_movie_uuid,
+                metadata_status=job.metadata_status,
+                metadata_source=job.metadata_source,
+                subtitle_id=job.published_subtitle_id,
+                storage_path=job.published_storage_path,
+                content_sha256=job.published_content_sha256,
+                file_size=job.published_file_size,
+            )
             attempts = job.catalog_sync_attempt_count + 1
             terminal = attempts >= max_catalog_sync_attempts
             next_attempt_at = (
