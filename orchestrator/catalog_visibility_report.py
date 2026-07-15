@@ -64,38 +64,24 @@ _REPORT_FIELDS = frozenset(
     {"manifest", "findings", "counts", "complete", "report_sha256"}
 )
 _SELECTION_FIELDS = frozenset({"allowlist", "limit"})
+_RECEIPT_FIELD_NAMES = (
+    "movie_uuid",
+    "metadata_status",
+    "metadata_source",
+    "subtitle_id",
+    "storage_path",
+    "content_sha256",
+    "file_size",
+)
 _STATUS_VALUES = frozenset(status.value for status in VisibilityStatus)
 _LOWERCASE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SAFE_MOVIE_CODE_INPUT_RE = re.compile(r"^[A-Za-z]+-?[0-9]+$")
-_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,256}$")
-_SAFE_STORAGE_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,1024}$")
-_JWT_LIKE_RE = re.compile(
-    r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"
-)
 _STRICT_UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
-)
-_SENSITIVE_STRING_MARKERS = (
-    "bearer",
-    "token",
-    "secret",
-    "service-role",
-    "service_role",
-    "service role",
-    "api-key",
-    "api_key",
-    "apikey",
-    "authorization",
-    "credential",
-    "x-amz-",
-    "x-goog-",
-    "signature=",
-    "signed-url",
-    "signed_url",
 )
 
 
@@ -142,22 +128,8 @@ def _exact_dict(value: object, fields: frozenset[str], label: str) -> dict[str, 
     return value
 
 
-def _contains_sensitive_string_material(value: str) -> bool:
-    folded = value.casefold()
-    return (
-        any(ord(character) < 32 or ord(character) == 127 for character in value)
-        or "://" in folded
-        or any(marker in folded for marker in _SENSITIVE_STRING_MARKERS)
-        or _JWT_LIKE_RE.fullmatch(value) is not None
-    )
-
-
 def _validate_safe_job_id(value: object) -> None:
-    if (
-        not isinstance(value, str)
-        or not _SAFE_JOB_ID_RE.fullmatch(value)
-        or _contains_sensitive_string_material(value)
-    ):
+    if not isinstance(value, str) or not _SAFE_JOB_ID_RE.fullmatch(value):
         raise ValueError("candidate job_id is unsafe")
 
 
@@ -166,7 +138,6 @@ def _canonical_safe_movie_code(value: object, label: str) -> str:
         not isinstance(value, str)
         or len(value) > 64
         or not _SAFE_MOVIE_CODE_INPUT_RE.fullmatch(value)
-        or _contains_sensitive_string_material(value)
     ):
         raise ValueError(f"{label} is invalid")
     try:
@@ -176,30 +147,6 @@ def _canonical_safe_movie_code(value: object, label: str) -> str:
     if len(canonical) > 64:
         raise ValueError(f"{label} is invalid")
     return canonical
-
-
-def _validate_optional_safe_token(value: object, label: str) -> None:
-    if value is None:
-        return
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be a string or null")
-    if not _SAFE_TOKEN_RE.fullmatch(value) or _contains_sensitive_string_material(value):
-        raise ValueError(f"{label} is unsafe")
-
-
-def _validate_optional_safe_storage_path(value: object) -> None:
-    if value is None:
-        return
-    if not isinstance(value, str):
-        raise TypeError("candidate storage_path must be a string or null")
-    segments = value.split("/")
-    if (
-        not _SAFE_STORAGE_PATH_RE.fullmatch(value)
-        or value.startswith("/")
-        or any(segment in {"", ".", ".."} for segment in segments)
-        or _contains_sensitive_string_material(value)
-    ):
-        raise ValueError("candidate storage_path is unsafe")
 
 
 def _validate_strict_utc_timestamp(value: object, label: str) -> str:
@@ -226,7 +173,7 @@ def _validate_canonical_uuid(value: object, label: str) -> str:
     return value
 
 
-def _validate_candidate(candidate: object) -> AuditCandidateSnapshot:
+def _validate_candidate_identity(candidate: object) -> AuditCandidateSnapshot:
     if not isinstance(candidate, AuditCandidateSnapshot):
         raise TypeError("candidate must be an AuditCandidateSnapshot")
     _validate_safe_job_id(candidate.job_id)
@@ -238,26 +185,50 @@ def _validate_candidate(candidate: object) -> AuditCandidateSnapshot:
     )
     if canonical != candidate.movie_code:
         raise ValueError("candidate movie_code must be canonical")
-    for field_name in (
-        "movie_uuid",
-        "metadata_status",
-        "metadata_source",
-        "subtitle_id",
-        "content_sha256",
-    ):
-        _validate_optional_safe_token(
-            getattr(candidate, field_name),
-            f"candidate {field_name}",
-        )
-    _validate_optional_safe_storage_path(candidate.storage_path)
-    if candidate.file_size is not None and (
-        not isinstance(candidate.file_size, int) or isinstance(candidate.file_size, bool)
-    ):
-        raise TypeError("candidate file_size must be an integer or null")
     _validate_strict_utc_timestamp(
         candidate.job_updated_at,
         "candidate job_updated_at",
     )
+    return candidate
+
+
+def _receipt_is_fully_redacted(candidate: AuditCandidateSnapshot) -> bool:
+    return all(getattr(candidate, field_name) is None for field_name in _RECEIPT_FIELD_NAMES)
+
+
+def _redacted_candidate(candidate: AuditCandidateSnapshot) -> AuditCandidateSnapshot:
+    return replace(
+        candidate,
+        movie_uuid=None,
+        metadata_status=None,
+        metadata_source=None,
+        subtitle_id=None,
+        storage_path=None,
+        content_sha256=None,
+        file_size=None,
+    )
+
+
+def _canonicalize_candidate_for_create(candidate: object) -> AuditCandidateSnapshot:
+    if not isinstance(candidate, AuditCandidateSnapshot):
+        raise TypeError("candidate must be an AuditCandidateSnapshot")
+    try:
+        candidate.validated_receipt()
+    except ValueError:
+        receipt_is_valid = False
+    else:
+        receipt_is_valid = True
+    _validate_candidate_identity(candidate)
+    return candidate if receipt_is_valid else _redacted_candidate(candidate)
+
+
+def _validate_candidate(candidate: object) -> AuditCandidateSnapshot:
+    candidate = _validate_candidate_identity(candidate)
+    try:
+        candidate.validated_receipt()
+    except ValueError:
+        if not _receipt_is_fully_redacted(candidate):
+            raise ValueError("candidate receipt is not canonical") from None
     return candidate
 
 
@@ -409,7 +380,9 @@ def create_audit_manifest(
 ) -> AuditManifest:
     if not isinstance(candidates, tuple):
         raise TypeError("candidates must be a tuple")
-    validated_candidates = tuple(_validate_candidate(item) for item in candidates)
+    validated_candidates = tuple(
+        _canonicalize_candidate_for_create(item) for item in candidates
+    )
     ordered_candidates = tuple(
         sorted(validated_candidates, key=lambda item: (item.job_updated_at, item.job_id))
     )

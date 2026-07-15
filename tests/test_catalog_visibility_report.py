@@ -206,8 +206,6 @@ def test_manifest_rejects_duplicate_job_or_movie_identity(
     [
         {"job_id": 1},
         {"movie_code": "KTB111"},
-        {"movie_uuid": 1},
-        {"file_size": True},
         {"job_updated_at": None},
     ],
 )
@@ -221,7 +219,6 @@ def test_manifest_rejects_malformed_candidate_base_fields(
 @pytest.mark.parametrize(
     ("field_name", "unsafe_value"),
     [
-        ("job_id", "authorization-SENTINELVALUE"),
         (
             "movie_uuid",
             "eyJhbGciOiJIUzI1NiJ9.SENTINELVALUE.c2lnbmF0dXJl",
@@ -267,8 +264,6 @@ def test_manifest_rejects_sensitive_or_content_bearing_candidate_strings_without
     [
         ("job_id", "a" * 129),
         ("movie_code", f"{'a' * 65}-111"),
-        ("movie_uuid", "a" * 257),
-        ("storage_path", "a" * 1025),
     ],
 )
 def test_manifest_rejects_excessively_long_candidate_strings(
@@ -291,6 +286,132 @@ def test_manifest_rejects_excessively_long_selection_movie_code(
             candidates=(candidate,),
             selection={"allowlist": [f"{'a' * 65}-111"], "limit": 1},
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"metadata_status": "password-SENTINELVALUE"},
+        {"metadata_source": "ghp_SENTINELVALUE123456789"},
+        {"subtitle_id": "opaque-SENTINELVALUE-random-value"},
+        {
+            "movie_uuid": "",
+            "metadata_status": "",
+            "metadata_source": "",
+            "subtitle_id": "",
+            "storage_path": "",
+            "content_sha256": "",
+            "file_size": 0,
+        },
+        {"storage_path": "safe/wrong-path.srt"},
+        {
+            "storage_path": (
+                "https://storage.example/file.srt?X-Amz-Signature=SENTINELVALUE"
+            )
+        },
+        {"movie_uuid": "eyJhbGciOiJIUzI1NiJ9.SENTINELVALUE.c2lnbmF0dXJl"},
+        {
+            "storage_path": (
+                "SENTINELVALUE\n00:00:00,000 --> 00:00:01,000\nsubtitle"
+            )
+        },
+        {"content_sha256": "a" * 257},
+    ],
+)
+def test_create_redacts_every_invalid_receipt_field_before_any_serialization(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    overrides: dict[str, object],
+):
+    raw_candidate = replace(candidate, **overrides)
+
+    manifest = make_manifest(tmp_path, raw_candidate)
+    canonical_candidate = manifest.candidates[0]
+
+    assert canonical_candidate == AuditCandidateSnapshot(
+        job_id=raw_candidate.job_id,
+        movie_code=raw_candidate.movie_code,
+        movie_uuid=None,
+        metadata_status=None,
+        metadata_source=None,
+        subtitle_id=None,
+        storage_path=None,
+        content_sha256=None,
+        file_size=None,
+        job_updated_at=raw_candidate.job_updated_at,
+    )
+    write_audit_manifest(tmp_path, manifest)
+    invalid_finding = finding(canonical_candidate, "invalid_receipt")
+    append_audit_finding(tmp_path, invalid_finding)
+    finalize_audit_report(tmp_path)
+
+    serialized = b"".join(
+        path.read_bytes() for path in tmp_path.iterdir() if path.is_file()
+    )
+    for raw_value in overrides.values():
+        if isinstance(raw_value, str) and raw_value:
+            assert raw_value.encode() not in serialized
+
+
+def test_create_preserves_valid_receipt_candidate_byte_for_byte(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = make_manifest(tmp_path, candidate)
+
+    assert manifest.candidates == (candidate,)
+
+
+def test_direct_manifest_requires_valid_or_fully_redacted_receipt(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    base_manifest = make_manifest(tmp_path, candidate)
+    partial = replace(candidate, movie_uuid=None)
+    raw_invalid = replace(candidate, metadata_status="password-SENTINELVALUE")
+
+    for direct_candidate in (partial, raw_invalid):
+        with pytest.raises(ValueError):
+            write_audit_manifest(
+                tmp_path / direct_candidate.job_id / str(uuid4()),
+                replace(base_manifest, candidates=(direct_candidate,)),
+            )
+
+
+def test_load_manifest_rejects_raw_invalid_receipt_instead_of_sanitizing(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    write_manifest(tmp_path, candidate)
+    path = tmp_path / "audit-manifest.json"
+    payload = json.loads(path.read_text())
+    payload["candidates"][0]["metadata_source"] = "ghp_SENTINELVALUE123456789"
+    path.write_text(canonical_line(payload))
+
+    with pytest.raises(ValueError):
+        load_audit_manifest(path)
+
+
+def test_direct_fully_redacted_manifest_is_accepted_and_reportable(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    base_manifest = make_manifest(tmp_path, candidate)
+    redacted = replace(
+        candidate,
+        movie_uuid=None,
+        metadata_status=None,
+        metadata_source=None,
+        subtitle_id=None,
+        storage_path=None,
+        content_sha256=None,
+        file_size=None,
+    )
+    manifest = replace(base_manifest, candidates=(redacted,))
+
+    write_audit_manifest(tmp_path, manifest)
+    loaded = load_audit_manifest(tmp_path / "audit-manifest.json")
+    invalid_finding = finding(loaded.candidates[0], "invalid_receipt")
+    append_audit_finding(tmp_path, invalid_finding)
+
+    assert loaded == manifest
+    assert load_audit_findings(tmp_path, loaded) == (invalid_finding,)
 
 
 @pytest.mark.parametrize(
@@ -337,7 +458,8 @@ def test_safe_malformed_or_missing_receipts_remain_reportable(
 ):
     invalid = replace(candidate, **overrides)
     manifest = write_manifest(tmp_path, invalid)
-    invalid_finding = finding(invalid, "invalid_receipt")
+    canonical_invalid = manifest.candidates[0]
+    invalid_finding = finding(canonical_invalid, "invalid_receipt")
 
     append_audit_finding(tmp_path, invalid_finding)
 
@@ -483,13 +605,17 @@ def test_finding_classification_requires_receipt_validity(
 
     invalid = replace(candidate, job_id="job-bad", movie_code="abc-001", subtitle_id=None)
     invalid_manifest = write_manifest(tmp_path / "invalid", invalid)
-    invalid_finding = finding(invalid, "invalid_receipt")
+    canonical_invalid = invalid_manifest.candidates[0]
+    invalid_finding = finding(canonical_invalid, "invalid_receipt")
     append_audit_finding(tmp_path / "invalid", invalid_finding)
     assert load_audit_findings(tmp_path / "invalid", invalid_manifest) == (invalid_finding,)
 
-    write_manifest(tmp_path / "invalid-regular", invalid)
+    regular_manifest = write_manifest(tmp_path / "invalid-regular", invalid)
     with pytest.raises(ValueError):
-        append_audit_finding(tmp_path / "invalid-regular", finding(invalid, "missing"))
+        append_audit_finding(
+            tmp_path / "invalid-regular",
+            finding(regular_manifest.candidates[0], "missing"),
+        )
 
     assert valid_manifest.candidates == (candidate,)
 
