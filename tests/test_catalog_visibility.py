@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import math
 from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
+from typing import Callable
 
 import pytest
 import requests
 
 import orchestrator.catalog_visibility as visibility_module
 from orchestrator.catalog_visibility import (
+    AuditRunSummary,
+    CatalogVisibilityAuditor,
     PublicCatalogVisibilityClient,
     PublicVisibilityResult,
     VisibilityStatus,
     normalize_catalog_api_origin,
+)
+from orchestrator.catalog_visibility_report import (
+    load_audit_findings,
+    load_audit_manifest,
+    load_audit_report,
 )
 from orchestrator.models import JobStatus
 from orchestrator.store import JobStore
@@ -22,6 +31,18 @@ SUBTITLE_ID = "00000000-0000-0000-0000-000000000001"
 CONTENT_SHA256 = "a" * 64
 SECRET = "never-expose-this-detail"
 MOVIE_UUID = "f1bd9932-5697-4f16-865a-c56edc73d491"
+
+
+def test_audit_runner_public_api_is_present():
+    assert [field.name for field in fields(AuditRunSummary)] == [
+        "discovered",
+        "checked",
+        "skipped",
+        "counts",
+        "report_path",
+        "report_sha256",
+    ]
+    assert CatalogVisibilityAuditor.scan
 
 
 class FakeResponse:
@@ -62,6 +83,43 @@ class FakeSession:
         if self.error is not None:
             raise self.error
         return self.response
+
+
+class AuditRecordingSession:
+    def __init__(
+        self,
+        responses: list[FakeResponse | BaseException],
+        *,
+        before_get: Callable[[], None] | None = None,
+    ) -> None:
+        self.responses = list(responses)
+        self.before_get = before_get
+        self.methods: list[str] = []
+
+    def get(self, url: str, **kwargs: object) -> FakeResponse:
+        self.methods.append("GET")
+        if self.before_get is not None:
+            self.before_get()
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    def post(self, *args: object, **kwargs: object) -> None:
+        self.methods.append("POST")
+        raise AssertionError("audit must not POST")
+
+    def put(self, *args: object, **kwargs: object) -> None:
+        self.methods.append("PUT")
+        raise AssertionError("audit must not PUT")
+
+    def patch(self, *args: object, **kwargs: object) -> None:
+        self.methods.append("PATCH")
+        raise AssertionError("audit must not PATCH")
+
+    def delete(self, *args: object, **kwargs: object) -> None:
+        self.methods.append("DELETE")
+        raise AssertionError("audit must not DELETE")
 
 
 class PreparedRequestSession(requests.Session):
@@ -119,6 +177,382 @@ def _receipt_candidate_job(store: JobStore):
     selected = store.get_job(job.id)
     assert selected is not None
     return selected
+
+
+def _receipt_candidate_jobs(store: JobStore, codes: list[str]):
+    jobs = []
+    for index, code in enumerate(codes, start=1):
+        job = store.submit_job(code, priority=100, force=False).job
+        assert job is not None
+        subtitle_id = f"00000000-0000-4000-8000-{index:012d}"
+        movie_uuid = f"10000000-0000-4000-8000-{index:012d}"
+        canonical = visibility_module.canonical_movie_code(code)
+        with store.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET status = ?, updated_at = ?, catalog_movie_uuid = ?, "
+                "metadata_status = ?, metadata_source = ?, published_subtitle_id = ?, "
+                "published_storage_path = ?, published_content_sha256 = ?, "
+                "published_file_size = ? WHERE id = ?",
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    f"2026-07-15T10:00:{index:02d}+00:00",
+                    movie_uuid,
+                    "complete",
+                    "public",
+                    subtitle_id,
+                    f"{canonical.split('-', 1)[0]}/{canonical}/"
+                    f"{canonical}-English_AI.srt",
+                    f"{index:x}" * 64,
+                    300 + index,
+                    job.id,
+                ),
+            )
+        selected = store.get_job(job.id)
+        assert selected is not None
+        jobs.append(selected)
+    return jobs
+
+
+def test_auditor_freezes_population_writes_manifest_then_gets_without_mutation(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    jobs = _receipt_candidate_jobs(
+        store,
+        ["KTB111", "ABC222", "DEF333", "GHI444", "JKL555"],
+    )
+    before_jobs = store.list_jobs()
+    list_calls = 0
+    original_list = store.list_catalog_visibility_candidates
+
+    def record_list(*, allowlist=None, limit=None):
+        nonlocal list_calls
+        list_calls += 1
+        return original_list(allowlist=allowlist, limit=limit)
+
+    monkeypatch.setattr(store, "list_catalog_visibility_candidates", record_list)
+    output_dir = tmp_path / "audit"
+
+    def assert_durable_manifest() -> None:
+        manifest = load_audit_manifest(output_dir / "audit-manifest.json")
+        assert len(manifest.candidates) == 5
+        assert tuple(item.job_id for item in manifest.candidates) == tuple(
+            job.id for job in jobs
+        )
+        assert list_calls == 1
+
+    expected_ids = [job.published_subtitle_id for job in jobs]
+    assert all(expected_ids)
+    other_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+    session = AuditRecordingSession(
+        [
+            FakeResponse(
+                body={"canonicalCode": "ktb-111", "subtitles": [{"id": expected_ids[0]}]}
+            ),
+            FakeResponse(
+                body={"canonicalCode": "abc-222", "subtitles": [{"id": other_id}]}
+            ),
+            FakeResponse(status_code=404),
+            FakeResponse(status_code=500),
+            FakeResponse(
+                body={"canonicalCode": "jkl-555", "subtitles": [{"id": "not-a-uuid"}]}
+            ),
+        ],
+        before_get=assert_durable_manifest,
+    )
+    client = PublicCatalogVisibilityClient(
+        "https://javsubtitle.example/", session=session
+    )
+
+    summary = CatalogVisibilityAuditor(store, client).scan(
+        output_dir,
+        allowlist={"jkl-555", "GHI444", "DEF-333", "abc222", "KTB111"},
+        limit=5,
+    )
+
+    report = load_audit_report(output_dir / "audit-report.json")
+    assert summary.discovered == 5
+    assert summary.checked == 5
+    assert summary.skipped == 0
+    assert summary.counts == {
+        "fetch_failed": 1,
+        "missing": 1,
+        "not_found": 1,
+        "response_invalid": 1,
+        "visible": 1,
+    }
+    assert summary.report_path == output_dir / "audit-report.json"
+    assert summary.report_sha256 == report.report_sha256
+    assert [finding.status for finding in report.findings] == [
+        "visible",
+        "missing",
+        "not_found",
+        "fetch_failed",
+        "response_invalid",
+    ]
+    assert session.methods == ["GET"] * 5
+    assert list_calls == 1
+    assert store.list_jobs() == before_jobs
+
+
+def test_auditor_resumes_only_unfinished_then_reuses_complete_report(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    jobs = _receipt_candidate_jobs(store, ["KTB111", "ABC222", "DEF333"])
+    output_dir = tmp_path / "resume-audit"
+    first_session = AuditRecordingSession(
+        [
+            FakeResponse(
+                body={
+                    "canonicalCode": "ktb-111",
+                    "subtitles": [{"id": jobs[0].published_subtitle_id}],
+                }
+            ),
+            FakeResponse(status_code=404),
+            RuntimeError(f"unexpected {SECRET}"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match=SECRET):
+        CatalogVisibilityAuditor(
+            store,
+            PublicCatalogVisibilityClient(
+                "https://javsubtitle.example", session=first_session
+            ),
+        ).scan(
+            output_dir,
+            allowlist={"KTB111", "ABC222", "DEF333"},
+            limit=3,
+        )
+
+    manifest = load_audit_manifest(output_dir / "audit-manifest.json")
+    first_findings = load_audit_findings(output_dir, manifest)
+    assert [finding.candidate.job_id for finding in first_findings] == [
+        jobs[0].id,
+        jobs[1].id,
+    ]
+    assert first_session.methods == ["GET", "GET", "GET"]
+
+    def population_must_not_be_queried(**kwargs):
+        raise AssertionError("resume must use the frozen manifest")
+
+    monkeypatch.setattr(
+        store,
+        "list_catalog_visibility_candidates",
+        population_must_not_be_queried,
+    )
+    second_session = AuditRecordingSession(
+        [
+            FakeResponse(
+                body={"canonicalCode": "def-333", "subtitles": []}
+            )
+        ]
+    )
+    summary = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example/", session=second_session
+        ),
+    ).scan(
+        output_dir,
+        allowlist={"def-333", "abc-222", "ktb-111"},
+        limit=3,
+    )
+
+    report = load_audit_report(output_dir / "audit-report.json")
+    assert summary.checked == 1
+    assert summary.skipped == 2
+    assert summary.discovered == 3
+    assert second_session.methods == ["GET"]
+    assert [finding.candidate.job_id for finding in report.findings] == [
+        job.id for job in jobs
+    ]
+    assert [finding.status for finding in report.findings] == [
+        "visible",
+        "not_found",
+        "missing",
+    ]
+
+    complete_session = AuditRecordingSession([])
+    complete = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example", session=complete_session
+        ),
+    ).scan(
+        output_dir,
+        allowlist={"ABC222", "KTB-111", "DEF333"},
+        limit=3,
+    )
+
+    assert complete.checked == 0
+    assert complete.skipped == 3
+    assert complete.report_sha256 == summary.report_sha256
+    assert complete_session.methods == []
+
+
+@pytest.mark.parametrize("changed", ["origin", "database", "allowlist", "limit"])
+def test_auditor_rejects_changed_resume_context_before_get(
+    changed: str,
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    _receipt_candidate_jobs(store, ["KTB111"])
+    output_dir = tmp_path / "context-audit"
+    with pytest.raises(RuntimeError):
+        CatalogVisibilityAuditor(
+            store,
+            PublicCatalogVisibilityClient(
+                "https://javsubtitle.example",
+                session=AuditRecordingSession([RuntimeError("interrupt")]),
+            ),
+        ).scan(output_dir, allowlist={"KTB111"}, limit=1)
+
+    monkeypatch.setattr(
+        store,
+        "list_catalog_visibility_candidates",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("resume must not query population")
+        ),
+    )
+    resume_store = store
+    base_url = "https://javsubtitle.example/"
+    allowlist = {"ktb-111"}
+    limit = 1
+    if changed == "origin":
+        base_url = "https://other.example"
+    elif changed == "database":
+        resume_store = JobStore(tmp_path / "other.sqlite3", mac_jobs_root, "M:\\")
+    elif changed == "allowlist":
+        allowlist = {"abc-222"}
+    else:
+        limit = 2
+    session = AuditRecordingSession([])
+
+    with pytest.raises(ValueError, match="differs from manifest"):
+        CatalogVisibilityAuditor(
+            resume_store,
+            PublicCatalogVisibilityClient(base_url, session=session),
+        ).scan(output_dir, allowlist=allowlist, limit=limit)
+
+    assert session.methods == []
+
+
+def test_auditor_propagates_checkpoint_corruption_without_restarting(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    jobs = _receipt_candidate_jobs(store, ["KTB111", "ABC222"])
+    output_dir = tmp_path / "corrupt-audit"
+    with pytest.raises(RuntimeError):
+        CatalogVisibilityAuditor(
+            store,
+            PublicCatalogVisibilityClient(
+                "https://javsubtitle.example",
+                session=AuditRecordingSession(
+                    [
+                        FakeResponse(
+                            body={
+                                "canonicalCode": "ktb-111",
+                                "subtitles": [{"id": jobs[0].published_subtitle_id}],
+                            }
+                        ),
+                        RuntimeError("interrupt"),
+                    ]
+                ),
+            ),
+        ).scan(output_dir, allowlist={"KTB111", "ABC222"}, limit=2)
+
+    checkpoint_path = output_dir / "audit-findings.jsonl"
+    with checkpoint_path.open("ab") as checkpoint:
+        checkpoint.write(b"corrupt-row\n")
+    corrupted = checkpoint_path.read_bytes()
+    monkeypatch.setattr(
+        store,
+        "list_catalog_visibility_candidates",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not restart")),
+    )
+    session = AuditRecordingSession([])
+
+    with pytest.raises(ValueError, match="audit checkpoint row is not valid JSON"):
+        CatalogVisibilityAuditor(
+            store,
+            PublicCatalogVisibilityClient(
+                "https://javsubtitle.example/", session=session
+            ),
+        ).scan(output_dir, allowlist={"abc-222", "ktb-111"}, limit=2)
+
+    assert checkpoint_path.read_bytes() == corrupted
+    assert session.methods == []
+
+
+def test_auditor_records_invalid_receipt_without_get(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = _receipt_candidate_jobs(store, ["KTB111"])[0]
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET published_storage_path = ? WHERE id = ?",
+            ("unsafe/path.srt", job.id),
+        )
+    session = AuditRecordingSession([])
+    output_dir = tmp_path / "invalid-receipt-audit"
+
+    summary = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example", session=session
+        ),
+    ).scan(output_dir)
+
+    report = load_audit_report(output_dir / "audit-report.json")
+    assert summary.checked == 0
+    assert summary.counts == {"invalid_receipt": 1}
+    assert session.methods == []
+    assert report.findings[0].status == "invalid_receipt"
+    assert report.findings[0].reason_code == "invalid_receipt"
+    assert report.findings[0].observed_subtitle_ids == ()
+    assert report.manifest.candidates[0].subtitle_id is None
+
+
+def test_zero_candidate_audit_is_complete_and_summary_counts_are_immutable(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    session = AuditRecordingSession([])
+    output_dir = tmp_path / "empty-audit"
+
+    summary = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example", session=session
+        ),
+    ).scan(output_dir)
+
+    report = load_audit_report(output_dir / "audit-report.json")
+    assert summary.discovered == summary.checked == summary.skipped == 0
+    assert summary.counts == {}
+    assert report.complete is True
+    assert report.findings == ()
+    assert session.methods == []
+    with pytest.raises(TypeError):
+        summary.counts["visible"] = 1
+
+    source = {"visible": 1}
+    copied = AuditRunSummary(1, 1, 0, source, Path("audit-report.json"), "a" * 64)
+    source["visible"] = 9
+    assert copied.counts == {"visible": 1}
 
 
 def test_receipt_candidate_and_validated_snapshot_are_exact_and_immutable(
@@ -495,7 +929,7 @@ def test_invalid_receipt_is_classified_without_request(expected_subtitle_id, con
     "subtitles",
     [
         [],
-        [{"id": "another-id"}],
+        [{"id": "11111111-1111-4111-8111-111111111111"}],
         [{"id": SUBTITLE_ID}, {"id": SUBTITLE_ID}],
     ],
 )
@@ -549,6 +983,17 @@ def test_network_failure_is_safe_fetch_failed():
         ({"canonicalCode": CANONICAL_CODE, "subtitles": [SECRET]}, None),
         ({"canonicalCode": CANONICAL_CODE, "subtitles": [{}]}, None),
         ({"canonicalCode": CANONICAL_CODE, "subtitles": [{"id": 123}]}, None),
+        (
+            {"canonicalCode": CANONICAL_CODE, "subtitles": [{"id": "not-a-uuid"}]},
+            None,
+        ),
+        (
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "subtitles": [{"id": "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABCDEF"}],
+            },
+            None,
+        ),
     ],
 )
 def test_invalid_payload_is_response_invalid_without_leaking_details(body, json_error):
@@ -556,4 +1001,5 @@ def test_invalid_payload_is_response_invalid_without_leaking_details(body, json_
 
     assert result.status is VisibilityStatus.RESPONSE_INVALID
     assert result.reason_code == "public_visibility_response_invalid"
+    assert result.observed_subtitle_ids == ()
     assert SECRET not in repr(result)

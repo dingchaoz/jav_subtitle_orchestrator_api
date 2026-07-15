@@ -465,6 +465,34 @@ def create_audit_manifest(
     return _validate_manifest(manifest)
 
 
+def validate_audit_resume_context(
+    manifest: AuditManifest,
+    *,
+    api_origin: str,
+    database_path: str | os.PathLike[str],
+    selection: dict[str, object],
+) -> None:
+    manifest = _validate_manifest(manifest)
+    current_origin = normalize_catalog_api_origin(api_origin)
+    try:
+        resolved_database_path = str(Path(database_path).resolve())
+    except (OSError, TypeError, ValueError):
+        raise ValueError("database_path is invalid") from None
+    current_database_digest = hashlib.sha256(
+        resolved_database_path.encode("utf-8")
+    ).hexdigest()
+    current_selection = _normalize_selection(selection)
+    if current_origin != manifest.api_origin:
+        raise ValueError("audit API origin differs from manifest")
+    if not hmac.compare_digest(
+        current_database_digest,
+        manifest.database_path_sha256,
+    ):
+        raise ValueError("audit database path differs from manifest")
+    if current_selection != manifest.selection:
+        raise ValueError("audit selection differs from manifest")
+
+
 def _directory_open_flags() -> int:
     if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
         raise RuntimeError("secure directory descriptors are unavailable")

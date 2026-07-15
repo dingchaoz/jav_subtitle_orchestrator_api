@@ -6,13 +6,16 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Protocol
 from urllib.parse import quote, urlencode, urlsplit
+from uuid import UUID
 
 import requests
 
 from orchestrator.movie_code import canonical_movie_code
-from orchestrator.store import JobRecord, validate_verified_supabase_receipt
+from orchestrator.store import JobRecord, JobStore, validate_verified_supabase_receipt
 
 
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -114,6 +117,148 @@ class PublicVisibilityResult:
     expected_subtitle_id: str
     observed_subtitle_ids: tuple[str, ...] = ()
     reason_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRunSummary:
+    discovered: int
+    checked: int
+    skipped: int
+    counts: dict[str, int]
+    report_path: Path
+    report_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "counts", MappingProxyType(dict(self.counts)))
+
+
+class CatalogVisibilityAuditor:
+    def __init__(
+        self,
+        store: JobStore,
+        client: PublicCatalogVisibilityClient,
+    ) -> None:
+        self.store = store
+        self.client = client
+
+    def scan(
+        self,
+        output_dir: Path,
+        *,
+        allowlist: set[str] | None = None,
+        limit: int | None = None,
+    ) -> AuditRunSummary:
+        from orchestrator.catalog_visibility_report import (
+            AuditFinding,
+            append_audit_finding,
+            create_audit_manifest,
+            finalize_audit_report,
+            load_audit_findings,
+            load_audit_manifest,
+            load_audit_report,
+            validate_audit_resume_context,
+            write_audit_manifest,
+        )
+
+        requested_allowlist = None if allowlist is None else set(allowlist)
+        selection = {
+            "allowlist": (
+                None if requested_allowlist is None else list(requested_allowlist)
+            ),
+            "limit": limit,
+        }
+        manifest_path = output_dir / "audit-manifest.json"
+        try:
+            manifest = load_audit_manifest(manifest_path)
+        except FileNotFoundError:
+            rows = self.store.list_catalog_visibility_candidates(
+                allowlist=requested_allowlist,
+                limit=limit,
+            )
+            candidates = tuple(AuditCandidateSnapshot.from_job(row) for row in rows)
+            manifest = create_audit_manifest(
+                api_origin=self.client.base_url,
+                database_path=self.store.db_path,
+                candidates=candidates,
+                selection=selection,
+            )
+            write_audit_manifest(output_dir, manifest)
+        else:
+            validate_audit_resume_context(
+                manifest,
+                api_origin=self.client.base_url,
+                database_path=self.store.db_path,
+                selection=selection,
+            )
+        existing = load_audit_findings(output_dir, manifest)
+        report_path = output_dir / "audit-report.json"
+        try:
+            completed_report = load_audit_report(report_path)
+        except FileNotFoundError:
+            pass
+        else:
+            findings_by_job_id = {
+                finding.candidate.job_id: finding for finding in existing
+            }
+            expected_findings = tuple(
+                findings_by_job_id.get(candidate.job_id)
+                for candidate in manifest.candidates
+            )
+            if (
+                completed_report.manifest != manifest
+                or completed_report.findings != expected_findings
+            ):
+                raise ValueError("audit report differs from manifest or checkpoint")
+            return AuditRunSummary(
+                discovered=len(manifest.candidates),
+                checked=0,
+                skipped=len(existing),
+                counts={
+                    key: value
+                    for key, value in completed_report.counts.items()
+                    if value
+                },
+                report_path=report_path,
+                report_sha256=completed_report.report_sha256,
+            )
+        completed = {finding.candidate.job_id for finding in existing}
+        checked = 0
+        for candidate in manifest.candidates:
+            if candidate.job_id in completed:
+                continue
+            try:
+                receipt = candidate.validated_receipt()
+            except ValueError:
+                finding = AuditFinding(
+                    candidate=candidate,
+                    status=VisibilityStatus.INVALID_RECEIPT.value,
+                    reason_code="invalid_receipt",
+                    observed_subtitle_ids=(),
+                )
+            else:
+                result = self.client.check(
+                    receipt.movie_code,
+                    receipt.subtitle_id,
+                    receipt.content_sha256,
+                )
+                checked += 1
+                finding = AuditFinding(
+                    candidate=candidate,
+                    status=result.status.value,
+                    reason_code=result.reason_code,
+                    observed_subtitle_ids=result.observed_subtitle_ids,
+                )
+            append_audit_finding(output_dir, finding)
+
+        report = finalize_audit_report(output_dir)
+        return AuditRunSummary(
+            discovered=len(manifest.candidates),
+            checked=checked,
+            skipped=len(existing),
+            counts={key: value for key, value in report.counts.items() if value},
+            report_path=report_path,
+            report_sha256=report.report_sha256,
+        )
 
 
 class VisibilitySession(Protocol):
@@ -239,6 +384,15 @@ def validate_catalog_timeout_seconds(timeout_seconds: object) -> int | float:
     ):
         raise ValueError("timeout_seconds must be positive")
     return timeout_seconds
+
+
+def _is_canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except (AttributeError, TypeError, ValueError):
+        return False
 
 
 def normalize_catalog_api_origin(base_url: str) -> str:
@@ -373,7 +527,7 @@ class PublicCatalogVisibilityClient:
             or body.get("canonicalCode") != canonical
             or not isinstance(body.get("subtitles"), list)
             or any(
-                not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                not isinstance(row, dict) or not _is_canonical_uuid(row.get("id"))
                 for row in body.get("subtitles", ())
             )
         ):
