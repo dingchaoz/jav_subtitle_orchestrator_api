@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import re
+import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ import fcntl
 import orchestrator.catalog_visibility_report as _report_storage
 from orchestrator.catalog_visibility import (
     AuditCandidateSnapshot,
+    PublicCatalogVisibilityClient,
+    PublicVisibilityResult,
     PublicationReceiptSnapshot,
     VisibilityStatus,
     normalize_catalog_api_origin,
@@ -483,6 +486,61 @@ def _execution_receipt_path(output_dir: Path) -> Path:
     return output_dir / _EXECUTION_RECEIPT_FILE_NAME
 
 
+def _validate_sync_client_binding(
+    sync_client: object,
+    api_origin: str,
+) -> PublicCatalogVisibilityClient:
+    try:
+        client_origin = normalize_catalog_api_origin(getattr(sync_client, "base_url"))
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("sync client origin is invalid") from None
+    if client_origin != api_origin:
+        raise ValueError("sync client origin differs from repair plan")
+    if getattr(sync_client, "public_visibility_verification_enabled", None) is not True:
+        raise ValueError("sync client exact public visibility verification is required")
+    visibility_client = getattr(sync_client, "public_visibility_client", None)
+    if visibility_client is None or not callable(getattr(visibility_client, "check", None)):
+        raise ValueError("sync client public visibility probe is required")
+    try:
+        visibility_origin = normalize_catalog_api_origin(
+            getattr(visibility_client, "base_url")
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("sync client public visibility origin is invalid") from None
+    if visibility_origin != api_origin:
+        raise ValueError("sync client public visibility origin differs from repair plan")
+    if not callable(getattr(sync_client, "sync", None)):
+        raise ValueError("sync client sync capability is required")
+    return visibility_client  # type: ignore[return-value]
+
+
+def _validate_canonical_execution_directory(
+    output_dir: Path,
+    plan: CatalogVisibilityRepairPlan,
+) -> Path:
+    requested = Path(output_dir)
+    canonical = plan.plan_path.parent
+    _report_storage._path_components(requested)
+    _report_storage._path_components(canonical)
+    try:
+        with _report_storage._pinned_directory(requested, create=False) as requested_fd:
+            requested_stat = os.fstat(requested_fd)
+            with _report_storage._pinned_directory(canonical, create=False) as canonical_fd:
+                canonical_stat = os.fstat(canonical_fd)
+    except (FileNotFoundError, OSError, ValueError):
+        raise ValueError("execution output directory must be the repair plan directory") from None
+    if (
+        requested_stat.st_dev != canonical_stat.st_dev
+        or requested_stat.st_ino != canonical_stat.st_ino
+        or requested_stat.st_uid != os.geteuid()
+        or canonical_stat.st_uid != os.geteuid()
+        or (requested_stat.st_mode & 0o077) != 0
+        or (canonical_stat.st_mode & 0o077) != 0
+    ):
+        raise ValueError("execution output directory must be the private repair plan directory")
+    return canonical
+
+
 def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
@@ -523,6 +581,7 @@ def _execution_row(
 def _validate_execution_row(
     value: object,
     plan: CatalogVisibilityRepairPlan,
+    items_by_job_id: Mapping[str, RepairPlanItem],
 ) -> dict[str, object]:
     row = _exact_dict(value, _EXECUTION_RECEIPT_FIELDS, "repair execution receipt")
     report_sha256 = row["report_sha256"]
@@ -531,14 +590,10 @@ def _validate_execution_row(
         or not hmac.compare_digest(report_sha256, plan.report_sha256)
     ):
         raise ValueError("repair execution receipt belongs to a different report")
-    matching = [
-        item
-        for item in plan.items
-        if item.receipt.job_id == row["job_id"]
-    ]
-    if len(matching) != 1:
+    job_id = row["job_id"]
+    item = items_by_job_id.get(job_id) if isinstance(job_id, str) else None
+    if item is None:
         raise ValueError("repair execution receipt item is not in the plan")
-    item = matching[0]
     outcome = row["outcome"]
     reason_code = row["reason_code"]
     valid_outcome = (
@@ -568,6 +623,7 @@ def _validate_execution_row(
 def _load_execution_rows_from_fd(
     descriptor: int,
     plan: CatalogVisibilityRepairPlan,
+    items_by_job_id: Mapping[str, RepairPlanItem],
 ) -> tuple[dict[str, object], ...]:
     data = _report_storage._read_fd_limited(
         descriptor,
@@ -591,6 +647,7 @@ def _load_execution_rows_from_fd(
         row = _validate_execution_row(
             _report_storage._decode_json(raw_row, "repair execution receipt row"),
             plan,
+            items_by_job_id,
         )
         job_id = row["job_id"]
         assert isinstance(job_id, str)
@@ -600,6 +657,12 @@ def _load_execution_rows_from_fd(
         rows.append(row)
     if len(rows) > len(plan.items):
         raise ValueError("repair execution receipt contains too many rows")
+    observed_job_ids = [row["job_id"] for row in rows]
+    expected_job_ids = [
+        item.receipt.job_id for item in plan.items[: len(rows)]
+    ]
+    if observed_job_ids != expected_job_ids:
+        raise ValueError("repair execution receipt rows are not a plan prefix")
     return tuple(rows)
 
 
@@ -622,6 +685,7 @@ def _claim_row(
 def _validate_claim_row(
     value: object,
     plan: CatalogVisibilityRepairPlan,
+    items_by_job_id: Mapping[str, RepairPlanItem],
 ) -> dict[str, object]:
     row = _exact_dict(value, _CLAIM_FIELDS, "repair execution claim")
     if row["schema_version"] != _CLAIM_SCHEMA_VERSION:
@@ -633,10 +697,10 @@ def _validate_claim_row(
         or not hmac.compare_digest(row["plan_sha256"], plan.plan_sha256)
     ):
         raise ValueError("repair execution claim belongs to a different plan")
-    matching = [item for item in plan.items if item.receipt.job_id == row["job_id"]]
-    if len(matching) != 1:
+    job_id = row["job_id"]
+    item = items_by_job_id.get(job_id) if isinstance(job_id, str) else None
+    if item is None:
         raise ValueError("repair execution claim item is not in the plan")
-    item = matching[0]
     if (
         row["movie_code"] != item.receipt.movie_code
         or row["expected_subtitle_id"] != item.receipt.subtitle_id
@@ -651,6 +715,7 @@ def _validate_claim_row(
 def _load_claim_rows_from_fd(
     descriptor: int,
     plan: CatalogVisibilityRepairPlan,
+    items_by_job_id: Mapping[str, RepairPlanItem],
 ) -> tuple[dict[str, object], ...]:
     data = _report_storage._read_fd_limited(
         descriptor,
@@ -674,6 +739,7 @@ def _load_claim_rows_from_fd(
         row = _validate_claim_row(
             _report_storage._decode_json(raw_row, "repair execution claim row"),
             plan,
+            items_by_job_id,
         )
         job_id = row["job_id"]
         assert isinstance(job_id, str)
@@ -683,6 +749,12 @@ def _load_claim_rows_from_fd(
         rows.append(row)
     if len(rows) > len(plan.items):
         raise ValueError("repair execution claims contain too many rows")
+    positions = {
+        item.receipt.job_id: index for index, item in enumerate(plan.items)
+    }
+    observed_positions = [positions[row["job_id"]] for row in rows]
+    if observed_positions != sorted(observed_positions):
+        raise ValueError("repair execution claim rows are out of plan order")
     return tuple(rows)
 
 
@@ -812,6 +884,60 @@ def _append_claim_row_at(
                 pass
 
 
+def _trailing_consecutive_failures(
+    plan: CatalogVisibilityRepairPlan,
+    terminal_by_job_id: Mapping[str, dict[str, object]],
+) -> int:
+    """Receipt-changed skips are neutral; repaired success resets the breaker."""
+    consecutive = 0
+    for item in plan.items:
+        row = terminal_by_job_id.get(item.receipt.job_id)
+        if row is None:
+            break
+        if row["outcome"] == "repaired":
+            consecutive = 0
+        elif row["outcome"] == "failed":
+            consecutive += 1
+    return consecutive
+
+
+def _classify_unresolved_visibility(
+    result: object,
+    item: RepairPlanItem,
+) -> tuple[bool, bool]:
+    if (
+        not isinstance(result, PublicVisibilityResult)
+        or result.canonical_code != item.receipt.movie_code
+        or result.expected_subtitle_id != item.receipt.subtitle_id
+    ):
+        return False, False
+    if (
+        result.status is VisibilityStatus.VISIBLE
+        and result.reason_code is None
+        and result.observed_subtitle_ids.count(item.receipt.subtitle_id) == 1
+    ):
+        return True, False
+    if result.status in {VisibilityStatus.MISSING, VisibilityStatus.NOT_FOUND}:
+        return False, True
+    return False, False
+
+
+def _current_receipt_in_write_transaction(
+    store: JobStore,
+    connection: sqlite3.Connection,
+    item: RepairPlanItem,
+) -> PublicationReceiptSnapshot | None:
+    current = store.get_job(item.receipt.job_id, conn=connection)
+    try:
+        return (
+            AuditCandidateSnapshot.from_job(current).validated_receipt()
+            if current is not None and current.status == JobStatus.ENGLISH_SRT_READY
+            else None
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def execute_catalog_visibility_repair(
     store: JobStore,
     plan: CatalogVisibilityRepairPlan,
@@ -821,9 +947,14 @@ def execute_catalog_visibility_repair(
     execute: bool = False,
     confirm_report_sha256: str | None = None,
     consecutive_failure_limit: int = 3,
+    recover_unresolved_claims: bool = False,
 ) -> RepairExecutionResult:
     if not isinstance(execute, bool):
         raise ValueError("execute must be a boolean")
+    if not isinstance(recover_unresolved_claims, bool):
+        raise ValueError("recover_unresolved_claims must be a boolean")
+    if recover_unresolved_claims and not execute:
+        raise ValueError("recover_unresolved_claims requires execute=True")
     if (
         not isinstance(consecutive_failure_limit, int)
         or isinstance(consecutive_failure_limit, bool)
@@ -831,7 +962,12 @@ def execute_catalog_visibility_repair(
     ):
         raise ValueError("consecutive_failure_limit must be a positive integer")
     validated = _validated_execution_plan(store, plan)
-    receipt_path = _execution_receipt_path(Path(output_dir))
+    visibility_client = _validate_sync_client_binding(sync_client, validated.api_origin)
+    canonical_output_dir = _validate_canonical_execution_directory(
+        Path(output_dir),
+        validated,
+    )
+    receipt_path = _execution_receipt_path(canonical_output_dir)
     if not execute:
         return RepairExecutionResult(
             action="dry_run",
@@ -848,12 +984,19 @@ def execute_catalog_visibility_repair(
         raise ValueError("confirm_report_sha256 mismatch")
 
     with _EXECUTION_PROCESS_LOCK:
-        with _report_storage._pinned_directory(output_dir, create=True) as directory_fd:
+        # Lock order is process -> canonical ledger directory -> SQLite writer.
+        # Store publication writers only take the SQLite lock, so there is no inverse.
+        with _report_storage._pinned_directory(
+            canonical_output_dir,
+            create=False,
+        ) as directory_fd:
             fcntl.flock(directory_fd, fcntl.LOCK_EX)
             descriptor, created = _open_execution_receipt(directory_fd)
             claims_descriptor: int | None = None
             stopped_reason: str | None = None
-            consecutive_failures = 0
+            items_by_job_id = {
+                item.receipt.job_id: item for item in validated.items
+            }
             try:
                 if created:
                     _report_storage._fsync_directory_fd(directory_fd)
@@ -864,7 +1007,11 @@ def execute_catalog_visibility_repair(
                     "repair execution receipt",
                     expected_mode=0o600,
                 )
-                existing = _load_execution_rows_from_fd(descriptor, validated)
+                existing = _load_execution_rows_from_fd(
+                    descriptor,
+                    validated,
+                    items_by_job_id,
+                )
                 claims_descriptor, claims_created = _open_execution_claims(directory_fd)
                 if claims_created:
                     _report_storage._fsync_directory_fd(directory_fd)
@@ -875,68 +1022,117 @@ def execute_catalog_visibility_repair(
                     "repair execution claims",
                     expected_mode=0o600,
                 )
-                claims = _load_claim_rows_from_fd(claims_descriptor, validated)
-                completed = {row["job_id"] for row in existing}
-                claimed = {row["job_id"] for row in claims}
-                unresolved = claimed - completed
-                if unresolved:
-                    stopped_reason = "unresolved_claim"
-                for item in (validated.items if not unresolved else ()):
+                claims = _load_claim_rows_from_fd(
+                    claims_descriptor,
+                    validated,
+                    items_by_job_id,
+                )
+                terminal_by_job_id = {
+                    row["job_id"]: row for row in existing
+                }
+                claim_by_job_id = {row["job_id"]: row for row in claims}
+                retry_claimed: set[str] = set()
+                unresolved_job_ids = set(claim_by_job_id) - set(terminal_by_job_id)
+                for item in validated.items:
                     job_id = item.receipt.job_id
-                    if job_id in completed:
+                    if job_id not in unresolved_job_ids:
                         continue
-                    current = store.get_job(item.receipt.job_id)
                     try:
-                        current_receipt = (
-                            AuditCandidateSnapshot.from_job(current).validated_receipt()
-                            if current is not None
-                            and current.status == JobStatus.ENGLISH_SRT_READY
-                            else None
-                        )
-                    except (TypeError, ValueError):
-                        current_receipt = None
-                    if current_receipt != item.receipt:
-                        row = _execution_row(
-                            item,
-                            report_sha256=validated.report_sha256,
-                            outcome="skipped_receipt_changed",
-                            reason_code="receipt_changed",
-                        )
-                        _append_execution_row_at(directory_fd, descriptor, row)
-                        existing += (row,)
-                        continue
-                    claim = _claim_row(item, validated)
-                    _append_claim_row_at(
-                        directory_fd,
-                        claims_descriptor,
-                        claim,
-                    )
-                    claims += (claim,)
-                    claimed.add(job_id)
-                    try:
-                        sync_client.sync(
+                        probe = visibility_client.check(
                             item.receipt.movie_code,
-                            expected_subtitle_id=item.receipt.subtitle_id,
-                            expected_content_sha256=item.receipt.content_sha256,
+                            item.receipt.subtitle_id,
+                            item.receipt.content_sha256,
                         )
-                    except CatalogSyncError as exc:
-                        consecutive_failures += 1
-                        row = _execution_row(
-                            item,
-                            report_sha256=validated.report_sha256,
-                            outcome="failed",
-                            reason_code=exc.reason_code,
-                        )
+                    except Exception:
+                        exact_visible, definitely_not_exact = False, False
                     else:
-                        consecutive_failures = 0
+                        exact_visible, definitely_not_exact = (
+                            _classify_unresolved_visibility(probe, item)
+                        )
+                    if exact_visible:
                         row = _execution_row(
                             item,
                             report_sha256=validated.report_sha256,
                             outcome="repaired",
                             reason_code=None,
                         )
-                    _append_execution_row_at(directory_fd, descriptor, row)
-                    existing += (row,)
+                        _append_execution_row_at(directory_fd, descriptor, row)
+                        existing += (row,)
+                        terminal_by_job_id[job_id] = row
+                        continue
+                    if recover_unresolved_claims and definitely_not_exact:
+                        retry_claimed.add(job_id)
+                        continue
+                    stopped_reason = "unresolved_claim"
+                    break
+
+                consecutive_failures = _trailing_consecutive_failures(
+                    validated,
+                    terminal_by_job_id,
+                )
+                if (
+                    stopped_reason is None
+                    and consecutive_failures >= consecutive_failure_limit
+                ):
+                    stopped_reason = "consecutive_remote_failures"
+
+                for item in (validated.items if stopped_reason is None else ()):
+                    job_id = item.receipt.job_id
+                    if job_id in terminal_by_job_id:
+                        continue
+                    if job_id in unresolved_job_ids and job_id not in retry_claimed:
+                        stopped_reason = "unresolved_claim"
+                        break
+                    with store.connection() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        current_receipt = _current_receipt_in_write_transaction(
+                            store,
+                            connection,
+                            item,
+                        )
+                        if current_receipt != item.receipt:
+                            row = _execution_row(
+                                item,
+                                report_sha256=validated.report_sha256,
+                                outcome="skipped_receipt_changed",
+                                reason_code="receipt_changed",
+                            )
+                            _append_execution_row_at(directory_fd, descriptor, row)
+                        else:
+                            if job_id not in claim_by_job_id:
+                                claim = _claim_row(item, validated)
+                                _append_claim_row_at(
+                                    directory_fd,
+                                    claims_descriptor,
+                                    claim,
+                                )
+                                claims += (claim,)
+                                claim_by_job_id[job_id] = claim
+                            try:
+                                sync_client.sync(
+                                    item.receipt.movie_code,
+                                    expected_subtitle_id=item.receipt.subtitle_id,
+                                    expected_content_sha256=item.receipt.content_sha256,
+                                )
+                            except CatalogSyncError as exc:
+                                consecutive_failures += 1
+                                row = _execution_row(
+                                    item,
+                                    report_sha256=validated.report_sha256,
+                                    outcome="failed",
+                                    reason_code=exc.reason_code,
+                                )
+                            else:
+                                consecutive_failures = 0
+                                row = _execution_row(
+                                    item,
+                                    report_sha256=validated.report_sha256,
+                                    outcome="repaired",
+                                    reason_code=None,
+                                )
+                            _append_execution_row_at(directory_fd, descriptor, row)
+                        existing += (row,)
+                        terminal_by_job_id[job_id] = row
                     if row["reason_code"] == "catalog_auth_failed":
                         stopped_reason = "catalog_auth_failed"
                         break
@@ -948,34 +1144,26 @@ def execute_catalog_visibility_repair(
                     os.close(claims_descriptor)
                 os.close(descriptor)
 
+    terminal_by_job_id = {row["job_id"]: row for row in existing}
     return RepairExecutionResult(
         action="executed",
         repaired=tuple(
             item.receipt.movie_code
             for item in validated.items
-            if any(
-                row["job_id"] == item.receipt.job_id
-                and row["outcome"] == "repaired"
-                for row in existing
-            )
+            if terminal_by_job_id.get(item.receipt.job_id, {}).get("outcome")
+            == "repaired"
         ),
         failed=tuple(
             item.receipt.movie_code
             for item in validated.items
-            if any(
-                row["job_id"] == item.receipt.job_id
-                and row["outcome"] == "failed"
-                for row in existing
-            )
+            if terminal_by_job_id.get(item.receipt.job_id, {}).get("outcome")
+            == "failed"
         ),
         skipped_receipt_changed=tuple(
             item.receipt.movie_code
             for item in validated.items
-            if any(
-                row["job_id"] == item.receipt.job_id
-                and row["outcome"] == "skipped_receipt_changed"
-                for row in existing
-            )
+            if terminal_by_job_id.get(item.receipt.job_id, {}).get("outcome")
+            == "skipped_receipt_changed"
         ),
         stopped_reason=stopped_reason,
         receipt_path=receipt_path,
