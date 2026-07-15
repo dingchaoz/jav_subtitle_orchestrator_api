@@ -17,6 +17,48 @@ from orchestrator.logging_config import configure_logging
 LOGGER = logging.getLogger(__name__)
 
 
+_LOWERCASE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _positive_int(value: str) -> int:
+    if re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    return int(value)
+
+
+def _lowercase_sha256(value: str) -> str:
+    if _LOWERCASE_SHA256_RE.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("must be exactly 64 lowercase hex characters")
+    return value
+
+
+def _catalog_movie_code(value: str) -> str:
+    from orchestrator.movie_code import canonical_movie_code
+
+    try:
+        return canonical_movie_code(value)
+    except (AttributeError, TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a valid movie code") from None
+
+
+class OrchestratorArgumentParser(argparse.ArgumentParser):
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        if parsed.command == "catalog-visibility-audit" and parsed.allowlist:
+            normalized = tuple(parsed.allowlist)
+            if len(normalized) != len(set(normalized)):
+                self.error("--allowlist contains duplicate canonical movie codes")
+            parsed.allowlist = tuple(sorted(normalized))
+        if parsed.command == "catalog-visibility-repair":
+            if parsed.execute and parsed.confirm_report_sha256 is None:
+                self.error(
+                    "--confirm-report-sha256 is required when --execute is used"
+                )
+            if not parsed.execute and parsed.confirm_report_sha256 is not None:
+                self.error("--confirm-report-sha256 requires --execute")
+        return parsed
+
+
 @dataclass(frozen=True, slots=True)
 class ProcessRecord:
     pid: int
@@ -815,6 +857,201 @@ def run_local_english_ai_audit(
     return summary
 
 
+def _absolute_cli_path(path: Path) -> Path:
+    return Path(path).absolute()
+
+
+def _validated_cli_output_dir(path: Path, *, operation: str) -> Path:
+    output = _absolute_cli_path(path)
+    try:
+        invalid = output.is_symlink() or (output.exists() and not output.is_dir())
+    except OSError:
+        raise SystemExit(f"catalog visibility {operation} output invalid") from None
+    if invalid:
+        raise SystemExit(f"catalog visibility {operation} output invalid")
+    return output
+
+
+def run_catalog_visibility_audit(
+    *,
+    output: Path,
+    allowlist: tuple[str, ...] | None,
+    limit: int | None,
+):
+    from orchestrator.catalog_visibility import (
+        CatalogVisibilityAuditor,
+        PublicCatalogVisibilityClient,
+    )
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    output_dir = _validated_cli_output_dir(output, operation="audit")
+    try:
+        settings = MacSettings()
+        if not settings.javsubtitle_api_base:
+            raise ValueError("catalog API origin is not configured")
+        store = JobStore(
+            settings.db_path,
+            settings.jobs_root_mac,
+            settings.jobs_root_windows,
+        )
+        client = PublicCatalogVisibilityClient(
+            settings.javsubtitle_api_base,
+            timeout_seconds=settings.subtitle_audit_timeout_seconds,
+        )
+        summary = CatalogVisibilityAuditor(store, client).scan(
+            output_dir,
+            allowlist=None if allowlist is None else set(allowlist),
+            limit=limit,
+        )
+    except Exception:
+        raise SystemExit("catalog visibility audit failed") from None
+
+    counts = summary.counts
+    print(
+        "audit_complete=true "
+        f"discovered={summary.discovered} "
+        f"checked={summary.checked} "
+        f"visible={counts.get('visible', 0)} "
+        f"missing={counts.get('missing', 0)} "
+        f"not_found={counts.get('not_found', 0)} "
+        f"fetch_failed={counts.get('fetch_failed', 0)} "
+        f"response_invalid={counts.get('response_invalid', 0)} "
+        f"invalid_receipt={counts.get('invalid_receipt', 0)} "
+        f"report_sha256={summary.report_sha256} "
+        f"report={_absolute_cli_path(summary.report_path)}"
+    )
+    return summary
+
+
+def _validated_cli_report_path(path: Path) -> Path:
+    report = _absolute_cli_path(path)
+    try:
+        valid = report.is_file() and not report.is_symlink()
+    except OSError:
+        valid = False
+    if not valid:
+        raise SystemExit("catalog visibility repair input invalid")
+    return report
+
+
+def _safe_stopped_reason(value: object) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, str) and re.fullmatch(r"[a-z0-9_]{1,64}", value):
+        return value
+    return "unknown"
+
+
+def run_catalog_visibility_repair(
+    *,
+    report: Path,
+    output: Path,
+    execute: bool,
+    confirm_report_sha256: str | None,
+) -> int:
+    if not isinstance(execute, bool):
+        raise SystemExit("catalog visibility repair authorization failed")
+    if execute:
+        if (
+            not isinstance(confirm_report_sha256, str)
+            or _LOWERCASE_SHA256_RE.fullmatch(confirm_report_sha256) is None
+        ):
+            raise SystemExit("catalog visibility repair authorization failed")
+    elif confirm_report_sha256 is not None:
+        raise SystemExit("catalog visibility repair authorization failed")
+
+    from orchestrator.catalog_visibility_repair import (
+        execute_catalog_visibility_repair,
+        plan_catalog_visibility_repair,
+    )
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    report_path = _validated_cli_report_path(report)
+    output_dir = _validated_cli_output_dir(output, operation="repair")
+    try:
+        settings = MacSettings()
+        if not settings.javsubtitle_api_base:
+            raise ValueError("catalog API origin is not configured")
+        store = JobStore(
+            settings.db_path,
+            settings.jobs_root_mac,
+            settings.jobs_root_windows,
+        )
+        plan = plan_catalog_visibility_repair(
+            store,
+            report_path,
+            expected_api_origin=settings.javsubtitle_api_base,
+            output_dir=output_dir,
+        )
+    except Exception:
+        raise SystemExit("catalog visibility repair planning failed") from None
+
+    receipt_path = output_dir / "repair-execution.jsonl"
+    if not execute:
+        skipped = dict(sorted(plan.skipped.items()))
+        resume_command = shlex.join(
+            [
+                "python",
+                "-m",
+                "orchestrator",
+                "catalog-visibility-repair",
+                "--report",
+                str(report_path),
+                "--output",
+                str(output_dir),
+                "--execute",
+                "--confirm-report-sha256",
+                plan.report_sha256,
+            ]
+        )
+        print(
+            "action=dry_run "
+            f"eligible={len(plan.items)} "
+            f"skipped_total={sum(skipped.values())} "
+            f"skipped={json.dumps(skipped, sort_keys=True, separators=(',', ':'))} "
+            f"report_sha256={plan.report_sha256} "
+            f"plan_sha256={plan.plan_sha256} "
+            f"plan={_absolute_cli_path(plan.plan_path)} "
+            f"receipt={receipt_path} "
+            f"resume={resume_command}"
+        )
+        return 0
+
+    if not settings.javsubtitle_admin_api_token:
+        raise SystemExit("catalog visibility repair authorization failed")
+    try:
+        sync_client = build_catalog_sync_client(settings)
+    except Exception:
+        raise SystemExit("catalog visibility repair authorization failed") from None
+    if sync_client is None:
+        raise SystemExit("catalog visibility repair authorization failed")
+    try:
+        result = execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=sync_client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=confirm_report_sha256,
+        )
+    except Exception:
+        raise SystemExit("catalog visibility repair execution failed") from None
+
+    stopped_reason = _safe_stopped_reason(result.stopped_reason)
+    print(
+        "action=executed "
+        f"repaired={len(result.repaired)} "
+        f"failed={len(result.failed)} "
+        f"skipped_receipt_changed={len(result.skipped_receipt_changed)} "
+        f"stopped_reason={stopped_reason} "
+        f"report_sha256={plan.report_sha256} "
+        f"receipt={_absolute_cli_path(result.receipt_path)}"
+    )
+    return 2 if result.failed or result.stopped_reason is not None else 0
+
+
 def run_windows_worker() -> None:
     from orchestrator.config import WindowsSettings
     from orchestrator.windows_worker import (
@@ -891,7 +1128,7 @@ def run_repair_interrupted_audio_wav(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m orchestrator")
+    parser = OrchestratorArgumentParser(prog="python -m orchestrator")
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("api")
     subcommands.add_parser("mac-worker")
@@ -989,6 +1226,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--requests-per-second",
         type=float,
         default=2.0,
+    )
+    catalog_visibility_audit = subcommands.add_parser(
+        "catalog-visibility-audit",
+        help="GET-only audit of exact public catalog subtitle visibility",
+    )
+    catalog_visibility_audit.add_argument("--output", type=Path, required=True)
+    catalog_visibility_audit.add_argument(
+        "--allowlist",
+        nargs="+",
+        type=_catalog_movie_code,
+        metavar="CODE",
+    )
+    catalog_visibility_audit.add_argument("--limit", type=_positive_int)
+    catalog_visibility_repair = subcommands.add_parser(
+        "catalog-visibility-repair",
+        help="plan or execute digest-authorized catalog-only repairs",
+    )
+    catalog_visibility_repair.add_argument("--report", type=Path, required=True)
+    catalog_visibility_repair.add_argument("--output", type=Path, required=True)
+    catalog_visibility_repair.add_argument("--execute", action="store_true")
+    catalog_visibility_repair.add_argument(
+        "--confirm-report-sha256",
+        type=_lowercase_sha256,
     )
     selector = subcommands.add_parser("select-historical-repair-canary")
     selector.add_argument("--allowlist-file", type=Path, required=True)
@@ -1099,6 +1359,21 @@ def main() -> None:
             limit=args.limit,
             workers=args.workers,
             requests_per_second=args.requests_per_second,
+        )
+    elif args.command == "catalog-visibility-audit":
+        run_catalog_visibility_audit(
+            output=args.output,
+            allowlist=args.allowlist,
+            limit=args.limit,
+        )
+    elif args.command == "catalog-visibility-repair":
+        raise SystemExit(
+            run_catalog_visibility_repair(
+                report=args.report,
+                output=args.output,
+                execute=args.execute,
+                confirm_report_sha256=args.confirm_report_sha256,
+            )
         )
     elif args.command == "select-historical-repair-canary":
         run_select_historical_repair_canary(
