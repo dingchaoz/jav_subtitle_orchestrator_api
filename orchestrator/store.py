@@ -4088,6 +4088,144 @@ class JobStore:
             assert completed is not None
             return completed
 
+    def list_catalog_sync_failure_candidates(
+        self,
+        *,
+        movie_codes: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[JobRecord]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("limit must be positive")
+        requested_order: dict[str, int] | None = None
+        if movie_codes is not None:
+            requested_order = {}
+            for movie_code in movie_codes:
+                canonical = canonical_movie_code(movie_code)
+                requested_order.setdefault(canonical, len(requested_order))
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND error LIKE 'catalog_sync:%'
+                  AND claimed_by IS NULL
+                  AND catalog_movie_uuid IS NOT NULL
+                  AND metadata_status IS NOT NULL
+                  AND metadata_source IS NOT NULL
+                  AND published_subtitle_id IS NOT NULL
+                  AND published_storage_path IS NOT NULL
+                  AND published_content_sha256 IS NOT NULL
+                  AND published_file_size > 0
+                ORDER BY created_at ASC, id ASC
+                """,
+                (JobStatus.FAILED.value,),
+            ).fetchall()
+        candidates: list[JobRecord] = []
+        for row in rows:
+            job = self._row_to_job(row)
+            try:
+                canonical = canonical_movie_code(job.normalized_movie_number)
+                _validate_verified_supabase_receipt(
+                    movie_code=canonical,
+                    movie_uuid=job.catalog_movie_uuid,
+                    metadata_status=job.metadata_status,
+                    metadata_source=job.metadata_source,
+                    subtitle_id=job.published_subtitle_id,
+                    storage_path=job.published_storage_path,
+                    content_sha256=job.published_content_sha256,
+                    file_size=job.published_file_size,
+                )
+            except ValueError:
+                continue
+            if requested_order is not None and canonical not in requested_order:
+                continue
+            candidates.append(job)
+        if requested_order is not None:
+            candidates.sort(
+                key=lambda job: requested_order[
+                    canonical_movie_code(job.normalized_movie_number)
+                ]
+            )
+        return candidates[:limit]
+
+    def restore_verified_catalog_sync_failure(
+        self,
+        snapshot: JobRecord,
+        *,
+        retry_catalog_sync: bool = False,
+    ) -> JobRecord | None:
+        if snapshot.status is not JobStatus.FAILED:
+            raise ValueError("catalog reconciliation requires failed snapshot")
+        if not snapshot.error or not snapshot.error.startswith("catalog_sync:"):
+            raise ValueError("catalog reconciliation requires catalog error")
+        _validate_verified_supabase_receipt(
+            movie_code=snapshot.normalized_movie_number,
+            movie_uuid=snapshot.catalog_movie_uuid,
+            metadata_status=snapshot.metadata_status,
+            metadata_source=snapshot.metadata_source,
+            subtitle_id=snapshot.published_subtitle_id,
+            storage_path=snapshot.published_storage_path,
+            content_sha256=snapshot.published_content_sha256,
+            file_size=snapshot.published_file_size,
+        )
+        original_reason = snapshot.error.split(":", 1)[1].strip()
+        warning_code = (
+            original_reason
+            if original_reason in _CATALOG_SYNC_FAILURE_REASON_CODES
+            else "catalog_sync_failed"
+        )
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, artifact_status = ?, catalog_sync_status = ?,
+                    catalog_sync_warning_code = ?,
+                    catalog_sync_warning_message = ?,
+                    catalog_sync_attempt_count = CASE WHEN ? THEN 0
+                                                      ELSE catalog_sync_attempt_count END,
+                    next_catalog_sync_attempt_at = NULL,
+                    catalog_lease_token = NULL, claimed_by = NULL,
+                    lease_expires_at = NULL, stage_lease_token = NULL,
+                    updated_at = ?, error = NULL
+                WHERE id = ? AND status = ? AND error = ? AND claimed_by IS NULL
+                  AND updated_at = ?
+                  AND catalog_movie_uuid IS ? AND metadata_status IS ?
+                  AND metadata_source IS ? AND published_subtitle_id IS ?
+                  AND published_storage_path IS ?
+                  AND published_content_sha256 IS ?
+                  AND published_file_size IS ?
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    "ready",
+                    "pending" if retry_catalog_sync else "failed",
+                    warning_code,
+                    (
+                        "Catalog sync failed after Supabase publication; "
+                        "artifact verified ready."
+                    ),
+                    retry_catalog_sync,
+                    now,
+                    snapshot.id,
+                    JobStatus.FAILED.value,
+                    snapshot.error,
+                    snapshot.updated_at,
+                    snapshot.catalog_movie_uuid,
+                    snapshot.metadata_status,
+                    snapshot.metadata_source,
+                    snapshot.published_subtitle_id,
+                    snapshot.published_storage_path,
+                    snapshot.published_content_sha256,
+                    snapshot.published_file_size,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            restored = self.get_job(snapshot.id, conn=conn)
+            assert restored is not None
+            return restored
+
     def claim_catalog_sync_job(
         self,
         worker_id: str,
@@ -5346,6 +5484,28 @@ class JobStore:
             event = self.get_callback_event(event_id, conn=conn)
             assert event is not None
             return event
+
+    def prepare_failed_callback_retry(
+        self,
+        event_id: str,
+        *,
+        target_url: str,
+        payload_json: str,
+    ) -> CallbackEventRecord | None:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE callback_events
+                SET status = 'pending', target_url = ?, payload_json = ?,
+                    updated_at = ?, delivered_at = NULL, last_error = NULL
+                WHERE id = ? AND status = 'failed'
+                """,
+                (target_url, payload_json, now, event_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self.get_callback_event(event_id, conn=conn)
 
     def _get_by_normalized(self, conn: sqlite3.Connection, normalized: str) -> JobRecord | None:
         row = conn.execute(

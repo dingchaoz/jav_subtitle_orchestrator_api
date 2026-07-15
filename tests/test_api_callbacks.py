@@ -164,3 +164,47 @@ def test_callback_failure_is_redacted_and_cannot_downgrade_ready_job(
     assert event.last_error == "callback_delivery_failed"
     assert "hmac-secret" not in event.last_error
     assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_explicit_ready_resend_retries_failed_event_but_not_delivered_event(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = ready_job(store)
+    failing_sender = RecordingCallbackSender(error=RuntimeError("temporary"))
+    notifier = CallbackNotifier(
+        store,
+        {
+            "machine-a.access": CallbackClient(
+                "https://client.example/ready",
+                "hmac-secret",
+            )
+        },
+        sender=failing_sender,
+    )
+    notifier.notify_subtitle_ready(job)
+
+    successful_sender = RecordingCallbackSender()
+    retrying_notifier = CallbackNotifier(
+        store,
+        {
+            "machine-a.access": CallbackClient(
+                "https://client.example/ready",
+                "hmac-secret",
+            )
+        },
+        sender=successful_sender,
+    )
+    retrying_notifier.notify_subtitle_ready(job, retry_failed=True)
+    retrying_notifier.notify_subtitle_ready(job, retry_failed=True)
+
+    assert len(successful_sender.calls) == 1
+    event = store.get_callback_event_for_client(
+        job.id,
+        "subtitle.ready",
+        "machine-a.access",
+    )
+    assert event.status == "delivered"
+    assert event.attempt_count == 2
