@@ -15,7 +15,6 @@ from orchestrator.movie_code import canonical_movie_code
 
 
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
-MAX_CATALOG_TIMEOUT_SECONDS = 300
 
 
 class VisibilityStatus(str, Enum):
@@ -156,7 +155,6 @@ def validate_catalog_timeout_seconds(timeout_seconds: object) -> int | float:
         or not isinstance(timeout_seconds, (int, float))
         or timeout_seconds <= 0
         or (isinstance(timeout_seconds, float) and not math.isfinite(timeout_seconds))
-        or timeout_seconds > MAX_CATALOG_TIMEOUT_SECONDS
     ):
         raise ValueError("timeout_seconds must be positive")
     return timeout_seconds
@@ -255,7 +253,7 @@ class PublicCatalogVisibilityClient:
                 timeout=self.timeout_seconds,
                 allow_redirects=False,
             )
-        except requests.RequestException:
+        except (requests.RequestException, OverflowError):
             return PublicVisibilityResult(
                 VisibilityStatus.FETCH_FAILED,
                 *result_args,

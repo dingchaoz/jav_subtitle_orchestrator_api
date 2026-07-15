@@ -174,7 +174,7 @@ class CatalogSyncClient:
                 timeout=self.timeout_seconds,
                 allow_redirects=False,
             )
-        except requests.RequestException:
+        except (requests.RequestException, OverflowError):
             request_failed = True
         if request_failed:
             raise CatalogSyncError("catalog_fetch_failed")

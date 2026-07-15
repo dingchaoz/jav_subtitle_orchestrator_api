@@ -6,7 +6,6 @@ from dataclasses import fields
 import pytest
 import requests
 
-from orchestrator.catalog_visibility import MAX_CATALOG_TIMEOUT_SECONDS
 from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, CatalogSyncResult
 
 
@@ -131,8 +130,8 @@ class FakeSession:
         response: FakeResponse | None = None,
         *,
         public_response: FakeResponse | None = None,
-        error: requests.RequestException | None = None,
-        public_error: requests.RequestException | None = None,
+        error: Exception | None = None,
+        public_error: Exception | None = None,
     ) -> None:
         self.response = response or FakeResponse()
         self.public_response = public_response or FakeResponse(body=valid_public_body())
@@ -618,9 +617,6 @@ def test_admin_token_must_be_nonempty_string(token):
         math.nan,
         math.inf,
         -math.inf,
-        MAX_CATALOG_TIMEOUT_SECONDS + 1,
-        MAX_CATALOG_TIMEOUT_SECONDS + 0.1,
-        1e20,
     ],
 )
 def test_timeout_must_be_positive_number(timeout):
@@ -630,7 +626,7 @@ def test_timeout_must_be_positive_number(timeout):
         )
 
 
-@pytest.mark.parametrize("timeout", [1, 0.25, 300, 300.0])
+@pytest.mark.parametrize("timeout", [1, 0.25, 300, 301, 3600, 1e20, 10**400])
 def test_sync_accepts_positive_finite_timeout(timeout):
     client = CatalogSyncClient(
         "https://javsubtitle.example",
@@ -640,6 +636,20 @@ def test_sync_accepts_positive_finite_timeout(timeout):
     )
 
     assert client.timeout_seconds == timeout
+
+
+def test_admin_post_overflow_is_safe_catalog_fetch_failure():
+    session = FakeSession(error=OverflowError(f"overflow {TOKEN} {ADULT_TEXT}"))
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert raised.value.reason_code == "catalog_fetch_failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    for sensitive in (TOKEN, ADULT_TEXT):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
 
 
 def test_sync_endpoint_uses_requests_aligned_idn_origin_for_bearer_request():

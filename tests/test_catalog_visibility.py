@@ -7,7 +7,6 @@ import pytest
 import requests
 
 from orchestrator.catalog_visibility import (
-    MAX_CATALOG_TIMEOUT_SECONDS,
     PublicCatalogVisibilityClient,
     PublicVisibilityResult,
     VisibilityStatus,
@@ -48,7 +47,7 @@ class FakeSession:
         self,
         response: FakeResponse | None = None,
         *,
-        error: requests.RequestException | None = None,
+        error: Exception | None = None,
     ) -> None:
         self.response = response or FakeResponse()
         self.error = error
@@ -73,6 +72,16 @@ class PreparedRequestSession(requests.Session):
         response.request = request
         response.url = request.url
         return response
+
+
+class OverflowingPreparedRequestSession(requests.Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[tuple[requests.PreparedRequest, dict[str, object]]] = []
+
+    def send(self, request: requests.PreparedRequest, **kwargs: object) -> requests.Response:
+        self.sent.append((request, kwargs))
+        raise OverflowError(f"timeout overflow containing {SECRET}")
 
 
 def check(session: FakeSession) -> PublicVisibilityResult:
@@ -190,9 +199,6 @@ def test_origin_normalization_rejects_invalid_hostname_characters(base_url: str)
         math.nan,
         math.inf,
         -math.inf,
-        MAX_CATALOG_TIMEOUT_SECONDS + 1,
-        MAX_CATALOG_TIMEOUT_SECONDS + 0.1,
-        1e20,
     ],
 )
 def test_timeout_must_be_a_positive_non_bool_number(timeout):
@@ -202,14 +208,39 @@ def test_timeout_must_be_a_positive_non_bool_number(timeout):
         )
 
 
-@pytest.mark.parametrize("timeout", [1, 0.25, 300, 300.0])
+@pytest.mark.parametrize("timeout", [1, 0.25, 300, 301, 3600, 1e20, 10**400])
 def test_positive_finite_timeout_is_preserved(timeout):
-    assert MAX_CATALOG_TIMEOUT_SECONDS == 300
     client = PublicCatalogVisibilityClient(
         "https://javsubtitle.example", timeout_seconds=timeout, session=FakeSession()
     )
 
     assert client.timeout_seconds == timeout
+
+
+def test_fake_get_overflow_is_safe_fetch_failure():
+    result = check(FakeSession(error=OverflowError(f"overflow {SECRET}")))
+
+    assert result.status is VisibilityStatus.FETCH_FAILED
+    assert result.reason_code == "public_visibility_fetch_failed"
+    assert SECRET not in repr(result)
+
+
+def test_requests_huge_timeout_overflow_is_safely_classified_without_network():
+    session = OverflowingPreparedRequestSession()
+    client = PublicCatalogVisibilityClient(
+        "https://javsubtitle.example",
+        timeout_seconds=1e20,
+        session=session,
+    )
+
+    result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+    assert result.status is VisibilityStatus.FETCH_FAILED
+    assert result.reason_code == "public_visibility_fetch_failed"
+    assert len(session.sent) == 1
+    _request, kwargs = session.sent[0]
+    assert kwargs["timeout"] == 1e20
+    assert SECRET not in repr(result)
 
 
 def test_requests_prepares_exact_validated_url_and_receives_finite_timeout():
