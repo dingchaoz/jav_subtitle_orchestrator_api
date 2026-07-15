@@ -195,6 +195,7 @@ class MacTranslationWorker:
         catalog_sync_client=None,
         max_catalog_sync_attempts: int = 10,
         catalog_sync_retry_seconds: int = 30,
+        catalog_sync_max_retry_seconds: int = 900,
     ) -> None:
         self.store = store
         self.translator = translator
@@ -217,6 +218,7 @@ class MacTranslationWorker:
         )
         self.max_catalog_sync_attempts = max_catalog_sync_attempts
         self.catalog_sync_retry_seconds = catalog_sync_retry_seconds
+        self.catalog_sync_max_retry_seconds = catalog_sync_max_retry_seconds
         self.consecutive_quality_failures = 0
         self.historical_quality_failures = (
             self.store.historical_lane_state().consecutive_quality_failures
@@ -335,6 +337,7 @@ class MacTranslationWorker:
         self.store.recover_expired_catalog_sync_leases(
             self.max_catalog_sync_attempts,
             self.catalog_sync_retry_seconds,
+            self.catalog_sync_max_retry_seconds,
         )
         if (
             self.store.has_due_historical_repair()
@@ -1700,6 +1703,15 @@ class MacTranslationWorker:
                 reason_code = (
                     exc.reason_code if isinstance(exc, CatalogSyncError) else "catalog_sync_failed"
                 )
+                retryable = (
+                    exc.retryable if isinstance(exc, CatalogSyncError) else True
+                )
+                http_status = (
+                    exc.http_status if isinstance(exc, CatalogSyncError) else None
+                )
+                response_json = (
+                    exc.response_json if isinstance(exc, CatalogSyncError) else None
+                )
                 error = f"catalog_sync: {reason_code}"
                 try:
                     updated = self.store.fail_catalog_sync(
@@ -1709,6 +1721,10 @@ class MacTranslationWorker:
                         lease_token=job.catalog_lease_token,
                         max_catalog_sync_attempts=self.max_catalog_sync_attempts,
                         retry_seconds=self.catalog_sync_retry_seconds,
+                        max_retry_seconds=self.catalog_sync_max_retry_seconds,
+                        retryable=retryable,
+                        http_status=http_status,
+                        response_json=response_json,
                     )
                 except CatalogLeaseLostError:
                     error = "catalog_sync: catalog_lease_lost"
@@ -1734,6 +1750,8 @@ class MacTranslationWorker:
                         d1_rows_updated=result.d1_rows_updated,
                         subtitle_count=result.subtitle_count,
                         kv_keys_deleted=result.kv_keys_deleted,
+                        http_status=result.diagnostic.http_status,
+                        response_json=result.diagnostic.response_json,
                     )
                 except CatalogLeaseLostError:
                     error = "catalog_sync: catalog_lease_lost"

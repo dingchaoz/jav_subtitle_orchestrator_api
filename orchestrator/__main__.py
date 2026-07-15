@@ -431,6 +431,9 @@ def run_mac_translation_worker() -> None:
             catalog_sync_client=catalog_sync_client,
             max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
             catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
+            catalog_sync_max_retry_seconds=(
+                settings.catalog_sync_max_retry_seconds
+            ),
         )
         run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
     except BaseException:
@@ -468,6 +471,7 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         catalog_sync_client=catalog_sync_client,
         max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
         catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
+        catalog_sync_max_retry_seconds=settings.catalog_sync_max_retry_seconds,
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)

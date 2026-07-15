@@ -241,7 +241,7 @@ class CatalogSyncError(RuntimeError):
         self,
         reason_code: str,
         *,
-        retryable: bool = False,
+        retryable: bool | None = None,
         http_status: int | None = None,
         response_json: str | None = None,
     ) -> None:
@@ -249,7 +249,16 @@ class CatalogSyncError(RuntimeError):
             reason_code if reason_code in _SAFE_REASON_CODES else "catalog_sync_failed"
         )
         self.reason_code = safe_reason
-        self.retryable = retryable
+        self.retryable = (
+            retryable
+            if retryable is not None
+            else safe_reason
+            not in {
+                "catalog_redirect_rejected",
+                "catalog_auth_failed",
+                "public_visibility_redirect_rejected",
+            }
+        )
         self.http_status = http_status
         self.response_json = response_json
         super().__init__(safe_reason)

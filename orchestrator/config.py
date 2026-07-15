@@ -96,6 +96,11 @@ class MacSettings(BaseSettings):
         le=3600,
         alias="CATALOG_SYNC_RETRY_SECONDS",
     )
+    catalog_sync_max_retry_seconds: int = Field(
+        default=900,
+        ge=1,
+        alias="CATALOG_SYNC_MAX_RETRY_SECONDS",
+    )
     max_catalog_sync_attempts: int = Field(
         default=10,
         ge=1,

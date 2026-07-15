@@ -59,6 +59,7 @@ _HISTORICAL_POLICY_PAUSE_REASONS = frozenset(
         "supabase_verification_failed",
     }
 )
+_MAX_CATALOG_DIAGNOSTIC_BYTES = 4096
 
 
 class CatalogLeaseLostError(PermissionError):
@@ -168,6 +169,26 @@ def _validate_ready_published_artifact(job: "JobRecord") -> None:
         content_sha256=job.published_content_sha256,
         file_size=job.published_file_size,
     )
+
+
+def _bounded_catalog_diagnostic(
+    http_status: object,
+    response_json: object,
+) -> tuple[int | None, str | None]:
+    safe_status = (
+        http_status
+        if isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599
+        else None
+    )
+    safe_response = (
+        response_json
+        if isinstance(response_json, str)
+        and len(response_json.encode("utf-8")) <= _MAX_CATALOG_DIAGNOSTIC_BYTES
+        else None
+    )
+    return safe_status, safe_response
 
 
 def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
@@ -319,7 +340,7 @@ def normal_translation_backlog_exists(conn: sqlite3.Connection) -> bool:
         """
         SELECT 1 FROM jobs
         WHERE translation_origin = ? AND (
-          status IN (?, ?, ?, ?)
+          status IN (?, ?, ?, ?, ?, ?)
           OR (status = ? AND artifact_status = ? AND catalog_sync_status = ?)
         )
         LIMIT 1
@@ -330,6 +351,8 @@ def normal_translation_backlog_exists(conn: sqlite3.Connection) -> bool:
             JobStatus.TRANSLATING.value,
             JobStatus.PUBLISH_PENDING.value,
             JobStatus.PUBLISHING.value,
+            JobStatus.CATALOG_SYNC_PENDING.value,
+            JobStatus.CATALOG_SYNCING.value,
             JobStatus.ENGLISH_SRT_READY.value,
             "ready",
             "pending",
@@ -1998,15 +2021,17 @@ class JobStore:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 """
-                SELECT r.job_id AS repair_job_id,
+                SELECT r.job_id AS repair_job_id, r.state AS repair_state,
                        r.attempt_count AS repair_attempt_count, j.*
                 FROM historical_translation_repairs AS r
                 JOIN jobs AS j ON j.id = r.job_id
-                WHERE r.state = ? AND j.status = ? AND j.claimed_by IS NULL
+                WHERE r.state IN (?, ?) AND j.status = ?
+                  AND j.claimed_by IS NULL
                   AND j.translation_origin = ?
                 """,
                 (
                     HistoricalRepairState.RUNNING.value,
+                    HistoricalRepairState.SUCCEEDED.value,
                     JobStatus.FAILED.value,
                     HISTORICAL_TRANSLATION_ORIGIN,
                 ),
@@ -2106,32 +2131,43 @@ class JobStore:
                 elif catalog_resume:
                     job_cursor = conn.execute(
                         """
-                        UPDATE jobs SET status = ?, updated_at = ?
+                        UPDATE jobs SET status = ?, artifact_status = ?,
+                            catalog_sync_status = ?,
+                            catalog_sync_warning_code = ?,
+                            catalog_sync_warning_message = ?,
+                            updated_at = ?, error = NULL
                         WHERE id = ? AND status = ? AND claimed_by IS NULL
                           AND translation_origin = ?
                         """,
                         (
-                            JobStatus.CATALOG_SYNC_PENDING.value,
+                            JobStatus.ENGLISH_SRT_READY.value,
+                            "ready",
+                            "pending",
+                            "catalog_sync_lease_expired",
+                            "Catalog synchronization lease expired.",
                             now,
                             row["repair_job_id"],
                             JobStatus.FAILED.value,
                             HISTORICAL_TRANSLATION_ORIGIN,
                         ),
                     )
-                    repair_cursor = conn.execute(
-                        """
-                        UPDATE historical_translation_repairs
-                        SET reason_code = ?, updated_at = ?
-                        WHERE job_id = ? AND state = ?
-                        """,
-                        (
-                            "historical_orphaned_catalog_resume",
-                            now,
-                            row["repair_job_id"],
-                            HistoricalRepairState.RUNNING.value,
-                        ),
-                    )
-                    if job_cursor.rowcount != 1 or repair_cursor.rowcount != 1:
+                    repair_updated = 1
+                    if row["repair_state"] == HistoricalRepairState.RUNNING.value:
+                        repair_cursor = conn.execute(
+                            """
+                            UPDATE historical_translation_repairs
+                            SET reason_code = ?, updated_at = ?
+                            WHERE job_id = ? AND state = ?
+                            """,
+                            (
+                                "historical_orphaned_catalog_resume",
+                                now,
+                                row["repair_job_id"],
+                                HistoricalRepairState.RUNNING.value,
+                            ),
+                        )
+                        repair_updated = repair_cursor.rowcount
+                    if job_cursor.rowcount != 1 or repair_updated != 1:
                         raise RuntimeError(
                             "historical_orphaned_catalog_state_changed"
                         )
@@ -4056,6 +4092,10 @@ class JobStore:
         lease_token: str,
         max_catalog_sync_attempts: int,
         retry_seconds: int,
+        max_retry_seconds: int = 900,
+        retryable: bool = True,
+        http_status: int | None = None,
+        response_json: str | None = None,
     ) -> JobRecord:
         if reason_code not in _CATALOG_SYNC_FAILURE_REASON_CODES:
             reason_code = "catalog_sync_failed"
@@ -4089,15 +4129,20 @@ class JobStore:
                 file_size=job.published_file_size,
             )
             attempts = job.catalog_sync_attempt_count + 1
-            auth_pause = reason_code == "catalog_auth_failed"
-            exhausted = (
-                not auth_pause and attempts >= max_catalog_sync_attempts
-            )
+            exhausted = not retryable or attempts >= max_catalog_sync_attempts
             next_catalog_status = "failed" if exhausted else "pending"
+            delay = min(
+                retry_seconds * (2 ** max(attempts - 1, 0)),
+                max_retry_seconds,
+            )
             next_attempt_at = (
                 None
                 if exhausted
-                else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+                else (now_dt + timedelta(seconds=delay)).isoformat()
+            )
+            safe_http_status, safe_response_json = _bounded_catalog_diagnostic(
+                http_status,
+                response_json,
             )
             cursor = conn.execute(
                 """
@@ -4108,6 +4153,9 @@ class JobStore:
                     lease_expires_at = NULL, catalog_lease_token = NULL,
                     catalog_sync_warning_code = ?,
                     catalog_sync_warning_message = ?,
+                    catalog_sync_last_http_status = ?,
+                    catalog_sync_last_response_json = ?,
+                    catalog_sync_last_attempt_at = ?,
                     updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
                   AND artifact_status = ? AND catalog_sync_status = ?
@@ -4122,6 +4170,9 @@ class JobStore:
                     next_attempt_at,
                     reason_code,
                     f"Catalog synchronization failed: {reason_code}",
+                    safe_http_status,
+                    safe_response_json,
+                    now,
                     now,
                     job_id,
                     JobStatus.ENGLISH_SRT_READY.value,
@@ -4135,13 +4186,6 @@ class JobStore:
             if cursor.rowcount != 1:
                 raise CatalogLeaseLostError(
                     f"job {job_id} catalog lease is no longer owned"
-                )
-            if auth_pause:
-                conn.execute(
-                    "UPDATE historical_repair_control "
-                    "SET paused = 1, reason_code = 'catalog_auth_failed', "
-                    "updated_at = ? WHERE singleton = 1",
-                    (now,),
                 )
             failed = self.get_job(job_id, conn=conn)
             assert failed is not None
@@ -4325,6 +4369,8 @@ class JobStore:
         d1_rows_updated: int,
         subtitle_count: int,
         kv_keys_deleted: tuple[str, ...],
+        http_status: int | None = None,
+        response_json: str | None = None,
     ) -> JobRecord:
         canonical = canonical_movie_code(canonical_code)
         if canonical != canonical_code:
@@ -4372,6 +4418,10 @@ class JobStore:
             if canonical_movie_code(job.normalized_movie_number) != canonical:
                 raise ValueError("catalog canonical code does not match job")
             _validate_ready_published_artifact(job)
+            safe_http_status, safe_response_json = _bounded_catalog_diagnostic(
+                http_status,
+                response_json,
+            )
             cursor = conn.execute(
                 """
                 UPDATE jobs
@@ -4379,6 +4429,9 @@ class JobStore:
                     artifact_status = ?, catalog_sync_status = ?,
                     catalog_sync_warning_code = NULL,
                     catalog_sync_warning_message = NULL,
+                    catalog_sync_last_http_status = ?,
+                    catalog_sync_last_response_json = ?,
+                    catalog_sync_last_attempt_at = ?,
                     claimed_by = NULL, lease_expires_at = NULL,
                     catalog_lease_token = NULL, updated_at = ?, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by = ?
@@ -4390,6 +4443,9 @@ class JobStore:
                     JobStatus.ENGLISH_SRT_READY.value,
                     "ready",
                     "succeeded",
+                    safe_http_status,
+                    safe_response_json,
+                    now,
                     now,
                     job_id,
                     JobStatus.ENGLISH_SRT_READY.value,
@@ -4498,6 +4554,7 @@ class JobStore:
         self,
         max_catalog_sync_attempts: int,
         retry_seconds: int,
+        max_retry_seconds: int = 900,
     ) -> int:
         now_dt = datetime.now(UTC).replace(microsecond=0)
         now = now_dt.isoformat()
@@ -4539,10 +4596,14 @@ class JobStore:
             with self.connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 next_catalog_status = "failed" if exhausted else "pending"
+                delay = min(
+                    retry_seconds * (2 ** max(attempts - 1, 0)),
+                    max_retry_seconds,
+                )
                 next_attempt_at = (
                     None
                     if exhausted
-                    else (now_dt + timedelta(seconds=retry_seconds)).isoformat()
+                    else (now_dt + timedelta(seconds=delay)).isoformat()
                 )
                 cursor = conn.execute(
                     """
@@ -4553,6 +4614,9 @@ class JobStore:
                         lease_expires_at = NULL, catalog_lease_token = NULL,
                         catalog_sync_warning_code = ?,
                         catalog_sync_warning_message = ?,
+                        catalog_sync_last_http_status = NULL,
+                        catalog_sync_last_response_json = NULL,
+                        catalog_sync_last_attempt_at = ?,
                         updated_at = ?, error = NULL
                     WHERE id = ? AND status = ? AND claimed_by = ?
                       AND catalog_lease_token IS ?
@@ -4574,6 +4638,7 @@ class JobStore:
                             if preservation_changed
                             else "Catalog synchronization lease expired."
                         ),
+                        now,
                         now,
                         row["id"],
                         row["status"],
