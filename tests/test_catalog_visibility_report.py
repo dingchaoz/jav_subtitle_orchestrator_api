@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+import orchestrator.catalog_visibility_report as report_module
 from orchestrator.catalog_visibility import AuditCandidateSnapshot
 from orchestrator.catalog_visibility_report import (
     AUDIT_REPORT_SCHEMA_VERSION,
@@ -796,3 +799,297 @@ def test_safe_serialization_never_contains_database_path_or_secret_fields(
     (tmp_path / "audit-findings.jsonl").write_text(canonical_line(payload) + "\n")
     with pytest.raises(ValueError):
         load_audit_findings(tmp_path, manifest)
+
+
+def test_manifest_and_report_mappings_are_defensive_and_immutable(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    allowlist = ["ktb-111"]
+    selection = {"allowlist": allowlist, "limit": 1}
+    manifest = create_audit_manifest(
+        api_origin="https://javsubtitle.example",
+        database_path=tmp_path / "jobs.sqlite3",
+        candidates=(candidate,),
+        selection=selection,
+    )
+    selection["limit"] = 99
+    allowlist.append("abc-001")
+
+    assert manifest.selection == {"allowlist": ["ktb-111"], "limit": 1}
+    with pytest.raises(TypeError):
+        manifest.selection["limit"] = 2
+    with pytest.raises((AttributeError, TypeError)):
+        manifest.selection["allowlist"].append("abc-001")
+
+    write_audit_manifest(tmp_path, manifest)
+    append_audit_finding(tmp_path, finding(candidate))
+    report = finalize_audit_report(tmp_path)
+    digest = report.report_sha256
+    with pytest.raises(TypeError):
+        report.counts["visible"] = 99
+    assert audit_report_sha256(report) == digest
+
+
+def test_hardlinked_checkpoint_is_rejected_without_modifying_external_inode(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    write_manifest(tmp_path, candidate)
+    external = tmp_path / "external"
+    external.write_bytes(b"external-content")
+    external.chmod(0o644)
+    os.link(external, tmp_path / "audit-findings.jsonl")
+    before = external.stat()
+
+    with pytest.raises(ValueError):
+        append_audit_finding(tmp_path, finding(candidate))
+
+    after = external.stat()
+    assert external.read_bytes() == b"external-content"
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o644
+
+
+def test_manifest_fsync_failure_leaves_no_final_or_temp_and_retry_succeeds(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = make_manifest(tmp_path, candidate)
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_first_file_fsync(descriptor: int):
+        nonlocal failed
+        if not failed and stat.S_ISREG(os.fstat(descriptor).st_mode):
+            failed = True
+            raise OSError("injected primary fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_file_fsync)
+    with pytest.raises((OSError, ValueError), match="fsync|written safely"):
+        write_audit_manifest(tmp_path, manifest)
+    assert not (tmp_path / "audit-manifest.json").exists()
+    assert not list(tmp_path.glob(".audit-manifest.json.*.tmp"))
+
+    monkeypatch.setattr(os, "fsync", real_fsync)
+    write_audit_manifest(tmp_path, manifest)
+    assert load_audit_manifest(tmp_path / "audit-manifest.json") == manifest
+
+
+def test_identical_existing_manifest_is_hardened_to_private_mode(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = write_manifest(tmp_path, candidate)
+    path = tmp_path / "audit-manifest.json"
+    path.chmod(0o644)
+
+    write_audit_manifest(tmp_path, manifest)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_concurrent_duplicate_append_has_one_success_and_remains_resumable(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = write_manifest(tmp_path, candidate)
+    barrier = threading.Barrier(8)
+
+    def append_once() -> str:
+        barrier.wait()
+        try:
+            append_audit_finding(tmp_path, finding(candidate))
+        except ValueError:
+            return "duplicate"
+        return "success"
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _: append_once(), range(8)))
+
+    assert results.count("success") == 1
+    assert results.count("duplicate") == 7
+    assert load_audit_findings(tmp_path, manifest) == (finding(candidate),)
+
+
+def test_first_checkpoint_creation_fsyncs_directory_and_propagates_failure(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    write_manifest(tmp_path, candidate)
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int):
+        nonlocal calls
+        calls += 1
+        raise OSError("injected directory fsync failure")
+
+    monkeypatch.setattr(
+        report_module,
+        "_fsync_directory_fd",
+        fail_directory_fsync,
+        raising=False,
+    )
+    with pytest.raises(OSError, match="directory fsync"):
+        append_audit_finding(tmp_path, finding(candidate))
+    assert calls == 1
+
+
+def test_report_is_idempotent_and_cannot_be_replaced_by_changed_checkpoint(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    write_manifest(tmp_path, candidate)
+    append_audit_finding(tmp_path, finding(candidate))
+    first = finalize_audit_report(tmp_path)
+    assert finalize_audit_report(tmp_path) == first
+
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    payload = json.loads(checkpoint.read_text())
+    payload["status"] = "missing"
+    payload["reason_code"] = "public_visibility_mismatch"
+    checkpoint.write_text(canonical_line(payload) + "\n")
+
+    with pytest.raises(ValueError):
+        finalize_audit_report(tmp_path)
+    assert load_audit_report(tmp_path / "audit-report.json") == first
+
+
+def test_pinned_directory_prevents_parent_swap_redirect(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    output = tmp_path / "output"
+    output.mkdir()
+    moved = tmp_path / "moved"
+    redirect = tmp_path / "redirect"
+    redirect.mkdir()
+    manifest = make_manifest(tmp_path, candidate)
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if (
+            not swapped
+            and dir_fd is not None
+            and isinstance(path, str)
+            and path.startswith(".audit-manifest.json.")
+        ):
+            output.rename(moved)
+            output.symlink_to(redirect, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    write_audit_manifest(output, manifest)
+
+    assert swapped is True
+    assert not any(redirect.iterdir())
+    assert load_audit_manifest(moved / "audit-manifest.json") == manifest
+
+
+def test_resource_limits_and_deep_json_fail_safely(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    monkeypatch.setattr(report_module, "MAX_AUDIT_CANDIDATES", 0, raising=False)
+    with pytest.raises(ValueError):
+        make_manifest(tmp_path / "candidates", candidate)
+
+    monkeypatch.setattr(report_module, "MAX_AUDIT_CANDIDATES", 10_000)
+    monkeypatch.setattr(report_module, "MAX_AUDIT_ALLOWLIST", 0, raising=False)
+    with pytest.raises(ValueError):
+        make_manifest(tmp_path / "allowlist", candidate)
+
+    monkeypatch.setattr(report_module, "MAX_AUDIT_ALLOWLIST", 10_000)
+    manifest = write_manifest(tmp_path / "document", candidate)
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 10, raising=False)
+    with pytest.raises(ValueError):
+        load_audit_manifest(tmp_path / "document" / "audit-manifest.json")
+
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 200 + "0" + "]" * 200)
+    monkeypatch.setattr(
+        report_module,
+        "MAX_AUDIT_DOCUMENT_BYTES",
+        64 * 1024 * 1024,
+    )
+    with pytest.raises(ValueError):
+        load_audit_manifest(deep)
+
+    monkeypatch.setattr(report_module, "MAX_OBSERVED_SUBTITLE_IDS", 0, raising=False)
+    with pytest.raises(ValueError):
+        append_audit_finding(
+            tmp_path / "document",
+            replace(finding(candidate), observed_subtitle_ids=(SUBTITLE_ID,)),
+        )
+
+
+def test_checkpoint_line_and_document_and_report_limits_fail_safely(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = write_manifest(tmp_path, candidate)
+    monkeypatch.setattr(report_module, "MAX_CHECKPOINT_LINE_BYTES", 10)
+    with pytest.raises(ValueError):
+        append_audit_finding(tmp_path, finding(candidate))
+
+    monkeypatch.setattr(report_module, "MAX_CHECKPOINT_LINE_BYTES", 64 * 1024)
+    append_audit_finding(tmp_path, finding(candidate))
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 10)
+    with pytest.raises(ValueError):
+        load_audit_findings(tmp_path, manifest)
+
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 64 * 1024 * 1024)
+    report = finalize_audit_report(tmp_path)
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 10)
+    with pytest.raises(ValueError):
+        load_audit_report(tmp_path / "audit-report.json")
+    assert report.complete is True
+
+
+def test_cleanup_fault_does_not_mask_primary_error_and_temp_is_removed(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = make_manifest(tmp_path, candidate)
+    real_close = os.close
+    close_failed = False
+
+    def fail_write(_descriptor: int, _data: bytes):
+        raise OSError("PRIMARY_WRITE_FAILURE")
+
+    def close_then_fail_once(descriptor: int):
+        nonlocal close_failed
+        is_regular = stat.S_ISREG(os.fstat(descriptor).st_mode)
+        real_close(descriptor)
+        if is_regular and not close_failed:
+            close_failed = True
+            raise OSError("CLEANUP_CLOSE_FAILURE")
+
+    monkeypatch.setattr(report_module, "_write_all_fd", fail_write)
+    monkeypatch.setattr(os, "close", close_then_fail_once)
+    with pytest.raises(OSError, match="PRIMARY_WRITE_FAILURE"):
+        write_audit_manifest(tmp_path, manifest)
+
+    assert close_failed is True
+    assert not (tmp_path / "audit-manifest.json").exists()
+    assert not list(tmp_path.glob(".audit-manifest.json.*.tmp"))
+
+
+def test_concurrent_manifest_creators_converge_or_fail_closed(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = make_manifest(tmp_path, candidate)
+    barrier = threading.Barrier(4)
+
+    def write_same() -> None:
+        barrier.wait()
+        write_audit_manifest(tmp_path, manifest)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(lambda _: write_same(), range(4)))
+    assert load_audit_manifest(tmp_path / "audit-manifest.json") == manifest
+
+    with pytest.raises(ValueError):
+        write_audit_manifest(tmp_path, replace(manifest, audit_id=str(uuid4())))
+
+
+def test_parent_traversal_is_rejected(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = make_manifest(tmp_path, candidate)
+    unsafe = os.path.join(str(tmp_path), "missing", "..", "redirect")
+
+    with pytest.raises(ValueError):
+        write_audit_manifest(unsafe, manifest)

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import re
 import stat
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 from uuid import UUID, uuid4
 
@@ -22,6 +27,18 @@ from orchestrator.movie_code import canonical_movie_code
 
 AUDIT_REPORT_SCHEMA_VERSION = 1
 REPAIR_ELIGIBLE = frozenset({"missing", "not_found"})
+MAX_AUDIT_CANDIDATES = 10_000
+MAX_AUDIT_ALLOWLIST = 10_000
+MAX_AUDIT_FINDINGS = 10_000
+MAX_OBSERVED_SUBTITLE_IDS = 10_000
+MAX_AUDIT_DOCUMENT_BYTES = 64 * 1024 * 1024
+MAX_CHECKPOINT_LINE_BYTES = 64 * 1024
+MAX_JSON_DEPTH = 100
+_SECURE_DIR_FD_SUPPORTED = all(
+    operation in os.supports_dir_fd
+    for operation in (os.open, os.mkdir, os.unlink, os.link)
+)
+_CHECKPOINT_PROCESS_LOCK = threading.RLock()
 
 _MANIFEST_FILE_NAME = "audit-manifest.json"
 _CHECKPOINT_FILE_NAME = "audit-findings.jsonl"
@@ -85,6 +102,31 @@ _STRICT_UTC_TIMESTAMP_RE = re.compile(
 )
 
 
+class _FrozenList(tuple[object, ...]):
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple(self) == tuple(other)
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+def _freeze_selection(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    snapshot = dict(value)
+    allowlist = snapshot.get("allowlist")
+    if isinstance(allowlist, (list, tuple)):
+        snapshot["allowlist"] = _FrozenList(allowlist)
+    return MappingProxyType(snapshot)
+
+
+def _freeze_counts(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    return MappingProxyType(dict(value))
+
+
 @dataclass(frozen=True, slots=True)
 class AuditFinding:
     candidate: AuditCandidateSnapshot
@@ -103,6 +145,9 @@ class AuditManifest:
     selection: dict[str, object]
     candidates: tuple[AuditCandidateSnapshot, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selection", _freeze_selection(self.selection))
+
 
 @dataclass(frozen=True, slots=True)
 class AuditReport:
@@ -111,6 +156,9 @@ class AuditReport:
     counts: dict[str, int]
     complete: bool
     report_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "counts", _freeze_counts(self.counts))
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -265,13 +313,17 @@ def _candidate_from_obj(value: object) -> AuditCandidateSnapshot:
 
 
 def _normalize_selection(selection: object) -> dict[str, object]:
-    payload = _exact_dict(selection, _SELECTION_FIELDS, "selection")
+    if not isinstance(selection, Mapping) or set(selection) != _SELECTION_FIELDS:
+        raise ValueError("selection has invalid fields")
+    payload = selection
     raw_allowlist = payload["allowlist"]
     if raw_allowlist is None:
         allowlist: list[str] | None = None
     else:
-        if not isinstance(raw_allowlist, list):
+        if not isinstance(raw_allowlist, (list, tuple)):
             raise TypeError("selection allowlist must be a JSON array or null")
+        if len(raw_allowlist) > MAX_AUDIT_ALLOWLIST:
+            raise ValueError("selection allowlist is too large")
         normalized_codes: list[str] = []
         for code in raw_allowlist:
             if not isinstance(code, str):
@@ -324,6 +376,8 @@ def _validate_manifest(manifest: object) -> AuditManifest:
         raise ValueError("manifest selection is not canonical")
     if not isinstance(manifest.candidates, tuple):
         raise TypeError("manifest candidates must be a tuple")
+    if len(manifest.candidates) > MAX_AUDIT_CANDIDATES:
+        raise ValueError("manifest contains too many candidates")
     validated_candidates = tuple(_validate_candidate(item) for item in manifest.candidates)
     deterministic_candidates = tuple(
         sorted(validated_candidates, key=lambda item: (item.job_updated_at, item.job_id))
@@ -340,13 +394,17 @@ def _validate_manifest(manifest: object) -> AuditManifest:
 
 
 def _manifest_to_obj(manifest: AuditManifest) -> dict[str, object]:
+    allowlist = manifest.selection["allowlist"]
     return {
         "schema_version": manifest.schema_version,
         "audit_id": manifest.audit_id,
         "created_at": manifest.created_at,
         "api_origin": manifest.api_origin,
         "database_path_sha256": manifest.database_path_sha256,
-        "selection": manifest.selection,
+        "selection": {
+            "allowlist": None if allowlist is None else list(allowlist),
+            "limit": manifest.selection["limit"],
+        },
         "candidates": [_candidate_to_obj(item) for item in manifest.candidates],
     }
 
@@ -356,6 +414,8 @@ def _manifest_from_obj(value: object) -> AuditManifest:
     candidates_payload = payload["candidates"]
     if not isinstance(candidates_payload, list):
         raise TypeError("manifest candidates must be a JSON array")
+    if len(candidates_payload) > MAX_AUDIT_CANDIDATES:
+        raise ValueError("manifest contains too many candidates")
     selection = _normalize_selection(payload["selection"])
     if selection != payload["selection"]:
         raise ValueError("manifest selection is not canonical")
@@ -380,6 +440,8 @@ def create_audit_manifest(
 ) -> AuditManifest:
     if not isinstance(candidates, tuple):
         raise TypeError("candidates must be a tuple")
+    if len(candidates) > MAX_AUDIT_CANDIDATES:
+        raise ValueError("too many audit candidates")
     validated_candidates = tuple(
         _canonicalize_candidate_for_create(item) for item in candidates
     )
@@ -402,68 +464,157 @@ def create_audit_manifest(
     return _validate_manifest(manifest)
 
 
-def _absolute_without_resolving(path: Path) -> Path:
-    return Path(os.path.abspath(os.fspath(path)))
+def _directory_open_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("secure directory descriptors are unavailable")
+    if not _SECURE_DIR_FD_SUPPORTED:
+        raise RuntimeError("secure directory-relative operations are unavailable")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def _reject_symlink_components(path: Path) -> None:
-    absolute = _absolute_without_resolving(path)
-    for component in reversed((absolute, *absolute.parents)):
-        try:
-            component_stat = component.lstat()
-        except FileNotFoundError:
+def _fsync_directory_fd(descriptor: int) -> None:
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}
+        if exc.errno not in unsupported:
+            raise
+
+
+def _close_ignoring_error(descriptor: int | None) -> None:
+    if descriptor is None:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _path_components(path: str | os.PathLike[str]) -> tuple[str, list[str]]:
+    raw = Path(path)
+    start = "/" if raw.is_absolute() else "."
+    components: list[str] = []
+    for part in raw.parts:
+        if part in {"", ".", "/"}:
             continue
-        except OSError as exc:
-            raise ValueError("audit path cannot be inspected safely") from exc
-        if stat.S_ISLNK(component_stat.st_mode):
-            raise ValueError("audit paths must not contain symlinks")
+        if part == "..":
+            raise ValueError("audit paths must not contain parent traversal")
+        components.append(part)
+    return start, components
 
 
-def _prepare_output_dir(output_dir: str | os.PathLike[str]) -> Path:
-    path = _absolute_without_resolving(Path(output_dir))
-    _reject_symlink_components(path)
+def _open_directory_path(path: str | os.PathLike[str], *, create: bool) -> int:
+    start, components = _path_components(path)
+    flags = _directory_open_flags()
+    descriptor = os.open(start, flags)
     try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ValueError("audit output directory cannot be created") from exc
-    _reject_symlink_components(path)
+        for component in components:
+            child: int | None = None
+            created_component = False
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    created_component = False
+                else:
+                    created_component = True
+                    _fsync_directory_fd(descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise ValueError("audit directory path is unsafe") from exc
+            try:
+                assert child is not None
+                if created_component:
+                    os.fchmod(child, 0o700)
+                    os.fsync(child)
+                os.close(descriptor)
+            except BaseException:
+                _close_ignoring_error(child)
+                raise
+            descriptor = child
+        return descriptor
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+
+
+@contextmanager
+def _pinned_directory(path: str | os.PathLike[str], *, create: bool):
+    descriptor = _open_directory_path(path, create=create)
     try:
-        if not path.is_dir():
-            raise ValueError("audit output path is not a directory")
-    except OSError as exc:
-        raise ValueError("audit output directory cannot be inspected") from exc
-    return path
+        yield descriptor
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+    else:
+        os.close(descriptor)
 
 
-def _nofollow_flag() -> int:
-    return getattr(os, "O_NOFOLLOW", 0)
+def _leaf_parent(path: str | os.PathLike[str]) -> tuple[Path, str]:
+    value = Path(path)
+    name = value.name
+    if not name or name in {".", ".."} or "/" in name:
+        raise ValueError("audit file path is invalid")
+    return value.parent, name
 
 
-def _safe_read_bytes(path: Path) -> bytes:
-    path = _absolute_without_resolving(path)
-    _reject_symlink_components(path)
-    flags = os.O_RDONLY | _nofollow_flag()
+def _validate_regular_fd(descriptor: int, label: str) -> os.stat_result:
+    file_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+        raise ValueError(f"{label} is not a private regular file")
+    return file_stat
+
+
+def _open_existing_leaf(directory_fd: int, name: str, flags: int, label: str) -> int:
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=directory_fd)
     except OSError as exc:
         if isinstance(exc, FileNotFoundError):
             raise
-        raise ValueError("audit file cannot be opened safely") from exc
+        raise ValueError(f"{label} cannot be opened safely") from exc
     try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError("audit file is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
-    except OSError as exc:
-        raise ValueError("audit file cannot be read safely") from exc
-    finally:
-        os.close(descriptor)
+        _validate_regular_fd(descriptor, label)
+        return descriptor
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+
+
+def _read_fd_limited(descriptor: int, label: str, limit: int) -> bytes:
+    file_stat = _validate_regular_fd(descriptor, label)
+    if file_stat.st_size > limit:
+        raise ValueError(f"{label} is too large")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = limit + 1
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    if len(data) > limit:
+        raise ValueError(f"{label} is too large")
+    return data
+
+
+def _safe_read_bytes(path: Path, label: str = "audit file") -> bytes:
+    parent, name = _leaf_parent(path)
+    with _pinned_directory(parent, create=False) as directory_fd:
+        descriptor = _open_existing_leaf(directory_fd, name, os.O_RDONLY, label)
+        try:
+            data = _read_fd_limited(descriptor, label, MAX_AUDIT_DOCUMENT_BYTES)
+        except BaseException:
+            _close_ignoring_error(descriptor)
+            raise
+        else:
+            os.close(descriptor)
+            return data
 
 
 def _decode_json(data: bytes, label: str) -> object:
@@ -480,50 +631,138 @@ def _decode_json(data: bytes, label: str) -> object:
 
     try:
         text = data.decode("utf-8")
-        return json.loads(
+        decoded = json.loads(
             text,
             object_pairs_hook=reject_duplicate_fields,
             parse_constant=reject_nonstandard_constant,
         )
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise ValueError(f"{label} is not valid JSON") from None
+    stack: list[tuple[object, int]] = [(decoded, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError(f"{label} is too deeply nested")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+    return decoded
 
 
-def _write_exclusive_private(path: Path, data: bytes) -> None:
-    _reject_symlink_components(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _nofollow_flag()
-    descriptor = os.open(path, flags, 0o600)
+def _write_all_fd(descriptor: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            raise OSError("audit file write did not progress")
+        offset += written
+
+
+def _unlink_at_ignoring_error(directory_fd: int, name: str) -> None:
     try:
+        os.unlink(name, dir_fd=directory_fd)
+    except OSError:
+        pass
+
+
+def _atomic_install_no_clobber(
+    directory_fd: int,
+    final_name: str,
+    data: bytes,
+    label: str,
+) -> bool:
+    if len(data) > MAX_AUDIT_DOCUMENT_BYTES:
+        raise ValueError(f"{label} is too large")
+    temp_name = f".{final_name}.{uuid4().hex}.tmp"
+    descriptor: int | None = None
+    installed = False
+    try:
+        descriptor = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        _validate_regular_fd(descriptor, label)
         os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(descriptor)
-    finally:
+        _write_all_fd(descriptor, data)
+        os.fsync(descriptor)
         os.close(descriptor)
+        descriptor = None
+        try:
+            os.link(
+                temp_name,
+                final_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            installed = False
+        else:
+            installed = True
+        os.unlink(temp_name, dir_fd=directory_fd)
+        _fsync_directory_fd(directory_fd)
+        return installed
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        _unlink_at_ignoring_error(directory_fd, temp_name)
+        try:
+            _fsync_directory_fd(directory_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _load_manifest_fd(descriptor: int) -> AuditManifest:
+    data = _read_fd_limited(
+        descriptor,
+        "audit manifest",
+        MAX_AUDIT_DOCUMENT_BYTES,
+    )
+    return _manifest_from_obj(_decode_json(data, "audit manifest"))
 
 
 def write_audit_manifest(
     output_dir: str | os.PathLike[str], manifest: AuditManifest
 ) -> None:
     manifest = _validate_manifest(manifest)
-    directory = _prepare_output_dir(output_dir)
-    path = directory / _MANIFEST_FILE_NAME
-    _reject_symlink_components(path)
-    if path.exists():
-        if load_audit_manifest(path) != manifest:
-            raise ValueError("existing audit manifest differs")
-        return
     data = _canonical_bytes(_manifest_to_obj(manifest))
-    try:
-        _write_exclusive_private(path, data)
-    except FileExistsError:
-        if load_audit_manifest(path) != manifest:
-            raise ValueError("existing audit manifest differs") from None
+    with _pinned_directory(output_dir, create=True) as directory_fd:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        installed = _atomic_install_no_clobber(
+            directory_fd,
+            _MANIFEST_FILE_NAME,
+            data,
+            "audit manifest",
+        )
+        if installed:
+            return
+        descriptor = _open_existing_leaf(
+            directory_fd,
+            _MANIFEST_FILE_NAME,
+            os.O_RDWR,
+            "audit manifest",
+        )
+        try:
+            existing = _load_manifest_fd(descriptor)
+            if existing != manifest:
+                raise ValueError("existing audit manifest differs")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        except BaseException:
+            _close_ignoring_error(descriptor)
+            raise
+        else:
+            os.close(descriptor)
 
 
 def load_audit_manifest(path: str | os.PathLike[str]) -> AuditManifest:
-    payload = _decode_json(_safe_read_bytes(Path(path)), "audit manifest")
+    payload = _decode_json(
+        _safe_read_bytes(Path(path), "audit manifest"),
+        "audit manifest",
+    )
     return _manifest_from_obj(payload)
 
 
@@ -540,6 +779,8 @@ def _validate_finding(finding: object) -> AuditFinding:
         raise ValueError("finding reason_code is invalid")
     if not isinstance(finding.observed_subtitle_ids, tuple):
         raise TypeError("finding observed_subtitle_ids must be a string tuple")
+    if len(finding.observed_subtitle_ids) > MAX_OBSERVED_SUBTITLE_IDS:
+        raise ValueError("finding contains too many observed subtitle IDs")
     for observed_subtitle_id in finding.observed_subtitle_ids:
         _validate_canonical_uuid(
             observed_subtitle_id,
@@ -581,6 +822,8 @@ def _finding_from_obj(value: object) -> AuditFinding:
     observed = payload["observed_subtitle_ids"]
     if not isinstance(observed, list) or any(not isinstance(item, str) for item in observed):
         raise TypeError("finding observed_subtitle_ids must be a JSON string array")
+    if len(observed) > MAX_OBSERVED_SUBTITLE_IDS:
+        raise ValueError("finding contains too many observed subtitle IDs")
     finding = AuditFinding(
         candidate=_candidate_from_obj(payload["candidate"]),
         status=payload["status"],  # type: ignore[arg-type]
@@ -601,66 +844,166 @@ def _match_finding_to_manifest(
         raise ValueError("finding candidate differs from the manifest snapshot")
 
 
+def _load_manifest_at(directory_fd: int) -> AuditManifest:
+    descriptor = _open_existing_leaf(
+        directory_fd,
+        _MANIFEST_FILE_NAME,
+        os.O_RDONLY,
+        "audit manifest",
+    )
+    try:
+        manifest = _load_manifest_fd(descriptor)
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+    else:
+        os.close(descriptor)
+        return manifest
+
+
+def _load_findings_from_fd(
+    descriptor: int,
+    manifest: AuditManifest,
+) -> tuple[AuditFinding, ...]:
+    file_stat = _validate_regular_fd(descriptor, "audit checkpoint")
+    if file_stat.st_size > MAX_AUDIT_DOCUMENT_BYTES:
+        raise ValueError("audit checkpoint is too large")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    candidates_by_job_id = {item.job_id: item for item in manifest.candidates}
+    findings: list[AuditFinding] = []
+    seen_job_ids: set[str] = set()
+    stream = os.fdopen(os.dup(descriptor), "rb")
+    try:
+        while True:
+            line = stream.readline(MAX_CHECKPOINT_LINE_BYTES + 1)
+            if not line:
+                break
+            if len(line) > MAX_CHECKPOINT_LINE_BYTES:
+                raise ValueError("audit checkpoint row is too large")
+            if line == b"\n":
+                raise ValueError("audit checkpoint contains a blank row")
+            if not line.endswith(b"\n"):
+                raise ValueError("audit checkpoint contains a truncated row")
+            if len(findings) >= min(MAX_AUDIT_FINDINGS, len(manifest.candidates)):
+                raise ValueError("audit checkpoint contains too many findings")
+            finding = _finding_from_obj(
+                _decode_json(line[:-1], "audit checkpoint row")
+            )
+            _match_finding_to_manifest(finding, candidates_by_job_id)
+            if finding.candidate.job_id in seen_job_ids:
+                raise ValueError("audit checkpoint contains a duplicate job finding")
+            seen_job_ids.add(finding.candidate.job_id)
+            findings.append(finding)
+    except BaseException:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        raise
+    else:
+        stream.close()
+    return tuple(findings)
+
+
+def _load_findings_at(
+    directory_fd: int,
+    manifest: AuditManifest,
+) -> tuple[AuditFinding, ...]:
+    try:
+        descriptor = _open_existing_leaf(
+            directory_fd,
+            _CHECKPOINT_FILE_NAME,
+            os.O_RDONLY,
+            "audit checkpoint",
+        )
+    except FileNotFoundError:
+        return ()
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        findings = _load_findings_from_fd(descriptor, manifest)
+    except BaseException:
+        _close_ignoring_error(descriptor)
+        raise
+    else:
+        os.close(descriptor)
+        return findings
+
+
 def load_audit_findings(
     output_dir: str | os.PathLike[str], manifest: AuditManifest
 ) -> tuple[AuditFinding, ...]:
     manifest = _validate_manifest(manifest)
-    directory = _prepare_output_dir(output_dir)
-    path = directory / _CHECKPOINT_FILE_NAME
-    _reject_symlink_components(path)
-    if not path.exists():
-        return ()
-    data = _safe_read_bytes(path)
-    if not data:
-        return ()
-    if not data.endswith(b"\n"):
-        raise ValueError("audit checkpoint contains a truncated row")
-    raw_lines = data.split(b"\n")[:-1]
-    if any(not line for line in raw_lines):
-        raise ValueError("audit checkpoint contains a blank row")
-    candidates_by_job_id = {item.job_id: item for item in manifest.candidates}
-    findings: list[AuditFinding] = []
-    seen_job_ids: set[str] = set()
-    for line in raw_lines:
-        finding = _finding_from_obj(_decode_json(line, "audit checkpoint row"))
+    with _CHECKPOINT_PROCESS_LOCK:
+        with _pinned_directory(output_dir, create=False) as directory_fd:
+            return _load_findings_at(directory_fd, manifest)
+
+
+def _append_audit_finding_locked(
+    output_dir: str | os.PathLike[str], finding: AuditFinding
+) -> None:
+    finding = _validate_finding(finding)
+    row = _canonical_bytes(_finding_to_obj(finding)) + b"\n"
+    if len(row) > MAX_CHECKPOINT_LINE_BYTES:
+        raise ValueError("audit checkpoint row is too large")
+    with _pinned_directory(output_dir, create=False) as directory_fd:
+        manifest = _load_manifest_at(directory_fd)
+        candidates_by_job_id = {item.job_id: item for item in manifest.candidates}
         _match_finding_to_manifest(finding, candidates_by_job_id)
-        if finding.candidate.job_id in seen_job_ids:
-            raise ValueError("audit checkpoint contains a duplicate job finding")
-        seen_job_ids.add(finding.candidate.job_id)
-        findings.append(finding)
-    return tuple(findings)
+        created = False
+        try:
+            descriptor = os.open(
+                _CHECKPOINT_FILE_NAME,
+                os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = _open_existing_leaf(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                os.O_RDWR | os.O_APPEND,
+                "audit checkpoint",
+            )
+        original_size: int | None = None
+        row_durable = False
+        try:
+            original_size = _validate_regular_fd(
+                descriptor,
+                "audit checkpoint",
+            ).st_size
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            existing = _load_findings_from_fd(descriptor, manifest)
+            if finding.candidate.job_id in {
+                item.candidate.job_id for item in existing
+            }:
+                raise ValueError("audit checkpoint already contains this job finding")
+            os.fchmod(descriptor, 0o600)
+            written = os.write(descriptor, row)
+            if written != len(row):
+                raise OSError("audit checkpoint append was incomplete")
+            os.fsync(descriptor)
+            row_durable = True
+            if created:
+                _fsync_directory_fd(directory_fd)
+        except BaseException:
+            if original_size is not None and not row_durable:
+                try:
+                    os.ftruncate(descriptor, original_size)
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
+            _close_ignoring_error(descriptor)
+            raise
+        else:
+            os.close(descriptor)
 
 
 def append_audit_finding(
     output_dir: str | os.PathLike[str], finding: AuditFinding
 ) -> None:
-    finding = _validate_finding(finding)
-    directory = _prepare_output_dir(output_dir)
-    manifest = load_audit_manifest(directory / _MANIFEST_FILE_NAME)
-    candidates_by_job_id = {item.job_id: item for item in manifest.candidates}
-    _match_finding_to_manifest(finding, candidates_by_job_id)
-    existing = load_audit_findings(directory, manifest)
-    if finding.candidate.job_id in {item.candidate.job_id for item in existing}:
-        raise ValueError("audit checkpoint already contains this job finding")
-    path = directory / _CHECKPOINT_FILE_NAME
-    _reject_symlink_components(path)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | _nofollow_flag()
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise ValueError("audit checkpoint cannot be opened safely") from exc
-    try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise ValueError("audit checkpoint is not a regular file")
-        os.fchmod(descriptor, 0o600)
-        row = _canonical_bytes(_finding_to_obj(finding)) + b"\n"
-        with os.fdopen(descriptor, "ab", closefd=False) as stream:
-            stream.write(row)
-            stream.flush()
-            os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    with _CHECKPOINT_PROCESS_LOCK:
+        _append_audit_finding_locked(output_dir, finding)
 
 
 def _status_counts(findings: tuple[AuditFinding, ...]) -> dict[str, int]:
@@ -674,7 +1017,7 @@ def _report_payload_without_digest(report: AuditReport) -> dict[str, object]:
     return {
         "manifest": _manifest_to_obj(report.manifest),
         "findings": [_finding_to_obj(item) for item in report.findings],
-        "counts": report.counts,
+        "counts": dict(report.counts),
         "complete": report.complete,
     }
 
@@ -695,6 +1038,8 @@ def _validate_report(report: object) -> AuditReport:
     manifest = _validate_manifest(report.manifest)
     if not isinstance(report.findings, tuple):
         raise TypeError("report findings must be a tuple")
+    if len(report.findings) > MAX_AUDIT_FINDINGS:
+        raise ValueError("audit report contains too many findings")
     findings = tuple(_validate_finding(item) for item in report.findings)
     expected_candidates = manifest.candidates
     if tuple(item.candidate for item in findings) != expected_candidates:
@@ -718,6 +1063,8 @@ def _report_from_obj(value: object) -> AuditReport:
     findings_payload = payload["findings"]
     if not isinstance(findings_payload, list):
         raise TypeError("audit report findings must be a JSON array")
+    if len(findings_payload) > MAX_AUDIT_FINDINGS:
+        raise ValueError("audit report contains too many findings")
     counts_payload = payload["counts"]
     if not isinstance(counts_payload, dict) or set(counts_payload) != _STATUS_VALUES:
         raise ValueError("audit report counts have invalid fields")
@@ -736,83 +1083,79 @@ def _report_from_obj(value: object) -> AuditReport:
     return _validate_report(report)
 
 
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _nofollow_flag()
-    try:
-        descriptor = os.open(directory, flags)
-    except OSError:
-        return
-    try:
-        try:
-            os.fsync(descriptor)
-        except OSError:
-            pass
-    finally:
-        os.close(descriptor)
+def _load_report_fd(descriptor: int) -> AuditReport:
+    data = _read_fd_limited(
+        descriptor,
+        "audit report",
+        MAX_AUDIT_DOCUMENT_BYTES,
+    )
+    return _report_from_obj(_decode_json(data, "audit report"))
 
 
-def _atomic_write_private(path: Path, data: bytes) -> None:
-    _reject_symlink_components(path)
-    if path.exists():
+def _finalize_audit_report_locked(
+    output_dir: str | os.PathLike[str],
+) -> AuditReport:
+    with _pinned_directory(output_dir, create=False) as directory_fd:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        manifest = _load_manifest_at(directory_fd)
+        checkpoint_findings = _load_findings_at(directory_fd, manifest)
+        findings_by_job_id = {
+            item.candidate.job_id: item for item in checkpoint_findings
+        }
+        if len(findings_by_job_id) != len(manifest.candidates) or set(
+            findings_by_job_id
+        ) != {item.job_id for item in manifest.candidates}:
+            raise ValueError("audit checkpoint is incomplete")
+        ordered_findings = tuple(
+            findings_by_job_id[candidate.job_id] for candidate in manifest.candidates
+        )
+        unsigned = AuditReport(
+            manifest=manifest,
+            findings=ordered_findings,
+            counts=_status_counts(ordered_findings),
+            complete=True,
+            report_sha256="",
+        )
+        report = replace(unsigned, report_sha256=audit_report_sha256(unsigned))
+        _validate_report(report)
+        data = _canonical_bytes(_report_to_obj(report))
+        installed = _atomic_install_no_clobber(
+            directory_fd,
+            _REPORT_FILE_NAME,
+            data,
+            "audit report",
+        )
+        if installed:
+            return report
+        descriptor = _open_existing_leaf(
+            directory_fd,
+            _REPORT_FILE_NAME,
+            os.O_RDWR,
+            "audit report",
+        )
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise ValueError("audit report target is not a regular file")
-        except OSError as exc:
-            raise ValueError("audit report target cannot be inspected") from exc
-    temp_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-    descriptor: int | None = None
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _nofollow_flag()
-        descriptor = os.open(temp_path, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(data)
-            stream.flush()
+            existing = _load_report_fd(descriptor)
+            if existing != report:
+                raise ValueError("existing audit report differs")
+            os.fchmod(descriptor, 0o600)
             os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        _reject_symlink_components(path)
-        os.replace(temp_path, path)
-        _fsync_directory(path.parent)
-    except OSError as exc:
-        raise ValueError("audit report cannot be written safely") from exc
-    finally:
-        if descriptor is not None:
+        except BaseException:
+            _close_ignoring_error(descriptor)
+            raise
+        else:
             os.close(descriptor)
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+            return existing
 
 
 def finalize_audit_report(output_dir: str | os.PathLike[str]) -> AuditReport:
-    directory = _prepare_output_dir(output_dir)
-    report_path = directory / _REPORT_FILE_NAME
-    _reject_symlink_components(report_path)
-    manifest = load_audit_manifest(directory / _MANIFEST_FILE_NAME)
-    checkpoint_findings = load_audit_findings(directory, manifest)
-    findings_by_job_id = {
-        item.candidate.job_id: item for item in checkpoint_findings
-    }
-    if len(findings_by_job_id) != len(manifest.candidates) or set(findings_by_job_id) != {
-        item.job_id for item in manifest.candidates
-    }:
-        raise ValueError("audit checkpoint is incomplete")
-    ordered_findings = tuple(
-        findings_by_job_id[candidate.job_id] for candidate in manifest.candidates
-    )
-    unsigned = AuditReport(
-        manifest=manifest,
-        findings=ordered_findings,
-        counts=_status_counts(ordered_findings),
-        complete=True,
-        report_sha256="",
-    )
-    report = replace(unsigned, report_sha256=audit_report_sha256(unsigned))
-    _validate_report(report)
-    _atomic_write_private(report_path, _canonical_bytes(_report_to_obj(report)))
-    return report
+    with _CHECKPOINT_PROCESS_LOCK:
+        return _finalize_audit_report_locked(output_dir)
 
 
 def load_audit_report(path: str | os.PathLike[str]) -> AuditReport:
-    return _report_from_obj(_decode_json(_safe_read_bytes(Path(path)), "audit report"))
+    return _report_from_obj(
+        _decode_json(
+            _safe_read_bytes(Path(path), "audit report"),
+            "audit report",
+        )
+    )
