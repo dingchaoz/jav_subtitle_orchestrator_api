@@ -194,6 +194,43 @@ def test_initialize_migrates_legacy_row_idempotently(
     assert foreign_key_violations == []
 
 
+def test_initialize_classifies_verified_legacy_ready_publication(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("KTB-104", priority=100, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'english_srt_ready', artifact_status = NULL,
+                catalog_sync_status = NULL,
+                catalog_movie_uuid = ?, metadata_status = 'complete',
+                metadata_source = 'public', published_subtitle_id = ?,
+                published_storage_path = ?, published_content_sha256 = ?,
+                published_file_size = 123, error = NULL
+            WHERE id = ?
+            """,
+            (
+                "f1bd9932-5697-4f16-865a-c56edc73d491",
+                "f1bd9932-5697-4f16-865a-c56edc73d492",
+                "ktb/ktb-104/ktb-104-English_AI.srt",
+                "a" * 64,
+                job.id,
+            ),
+        )
+
+    store.initialize()
+
+    migrated = store.get_job(job.id)
+    assert migrated.status is JobStatus.ENGLISH_SRT_READY
+    assert migrated.artifact_status == "ready"
+    assert migrated.catalog_sync_status is None
+    assert migrated.error is None
+
+
 def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
     sqlite_path, mac_jobs_root
 ):

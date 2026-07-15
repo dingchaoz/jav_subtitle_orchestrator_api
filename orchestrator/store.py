@@ -899,6 +899,39 @@ class JobStore:
             for column, definition in durable_state_columns.items():
                 if column not in columns:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+            legacy_ready_rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND artifact_status IS NULL
+                  AND catalog_movie_uuid IS NOT NULL
+                  AND metadata_status IS NOT NULL
+                  AND metadata_source IS NOT NULL
+                  AND published_subtitle_id IS NOT NULL
+                  AND published_storage_path IS NOT NULL
+                  AND published_content_sha256 IS NOT NULL
+                  AND published_file_size > 0
+                """,
+                (JobStatus.ENGLISH_SRT_READY.value,),
+            ).fetchall()
+            for row in legacy_ready_rows:
+                try:
+                    _validate_verified_supabase_receipt(
+                        movie_code=row["normalized_movie_number"],
+                        movie_uuid=row["catalog_movie_uuid"],
+                        metadata_status=row["metadata_status"],
+                        metadata_source=row["metadata_source"],
+                        subtitle_id=row["published_subtitle_id"],
+                        storage_path=row["published_storage_path"],
+                        content_sha256=row["published_content_sha256"],
+                        file_size=row["published_file_size"],
+                    )
+                except ValueError:
+                    continue
+                conn.execute(
+                    "UPDATE jobs SET artifact_status = 'ready' "
+                    "WHERE id = ? AND status = ? AND artifact_status IS NULL",
+                    (row["id"], JobStatus.ENGLISH_SRT_READY.value),
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created "
                 "ON jobs(status, priority, created_at)"
