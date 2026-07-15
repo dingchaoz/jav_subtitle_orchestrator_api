@@ -196,6 +196,7 @@ class MacTranslationWorker:
         max_catalog_sync_attempts: int = 10,
         catalog_sync_retry_seconds: int = 30,
         catalog_sync_max_retry_seconds: int = 900,
+        callback_notifier=None,
     ) -> None:
         self.store = store
         self.translator = translator
@@ -219,6 +220,7 @@ class MacTranslationWorker:
         self.max_catalog_sync_attempts = max_catalog_sync_attempts
         self.catalog_sync_retry_seconds = catalog_sync_retry_seconds
         self.catalog_sync_max_retry_seconds = catalog_sync_max_retry_seconds
+        self.callback_notifier = callback_notifier
         self.consecutive_quality_failures = 0
         self.historical_quality_failures = (
             self.store.historical_lane_state().consecutive_quality_failures
@@ -1673,6 +1675,15 @@ class MacTranslationWorker:
                 job.id,
                 updated.published_content_sha256,
             )
+        if self.callback_notifier is not None:
+            try:
+                self.callback_notifier.notify_subtitle_ready(updated)
+            except Exception:
+                _append_job_log_safely(
+                    paths.job_dir_mac,
+                    "mac-translation.log",
+                    f"callback_failed {job.id}",
+                )
         _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,

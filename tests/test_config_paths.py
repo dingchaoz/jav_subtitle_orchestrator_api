@@ -41,6 +41,8 @@ MAC_ENV_ALIASES = (
     "CATALOG_SYNC_RETRY_SECONDS",
     "CATALOG_SYNC_MAX_RETRY_SECONDS",
     "MAX_CATALOG_SYNC_ATTEMPTS",
+    "CALLBACK_CLIENTS_JSON",
+    "CALLBACK_TIMEOUT_SECONDS",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -248,6 +250,26 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.catalog_sync_retry_seconds == 30
     assert settings.catalog_sync_max_retry_seconds == 900
     assert settings.max_catalog_sync_attempts == 10
+    assert settings.callback_clients == {}
+    assert settings.callback_timeout_seconds == 10
+
+
+def test_mac_callback_settings_parse_json_without_exposing_secrets(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv(
+        "CALLBACK_CLIENTS_JSON",
+        '{"machine-a.access":{"url":"https://client.example/ready",'
+        '"secret":"hmac-secret"}}',
+    )
+    monkeypatch.setenv("CALLBACK_TIMEOUT_SECONDS", "7")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.callback_clients["machine-a.access"].url == (
+        "https://client.example/ready"
+    )
+    assert settings.callback_clients["machine-a.access"].secret == "hmac-secret"
+    assert settings.callback_timeout_seconds == 7
 
 
 def test_mac_catalog_sync_settings_load_overrides(monkeypatch):

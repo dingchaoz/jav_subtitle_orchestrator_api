@@ -265,6 +265,7 @@ def run_api() -> None:
         worker_lease_seconds=settings.worker_lease_seconds,
         max_worker_attempts=settings.max_worker_attempts,
         subtitle_audit_service=build_subtitle_audit_api_service(settings),
+        callback_clients=build_callback_clients(settings),
     )
     uvicorn.run(app, host=settings.host, port=settings.port)
 
@@ -276,6 +277,25 @@ def _release_worker_lock(lock, *, preserve_worker_error: bool) -> None:
         if not preserve_worker_error:
             raise
         LOGGER.exception("worker lock cleanup failed while preserving worker error")
+
+
+def build_callback_clients(settings):
+    from orchestrator.callbacks import CallbackClient
+
+    return {
+        key: CallbackClient(url=value.url, secret=value.secret)
+        for key, value in getattr(settings, "callback_clients", {}).items()
+    }
+
+
+def build_callback_notifier(store, settings):
+    from orchestrator.callbacks import CallbackNotifier
+
+    return CallbackNotifier(
+        store,
+        build_callback_clients(settings),
+        timeout_seconds=getattr(settings, "callback_timeout_seconds", 10),
+    )
 
 
 def run_mac_worker() -> None:
@@ -434,6 +454,7 @@ def run_mac_translation_worker() -> None:
             catalog_sync_max_retry_seconds=(
                 settings.catalog_sync_max_retry_seconds
             ),
+            callback_notifier=build_callback_notifier(store, settings),
         )
         run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
     except BaseException:
@@ -472,6 +493,7 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
         catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
         catalog_sync_max_retry_seconds=settings.catalog_sync_max_retry_seconds,
+        callback_notifier=build_callback_notifier(store, settings),
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)

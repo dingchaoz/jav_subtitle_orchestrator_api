@@ -740,6 +740,22 @@ class WorkerStatusRecord:
 
 
 @dataclass(frozen=True)
+class CallbackEventRecord:
+    id: str
+    job_id: str
+    event_type: str
+    target_url: str
+    status: Literal["pending", "delivered", "failed"]
+    attempt_count: int
+    created_at: str
+    updated_at: str
+    delivered_at: str | None
+    payload_json: str
+    last_error: str | None
+    client_key: str | None
+
+
+@dataclass(frozen=True)
 class SubmitResult:
     kind: Literal["created", "existing", "invalid", "conflict"]
     movie_number: str
@@ -876,6 +892,62 @@ class JobStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS callback_events (
+                  id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL REFERENCES jobs(id),
+                  event_type TEXT NOT NULL,
+                  target_url TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  attempt_count INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  delivered_at TEXT,
+                  payload_json TEXT NOT NULL,
+                  last_error TEXT,
+                  client_key TEXT
+                )
+                """
+            )
+            callback_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(callback_events)"
+                ).fetchall()
+            }
+            if "client_key" not in callback_columns:
+                conn.execute(
+                    "ALTER TABLE callback_events ADD COLUMN client_key TEXT"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_callback_events_job_updated "
+                "ON callback_events(job_id, updated_at)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_callback_events_job_type_client "
+                "ON callback_events(job_id, event_type, client_key) "
+                "WHERE client_key IS NOT NULL"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_requests (
+                  id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL REFERENCES jobs(id),
+                  client_key TEXT,
+                  requested_priority INTEGER NOT NULL,
+                  effective_priority_before INTEGER,
+                  effective_priority_after INTEGER NOT NULL,
+                  action TEXT NOT NULL,
+                  requested_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_job_requests_job_requested "
+                "ON job_requests(job_id, requested_at, id)"
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS worker_statuses (
                   worker_id TEXT PRIMARY KEY,
                   role TEXT NOT NULL,
@@ -935,7 +1007,13 @@ class JobStore:
                 (utc_now_iso(),),
             )
 
-    def submit_job(self, movie_number: str, priority: int, force: bool) -> SubmitResult:
+    def submit_job(
+        self,
+        movie_number: str,
+        priority: int,
+        force: bool,
+        callback_client_key: str | None = None,
+    ) -> SubmitResult:
         normalized = normalize_movie_number(movie_number)
         if normalized is None:
             return SubmitResult(kind="invalid", movie_number=movie_number)
@@ -944,9 +1022,24 @@ class JobStore:
             conn.execute("BEGIN IMMEDIATE")
             existing = self._get_by_normalized(conn, normalized)
             if existing and not force:
+                self._record_job_request(
+                    conn,
+                    job_id=existing.id,
+                    client_key=callback_client_key,
+                    requested_priority=priority,
+                    effective_priority_before=existing.priority,
+                    effective_priority_after=existing.priority,
+                    action="existing",
+                )
                 return SubmitResult(kind="existing", movie_number=movie_number, job=existing)
             if existing and force:
-                return self._force_reset(conn, existing, movie_number)
+                return self._force_reset(
+                    conn,
+                    existing,
+                    movie_number,
+                    callback_client_key=callback_client_key,
+                    requested_priority=priority,
+                )
 
             now = utc_now_iso()
             paths = build_job_paths(normalized, self.jobs_root_mac, self.jobs_root_windows)
@@ -962,12 +1055,13 @@ class JobStore:
                   created_at, updated_at, error, job_dir_mac, job_dir_windows,
                   metadata_path_mac, audio_path_mac, audio_path_windows,
                   japanese_srt_path_mac, japanese_srt_path_windows,
-                  english_srt_path_mac, english_srt_path_windows
+                  english_srt_path_mac, english_srt_path_windows,
+                  callback_client_key
                 )
                 VALUES (
                   ?, ?, ?, ?, ?, 0, 0, 0, 0, NULL, NULL, NULL, NULL,
                   NULL, NULL, ?, ?, NULL, ?, ?,
-                  NULL, NULL, NULL, NULL, NULL, NULL, NULL
+                  NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?
                 )
                 """,
                 (
@@ -980,9 +1074,19 @@ class JobStore:
                     now,
                     str(paths.job_dir_mac),
                     paths.job_dir_windows,
+                    callback_client_key,
                 ),
             )
             job = self.get_job(job_id, conn=conn)
+            self._record_job_request(
+                conn,
+                job_id=job_id,
+                client_key=callback_client_key,
+                requested_priority=priority,
+                effective_priority_before=None,
+                effective_priority_after=priority,
+                action="created",
+            )
             return SubmitResult(kind="created", movie_number=movie_number, job=job)
 
     def submit_batch(
@@ -990,12 +1094,18 @@ class JobStore:
         movie_numbers: list[str],
         priority: int,
         force: bool,
+        callback_client_key: str | None = None,
     ) -> BatchSubmitResult:
         created: list[SubmitResult] = []
         existing: list[SubmitResult] = []
         invalid: list[SubmitResult] = []
         for movie_number in movie_numbers:
-            result = self.submit_job(movie_number, priority=priority, force=force)
+            result = self.submit_job(
+                movie_number,
+                priority=priority,
+                force=force,
+                callback_client_key=callback_client_key,
+            )
             if result.kind == "created":
                 created.append(result)
             elif result.kind in {"existing", "conflict"}:
@@ -5065,6 +5175,178 @@ class JobStore:
                 (lease_expires_at, job_id),
             )
 
+    def _record_job_request(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        client_key: str | None,
+        requested_priority: int,
+        effective_priority_before: int | None,
+        effective_priority_after: int,
+        action: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO job_requests (
+              id, job_id, client_key, requested_priority,
+              effective_priority_before, effective_priority_after,
+              action, requested_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                job_id,
+                client_key,
+                requested_priority,
+                effective_priority_before,
+                effective_priority_after,
+                action,
+                utc_now_iso(),
+            ),
+        )
+
+    def list_callback_client_keys(self, job_id: str) -> list[str]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT client_key FROM job_requests
+                WHERE job_id = ? AND client_key IS NOT NULL
+                UNION
+                SELECT callback_client_key AS client_key FROM jobs
+                WHERE id = ? AND callback_client_key IS NOT NULL
+                ORDER BY client_key
+                """,
+                (job_id, job_id),
+            ).fetchall()
+            return [row["client_key"] for row in rows]
+
+    def create_callback_event(
+        self,
+        *,
+        job_id: str,
+        event_type: str,
+        target_url: str,
+        payload_json: str,
+        client_key: str,
+    ) -> CallbackEventRecord:
+        now = utc_now_iso()
+        event_id = uuid4().hex
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO callback_events (
+                  id, job_id, event_type, target_url, status,
+                  attempt_count, created_at, updated_at, delivered_at,
+                  payload_json, last_error, client_key
+                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, NULL, ?, NULL, ?)
+                """,
+                (
+                    event_id,
+                    job_id,
+                    event_type,
+                    target_url,
+                    now,
+                    now,
+                    payload_json,
+                    client_key,
+                ),
+            )
+            event = self.get_callback_event_for_client(
+                job_id,
+                event_type,
+                client_key,
+                conn=conn,
+            )
+            assert event is not None
+            return event
+
+    def get_callback_event_for_client(
+        self,
+        job_id: str,
+        event_type: str,
+        client_key: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> CallbackEventRecord | None:
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM callback_events WHERE job_id = ? "
+                "AND event_type = ? AND client_key = ? LIMIT 1",
+                (job_id, event_type, client_key),
+            ).fetchone()
+            return self._row_to_callback_event(row) if row else None
+        with self.connection() as active_conn:
+            return self.get_callback_event_for_client(
+                job_id,
+                event_type,
+                client_key,
+                conn=active_conn,
+            )
+
+    def get_callback_event(
+        self,
+        event_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> CallbackEventRecord | None:
+        if conn is not None:
+            row = conn.execute(
+                "SELECT * FROM callback_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            return self._row_to_callback_event(row) if row else None
+        with self.connection() as active_conn:
+            return self.get_callback_event(event_id, conn=active_conn)
+
+    def get_latest_callback_event(self, job_id: str) -> CallbackEventRecord | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM callback_events WHERE job_id = ? "
+                "ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            return self._row_to_callback_event(row) if row else None
+
+    def record_callback_delivery(
+        self,
+        event_id: str,
+        *,
+        status: Literal["delivered", "failed"],
+        last_error: str | None = None,
+    ) -> CallbackEventRecord:
+        now = utc_now_iso()
+        safe_error = None
+        if status == "failed":
+            safe_error = (
+                last_error
+                if isinstance(last_error, str)
+                and 0 < len(last_error) <= 96
+                and last_error.replace("_", "").isalnum()
+                else "callback_delivery_failed"
+            )
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE callback_events
+                SET status = ?, attempt_count = attempt_count + 1,
+                    updated_at = ?, delivered_at = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    now,
+                    now if status == "delivered" else None,
+                    safe_error,
+                    event_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(event_id)
+            event = self.get_callback_event(event_id, conn=conn)
+            assert event is not None
+            return event
+
     def _get_by_normalized(self, conn: sqlite3.Connection, normalized: str) -> JobRecord | None:
         row = conn.execute(
             "SELECT * FROM jobs WHERE normalized_movie_number = ?",
@@ -5093,8 +5375,11 @@ class JobStore:
         conn: sqlite3.Connection,
         existing: JobRecord,
         movie_number: str,
+        *,
+        callback_client_key: str | None,
+        requested_priority: int,
     ) -> SubmitResult:
-        if existing.status in {
+        if existing.claimed_by is not None or existing.status in {
             JobStatus.TRANSCRIPTION_CLAIMED,
             JobStatus.TRANSCRIBING,
             JobStatus.TRANSCRIPTION_DONE,
@@ -5125,17 +5410,26 @@ class JobStore:
                 next_catalog_sync_attempt_at = NULL, catalog_lease_token = NULL,
                 catalog_movie_uuid = NULL, metadata_status = NULL,
                 metadata_source = NULL,
+                artifact_status = NULL, catalog_sync_status = NULL,
+                catalog_sync_warning_code = NULL,
+                catalog_sync_warning_message = NULL,
+                catalog_sync_last_http_status = NULL,
+                catalog_sync_last_response_json = NULL,
+                catalog_sync_last_attempt_at = NULL,
+                callback_client_key = COALESCE(callback_client_key, ?),
                 metadata_path_mac = NULL, audio_path_mac = NULL,
                 audio_path_windows = NULL, japanese_srt_path_mac = NULL,
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
+              AND claimed_by IS NULL
               AND status NOT IN (?, ?, ?, ?, ?, ?)
             """,
             (
                 JobStatus.QUEUED.value,
                 now,
                 NORMAL_TRANSLATION_ORIGIN,
+                callback_client_key,
                 existing.id,
                 *active_statuses,
             ),
@@ -5144,6 +5438,20 @@ class JobStore:
             job = self.get_job(existing.id, conn=conn)
             return SubmitResult(kind="conflict", movie_number=movie_number, job=job)
         job = self.get_job(existing.id, conn=conn)
+        assert job is not None
+        conn.execute(
+            "DELETE FROM callback_events WHERE job_id = ?",
+            (job.id,),
+        )
+        self._record_job_request(
+            conn,
+            job_id=job.id,
+            client_key=callback_client_key,
+            requested_priority=requested_priority,
+            effective_priority_before=existing.priority,
+            effective_priority_after=job.priority,
+            action="forced",
+        )
         return SubmitResult(kind="created", movie_number=movie_number, job=job)
 
     def _row_to_job(self, row: sqlite3.Row) -> JobRecord:
@@ -5192,6 +5500,23 @@ class JobStore:
             japanese_srt_path_windows=row["japanese_srt_path_windows"],
             english_srt_path_mac=row["english_srt_path_mac"],
             english_srt_path_windows=row["english_srt_path_windows"],
+        )
+
+    @staticmethod
+    def _row_to_callback_event(row: sqlite3.Row) -> CallbackEventRecord:
+        return CallbackEventRecord(
+            id=row["id"],
+            job_id=row["job_id"],
+            event_type=row["event_type"],
+            target_url=row["target_url"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            delivered_at=row["delivered_at"],
+            payload_json=row["payload_json"],
+            last_error=row["last_error"],
+            client_key=row["client_key"],
         )
 
     @staticmethod

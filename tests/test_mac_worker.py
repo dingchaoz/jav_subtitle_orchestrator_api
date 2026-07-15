@@ -349,6 +349,16 @@ class RecordingCatalogSync:
         )
 
 
+class RecordingCallbackNotifier:
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+
+    def notify_subtitle_ready(self, job):
+        self.events.append(("webhook", job.normalized_movie_number))
+        self.calls.append(job)
+
+
 class ReclaimingCatalogSync:
     public_visibility_verification_enabled = True
 
@@ -2099,6 +2109,92 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
     assert "publish_verified" in log.read_text(encoding="utf-8")
     assert "Distinct English" not in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("catalog_failure", [False, True])
+def test_ready_webhook_fires_after_publish_before_catalog_and_never_downgrades(
+    sqlite_path,
+    mac_jobs_root,
+    catalog_failure,
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-201")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=(
+                [CatalogSyncError("catalog_sync_failed")]
+                if catalog_failure
+                else None
+            ),
+        ),
+        callback_notifier=notifier,
+        max_catalog_sync_attempts=1,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    published = store.get_job(job.id)
+    assert published.status is JobStatus.ENGLISH_SRT_READY
+    assert len(notifier.calls) == 1
+    assert worker.process_one() is True
+
+    assert [event[0] for event in events] == [
+        "translate",
+        "publish",
+        "webhook",
+        "catalog",
+    ]
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.error is None
+    assert len(notifier.calls) == 1
+    assert current.catalog_sync_status == (
+        "failed" if catalog_failure else "succeeded"
+    )
+
+
+def test_ready_webhook_is_not_sent_when_supabase_publication_fails(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-202")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            events,
+            errors=[RuntimeError("supabase unavailable")],
+        ),
+        catalog_sync_client=RecordingCatalogSync(events),
+        callback_notifier=notifier,
+        max_publish_attempts=1,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert [event[0] for event in events] == ["translate", "publish"]
+    assert notifier.calls == []
+    assert store.get_job(job.id).status is JobStatus.FAILED
 
 
 def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
