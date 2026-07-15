@@ -277,13 +277,18 @@ def build_supabase_publisher(settings):
     )
 
 
-def build_catalog_sync_client(settings):
-    if not settings.mac_translation_publish_enabled:
+def build_catalog_sync_client(
+    settings,
+    *,
+    require_publish_enabled: bool = True,
+):
+    if not isinstance(require_publish_enabled, bool):
+        raise TypeError("require_publish_enabled must be a boolean")
+    if require_publish_enabled and not settings.mac_translation_publish_enabled:
         return None
     if not settings.javsubtitle_api_base or not settings.javsubtitle_admin_api_token:
         raise RuntimeError(
-            "Supabase publication and catalog sync is enabled but website API base "
-            "or admin token is missing"
+            "Catalog sync credentials are required when catalog sync is enabled"
         )
     from orchestrator.catalog_sync import CatalogSyncClient
 
@@ -1028,7 +1033,10 @@ def run_catalog_visibility_repair(
     if not settings.javsubtitle_admin_api_token:
         raise SystemExit("catalog visibility repair authorization failed")
     try:
-        sync_client = build_catalog_sync_client(settings)
+        sync_client = build_catalog_sync_client(
+            settings,
+            require_publish_enabled=False,
+        )
     except Exception:
         raise SystemExit("catalog visibility repair authorization failed") from None
     if sync_client is None:

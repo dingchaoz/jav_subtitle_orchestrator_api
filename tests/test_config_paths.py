@@ -298,9 +298,40 @@ def test_supabase_publisher_factory_requires_credentials_when_enabled():
 
 
 def test_catalog_sync_factory_is_disabled_with_local_publication():
-    settings = SimpleNamespace(mac_translation_publish_enabled=False)
+    settings = SimpleNamespace(
+        mac_translation_publish_enabled=False,
+        javsubtitle_api_base="https://javsubtitle.example",
+        javsubtitle_admin_api_token="admin-token",
+    )
 
     assert build_catalog_sync_client(settings) is None
+
+
+def test_catalog_sync_factory_can_be_explicitly_enabled_for_repair_only():
+    settings = SimpleNamespace(
+        mac_translation_publish_enabled=False,
+        javsubtitle_api_base="https://javsubtitle.example",
+        javsubtitle_admin_api_token="admin-token",
+    )
+
+    client = build_catalog_sync_client(
+        settings,
+        require_publish_enabled=False,
+    )
+
+    assert client.base_url == "https://javsubtitle.example"
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "false", object()])
+def test_catalog_sync_factory_requires_literal_publish_gate_boolean(value):
+    settings = SimpleNamespace(
+        mac_translation_publish_enabled=False,
+        javsubtitle_api_base="https://javsubtitle.example",
+        javsubtitle_admin_api_token="admin-token",
+    )
+
+    with pytest.raises(TypeError, match="require_publish_enabled must be a boolean"):
+        build_catalog_sync_client(settings, require_publish_enabled=value)
 
 
 @pytest.mark.parametrize("missing", ["javsubtitle_api_base", "javsubtitle_admin_api_token"])

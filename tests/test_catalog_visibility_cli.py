@@ -426,9 +426,13 @@ def test_repair_execute_uses_exact_builder_and_canonical_output(
         sync=lambda *_args, **_kwargs: None,
     )
 
-    def build(settings: object) -> object:
+    def build(
+        settings: object,
+        *,
+        require_publish_enabled: bool,
+    ) -> object:
         assert isinstance(settings, Settings)
-        events.append(("build_client", settings))
+        events.append(("build_client", settings, require_publish_enabled))
         return client
 
     monkeypatch.setattr(cli, "build_catalog_sync_client", build)
@@ -447,6 +451,7 @@ def test_repair_execute_uses_exact_builder_and_canonical_output(
         "build_client",
         "execute",
     ]
+    assert events[2][2] is False
     execute_event = events[-1]
     assert execute_event[1][1].plan_path.parent == (tmp_path / "repair").absolute()
     assert execute_event[2] == {
@@ -553,10 +558,19 @@ def test_repair_execute_returns_nonzero_for_failures_or_stop(
     import orchestrator.__main__ as cli
 
     _install_repair_fakes(monkeypatch, tmp_path, result=result)
+
+    def build_client(
+        _settings: object,
+        *,
+        require_publish_enabled: bool,
+    ) -> object:
+        assert require_publish_enabled is False
+        return SimpleNamespace()
+
     monkeypatch.setattr(
         cli,
         "build_catalog_sync_client",
-        lambda _settings: SimpleNamespace(),
+        build_client,
     )
 
     exit_code = cli.run_catalog_visibility_repair(

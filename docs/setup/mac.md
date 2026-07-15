@@ -192,6 +192,24 @@ Review `repair-plan.json`, the eligible and skipped counts, the printed
 receipt, skip completed items, and revalidate each current database receipt before
 any sync. A changed receipt is skipped rather than repaired.
 
+The GET-only audit and dry-run planning command require the configured
+`JAVSUBTITLE_API_BASE`; neither needs a production mutation window. Execution also
+requires `JAVSUBTITLE_ADMIN_API_TOKEN`. The dedicated repair CLI intentionally does
+not require `MAC_TRANSLATION_PUBLISH_ENABLED=true`: that worker-wide flag continues
+to control automatic publication and catalog sync by the translation worker. Keep
+the admin token only in the server-side environment file. Never put it in command
+arguments, terminal output, logs, screenshots, reports, or approval messages.
+
+Before an approved `--execute`, quiesce every service and process that can write the
+jobs SQLite database, including API and worker processes, and verify that they are
+stopped. Repair execution holds `BEGIN IMMEDIATE` across the remote catalog sync
+and exact public visibility GET, including their network timeouts. Other writers
+have short busy timeouts and may otherwise block or fail. Keep repair execution at
+its built-in concurrency of one and run only the approved bounded canary or batch.
+Restart database-writing services only after the execution receipt and subsequent
+GET-only re-audit have been reviewed. Audit and dry-run planning do not require
+this quiesced mutation window.
+
 > **Production mutation gate:** do not run the following form until an explicit
 > production approval names this exact report digest and allowlisted batch. Replace
 > the placeholder only with the lowercase digest printed by the reviewed dry run;
