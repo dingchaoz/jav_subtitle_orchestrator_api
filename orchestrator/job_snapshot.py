@@ -9,6 +9,8 @@ def write_job_snapshot(job: JobRecord) -> Path:
     job_dir = Path(job.job_dir_mac)
     job_dir.mkdir(parents=True, exist_ok=True)
     snapshot = asdict(job)
+    snapshot.pop("stage_lease_token", None)
+    snapshot.pop("catalog_lease_token", None)
     snapshot["status"] = job.status.value
     path = job_dir / "job.json"
     path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from orchestrator.api import create_app
@@ -15,7 +17,7 @@ def test_post_job_creates_job(sqlite_path, mac_jobs_root):
     body = response.json()
     assert body["movie_number"] == "ktb-096"
     assert body["status"] == "queued"
-    assert body["job_dir_mac"].endswith("/ktb-096")
+    assert Path(body["job_dir_mac"]).name == "ktb-096"
     assert body["job_dir_windows"] == "M:\\ktb-096"
 
 

@@ -6,14 +6,13 @@ Use this runbook after all unit and integration tests pass. It verifies one movi
 
 - Mac API is bound to `0.0.0.0:8010`.
 - Windows `.env.windows` sets `MAC_API_BASE_URL` to the Mac LAN address, for example `http://192.168.1.205:8010`.
-- Mac downloader worker is running.
-- Windows worker is running.
+- Mac downloader and Mac translation workers are running.
+- Windows transcription worker is running.
 - Windows can read and write `M:\`.
 - `M:\` points to `/Users/ytt/MissAVJobs`.
 - `.env` exists on Mac.
 - `.env.windows` exists on Windows.
-- `OPENAI_API_KEY` is set on Windows.
-- `TRANSLATE_SCRIPT_PATH` points to the existing `subtitle_translate.py` script.
+- The Mac translation smoke test passes before `mac-translation-worker` starts.
 
 ## Submit One Movie
 
@@ -80,16 +79,17 @@ metadata.json
 audio.wav
 ```
 
-## Wait For Windows Worker Completion
+## Wait For Windows Transcription Handoff
 
-Wait for the Windows worker to finish transcription and translation.
+Wait for the Windows worker to finish transcription. The API status must become `transcription_done`, and only the Japanese file should be required at this boundary:
 
 Expected final files:
 
 ```text
 M:\ktb-096\ktb-096.Japanese.srt
-M:\ktb-096\ktb-096.English.srt
 ```
+
+Then wait for the Mac translation worker to claim the job, pass the quality gate, and produce `/Users/ytt/MissAVJobs/ktb-096/ktb-096.English.srt` with status `english_srt_ready`.
 
 ## Confirm API Status
 
@@ -121,7 +121,8 @@ If status is `failed`, stuck in an intermediate state, or repeatedly requeued to
 ```text
 /Users/ytt/MissAVJobs/ktb-096/job.json
 /Users/ytt/MissAVJobs/ktb-096/logs/mac-download.log
+/Users/ytt/MissAVJobs/ktb-096/logs/mac-translation.log
+/Users/ytt/MissAVJobs/ktb-096/logs/quality.log
 /Users/ytt/MissAVJobs/ktb-096/logs/windows-worker.log
 /Users/ytt/MissAVJobs/ktb-096/logs/whisper.log
-/Users/ytt/MissAVJobs/ktb-096/logs/translate.log
 ```

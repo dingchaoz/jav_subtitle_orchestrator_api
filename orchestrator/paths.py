@@ -1,19 +1,15 @@
-import re
 import uuid
 from pathlib import Path
 
+from orchestrator.movie_code import canonical_movie_code
 from orchestrator.models import JobPaths
-
-MOVIE_RE = re.compile(r"^([a-zA-Z]+)-?(\d+)$")
 
 
 def normalize_movie_number(raw: str) -> str | None:
-    cleaned = raw.strip()
-    match = MOVIE_RE.match(cleaned)
-    if not match:
+    try:
+        return canonical_movie_code(raw)
+    except ValueError:
         return None
-    prefix, number = match.groups()
-    return f"{prefix.lower()}-{number}"
 
 
 def new_job_id() -> str:

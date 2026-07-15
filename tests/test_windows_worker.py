@@ -1,22 +1,33 @@
 from pathlib import Path
 from threading import Event
 
-from orchestrator.windows_worker import WindowsWorker
+import pytest
+import requests
+
+from orchestrator.windows_worker import WindowsWorker, run_forever
 
 
 class FailedCalls(list):
-    def __call__(self, job_id, stage, error):
+    def __init__(self):
+        super().__init__()
+        self.permanent = []
+
+    def __call__(self, job_id, stage, error, permanent=False):
         self.append((job_id, stage, error))
+        self.permanent.append(permanent)
 
 
 class FakeClient:
     def __init__(self, job):
         self.job = job
+        self.next_job_calls = 0
         self.heartbeats = []
         self.completed = []
+        self.transcriptions_completed = []
         self.failed = FailedCalls()
 
     def next_job(self):
+        self.next_job_calls += 1
         return self.job
 
     def heartbeat(self, job_id, stage):
@@ -24,6 +35,9 @@ class FakeClient:
 
     def complete(self, job_id, japanese_srt_path_windows, english_srt_path_windows):
         self.completed.append((job_id, japanese_srt_path_windows, english_srt_path_windows))
+
+    def transcription_complete(self, job_id, japanese_srt_path_windows):
+        self.transcriptions_completed.append((job_id, japanese_srt_path_windows))
 
 class FakeTranscriber:
     def transcribe_to_srt(self, audio_path: Path, output_path: Path) -> None:
@@ -41,6 +55,28 @@ class FakeTranslator:
             "1\n00:00:00,000 --> 00:00:01,000\nHello\n\n",
             encoding="utf-8",
         )
+
+
+class CollapsedTranslator:
+    def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
+        source = input_srt.read_text(encoding="utf-8")
+        lines = source.splitlines()
+        for index in range(2, len(lines), 4):
+            lines[index] = "I don't know what to do"
+        output_srt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class DiverseStartupTranslator:
+    def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
+        lines = input_srt.read_text(encoding="utf-8").splitlines()
+        for index in range(2, len(lines), 4):
+            lines[index] = f"Distinct safe translation {index}"
+        output_srt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class NeverTranslator:
+    def translate_to_english(self, input_srt: Path, output_srt: Path) -> None:
+        raise AssertionError("Windows must not translate")
 
 
 class BlockingFakeClient(FakeClient):
@@ -114,6 +150,18 @@ class FailingTranscriber:
         raise RuntimeError(self.error)
 
 
+class FlakyApiWorker:
+    def __init__(self):
+        self.client = type("Client", (), {"base_url": "http://192.168.1.247:8000"})()
+        self.calls = 0
+
+    def process_one(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise requests.exceptions.ConnectTimeout("timed out")
+        raise KeyboardInterrupt
+
+
 def make_job(tmp_path):
     job_dir = tmp_path / "ktb-096"
     job_dir.mkdir()
@@ -147,18 +195,54 @@ def test_windows_worker_processes_one_job(tmp_path):
     assert client.heartbeats == [
         ("job_1", "transcribing"),
         ("job_1", "transcription_done"),
-        ("job_1", "translating"),
     ]
-    assert client.completed == [
-        (
-            "job_1",
-            str(job_dir / "ktb-096.Japanese.srt"),
-            str(job_dir / "ktb-096.English.srt"),
-        )
+    assert client.transcriptions_completed == [
+        ("job_1", str(job_dir / "ktb-096.Japanese.srt")),
     ]
+    assert client.completed == []
 
 
-def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
+def test_windows_worker_hands_off_after_transcription_without_translation(tmp_path):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FakeTranscriber(), NeverTranslator())
+
+    assert worker.process_one() is True
+
+    assert client.transcriptions_completed == [
+        ("job_1", job["japanese_srt_path_windows"]),
+    ]
+    assert client.completed == []
+    assert not Path(job["english_srt_path_windows"]).exists()
+
+
+def test_windows_worker_skips_transcription_when_japanese_srt_exists(tmp_path):
+    job = make_job(tmp_path)
+    japanese_srt = Path(job["japanese_srt_path_windows"])
+    japanese_srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nexisting transcript\n\n",
+        encoding="utf-8",
+    )
+    client = FakeClient(job)
+    worker = WindowsWorker(client, FailingTranscriber("should not transcribe"), FakeTranslator())
+
+    processed = worker.process_one()
+
+    assert processed is True
+    assert client.heartbeats == [
+        ("job_1", "transcription_done"),
+    ]
+    assert client.failed == []
+    assert client.transcriptions_completed == [
+        ("job_1", job["japanese_srt_path_windows"]),
+    ]
+    assert client.completed == []
+    assert "skipping existing transcript" in (
+        japanese_srt.parent / "logs" / "whisper.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_windows_worker_writes_worker_and_whisper_logs(tmp_path):
     job = make_job(tmp_path)
     client = FakeClient(job)
     worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
@@ -171,14 +255,12 @@ def test_windows_worker_writes_worker_whisper_and_translate_logs(tmp_path):
 
     assert (job_dir / "logs" / "windows-worker.log").read_text(encoding="utf-8") == (
         "claimed job_1\n"
-        "completed job_1\n"
+        "transcription_completed job_1\n"
     )
     assert (job_dir / "logs" / "whisper.log").read_text(encoding="utf-8") == (
         f"transcribing {audio_path}\n"
     )
-    assert (job_dir / "logs" / "translate.log").read_text(encoding="utf-8") == (
-        f"translating {japanese_srt}\n"
-    )
+    assert not (job_dir / "logs" / "translate.log").exists()
 
 
 def test_windows_worker_completed_log_failure_does_not_fail_completed_job(
@@ -190,19 +272,16 @@ def test_windows_worker_completed_log_failure_does_not_fail_completed_job(
     worker = WindowsWorker(client, FakeTranscriber(), FakeTranslator())
 
     def fail_on_completed(job_dir, filename, message):
-        if message == "completed job_1":
+        if message == "transcription_completed job_1":
             raise OSError("log disk full")
 
     monkeypatch.setattr("orchestrator.windows_worker.append_job_log", fail_on_completed)
 
     assert worker.process_one() is True
-    assert client.completed == [
-        (
-            "job_1",
-            job["japanese_srt_path_windows"],
-            job["english_srt_path_windows"],
-        )
+    assert client.transcriptions_completed == [
+        ("job_1", job["japanese_srt_path_windows"]),
     ]
+    assert client.completed == []
     assert client.failed == []
 
 
@@ -264,21 +343,17 @@ def test_windows_worker_heartbeats_during_long_transcription(tmp_path):
     assert client.heartbeats.count(("job_1", "transcribing")) >= 2
 
 
-def test_windows_worker_heartbeats_during_long_translation(tmp_path):
+def test_windows_worker_never_enters_translation_stage(tmp_path):
     job = make_job(tmp_path)
     client = BlockingFakeClient(job, "translating")
-    worker = WindowsWorker(
-        client,
-        FakeTranscriber(),
-        BlockingTranslator(client),
-        heartbeat_interval_seconds=0.001,
-    )
+    worker = WindowsWorker(client, FakeTranscriber(), NeverTranslator())
 
     processed = worker.process_one()
 
     assert processed is True
-    assert client.periodic_heartbeat_seen.is_set()
-    assert client.heartbeats.count(("job_1", "translating")) >= 2
+    assert not client.periodic_heartbeat_seen.is_set()
+    assert ("job_1", "translating") not in client.heartbeats
+    assert client.completed == []
 
 
 def test_windows_worker_continues_after_transient_periodic_heartbeat_failure(tmp_path):
@@ -296,11 +371,20 @@ def test_windows_worker_continues_after_transient_periodic_heartbeat_failure(tmp
     assert processed is True
     assert client.first_periodic_failure_seen.is_set()
     assert client.later_periodic_success_seen.is_set()
-    assert client.completed == [
-        (
-            "job_1",
-            job["japanese_srt_path_windows"],
-            job["english_srt_path_windows"],
-        )
+    assert client.transcriptions_completed == [
+        ("job_1", job["japanese_srt_path_windows"]),
     ]
+    assert client.completed == []
     assert client.failed == []
+
+
+def test_run_forever_retries_after_mac_api_timeout(caplog):
+    worker = FlakyApiWorker()
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(KeyboardInterrupt):
+            run_forever(worker, poll_interval_seconds=0)
+
+    assert worker.calls == 2
+    assert "could not reach Mac API" in caplog.text
+    assert "192.168.1.247:8000" in caplog.text
