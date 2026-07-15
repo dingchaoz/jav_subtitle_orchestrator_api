@@ -674,6 +674,37 @@ def dashboard_html() -> str:
       font-size: 14px;
     }
 
+    .dashboard-tabs {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .dashboard-tab {
+      width: auto;
+      min-height: 36px;
+      border-color: var(--border);
+      background: #ffffff;
+      color: var(--text);
+    }
+
+    .dashboard-tab.active {
+      border-color: var(--accent-dark);
+      background: var(--accent);
+      color: #ffffff;
+    }
+
+    .dashboard-view {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .dashboard-view[hidden] {
+      display: none;
+    }
+
     main {
       display: grid;
       grid-template-columns: minmax(0, 1fr);
@@ -1097,86 +1128,49 @@ def dashboard_html() -> str:
     </nav>
   </header>
   <main>
-    <section class="health-grid" aria-label="Health">
-      <article class="health-card">
-        <div class="health-title">API</div>
-        <div class="health-value" id="api-status">Loading</div>
-        <div class="health-meta" id="api-meta">Fetching state</div>
-      </article>
-      <article class="health-card">
-        <div class="health-title">Mac Downloader</div>
-        <div class="health-value" id="mac-download-status">Loading</div>
-        <div class="health-meta" id="mac-download-meta">Fetching state</div>
-      </article>
-      <article class="health-card">
-        <div class="health-title">Windows Transcription</div>
-        <div class="health-value" id="windows-status">Loading</div>
-        <div class="health-meta" id="windows-meta">Fetching state</div>
-      </article>
-      <article class="health-card">
-        <div class="health-title">Mac Translation</div>
-        <div class="health-value" id="translation-status">Loading</div>
-        <div class="health-meta" id="translation-meta">Fetching state</div>
-      </article>
-      <article class="health-card">
-        <div class="health-title">History repair</div>
-        <div class="health-value" id="history-repair-status">Loading</div>
-        <div class="health-meta" id="history-repair-meta">Fetching state</div>
-        <div class="health-meta" id="history-repair-counts">No counts yet</div>
-        <div class="health-meta" id="history-repair-current">No current repair</div>
-        <div class="health-meta" id="history-repair-pause">Pause state unknown</div>
-      </article>
-      <article class="health-card">
-        <div class="health-title">Active errors</div>
-        <div class="health-value" id="errors-status">Loading</div>
-        <div class="health-meta" id="errors-meta">Fetching state</div>
-      </article>
+    <section class="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
+      <button type="button" class="dashboard-tab active" id="dashboard-tab-operations" data-dashboard-tab="operations" role="tab" aria-selected="true" aria-controls="dashboard-view-operations">Operations</button>
+      <button type="button" class="dashboard-tab" id="dashboard-tab-subtitle-quality" data-dashboard-tab="subtitle-quality" role="tab" aria-selected="false" aria-controls="dashboard-view-subtitle-quality">Subtitle Quality</button>
     </section>
 
-    <section class="panel" aria-labelledby="subtitle-quality-title">
-      <div class="panel-header">
-        <h2 id="subtitle-quality-title">Subtitle Quality</h2>
-        <div class="health-meta" id="subtitle-quality-latest">Loading latest scan</div>
-      </div>
-      <div class="subtitle-quality-grid">
-        <article class="subtitle-quality-card"><span>Bad</span><strong id="subtitle-quality-bad">—</strong></article>
-        <article class="subtitle-quality-card"><span>Invalid</span><strong id="subtitle-quality-invalid">—</strong></article>
-        <article class="subtitle-quality-card"><span>Missing</span><strong id="subtitle-quality-missing">—</strong></article>
-        <article class="subtitle-quality-card"><span>Review</span><strong id="subtitle-quality-review">—</strong></article>
-        <article class="subtitle-quality-card"><span>Audited / catalog</span><strong id="subtitle-quality-progress">—</strong></article>
-        <article class="subtitle-quality-card"><span>Top reasons</span><strong id="subtitle-quality-reasons">—</strong></article>
-      </div>
-      <div class="subtitle-quality-toolbar">
-        <label>Status
-          <select id="subtitle-quality-status-filter">
-            <option value="">All statuses</option>
-            <option value="bad">Bad</option>
-            <option value="invalid">Invalid</option>
-            <option value="missing">Missing</option>
-            <option value="review">Review</option>
-            <option value="warning">Warning</option>
-            <option value="pass">Pass</option>
-          </select>
-        </label>
-        <label>Language
-          <input id="subtitle-quality-language-filter" maxlength="128" autocomplete="off" placeholder="For example English_AI">
-        </label>
-      </div>
-      <div id="subtitle-quality-findings" aria-live="polite"></div>
-      <div class="browser-footer">
-        <div id="subtitle-quality-page">Page 1 of 1</div>
-        <div class="pager">
-          <button type="button" id="subtitle-quality-prev">Prev</button>
-          <button type="button" id="subtitle-quality-next">Next</button>
-        </div>
-      </div>
-      <p class="health-meta">
-        Historical repair planning is dry-run only. Run on the Mac:
-        <code>python -m orchestrator plan-historical-subtitle-repair --allowlist abc-001 --limit 1</code>
-      </p>
-    </section>
+    <section class="dashboard-view" id="dashboard-view-operations" role="tabpanel" aria-labelledby="dashboard-tab-operations">
+      <section class="health-grid" aria-label="Health">
+        <article class="health-card">
+          <div class="health-title">API</div>
+          <div class="health-value" id="api-status">Loading</div>
+          <div class="health-meta" id="api-meta">Fetching state</div>
+        </article>
+        <article class="health-card">
+          <div class="health-title">Mac Downloader</div>
+          <div class="health-value" id="mac-download-status">Loading</div>
+          <div class="health-meta" id="mac-download-meta">Fetching state</div>
+        </article>
+        <article class="health-card">
+          <div class="health-title">Windows Transcription</div>
+          <div class="health-value" id="windows-status">Loading</div>
+          <div class="health-meta" id="windows-meta">Fetching state</div>
+        </article>
+        <article class="health-card">
+          <div class="health-title">Mac Translation</div>
+          <div class="health-value" id="translation-status">Loading</div>
+          <div class="health-meta" id="translation-meta">Fetching state</div>
+        </article>
+        <article class="health-card">
+          <div class="health-title">History repair</div>
+          <div class="health-value" id="history-repair-status">Loading</div>
+          <div class="health-meta" id="history-repair-meta">Fetching state</div>
+          <div class="health-meta" id="history-repair-counts">No counts yet</div>
+          <div class="health-meta" id="history-repair-current">No current repair</div>
+          <div class="health-meta" id="history-repair-pause">Pause state unknown</div>
+        </article>
+        <article class="health-card">
+          <div class="health-title">Active errors</div>
+          <div class="health-value" id="errors-status">Loading</div>
+          <div class="health-meta" id="errors-meta">Fetching state</div>
+        </article>
+      </section>
 
-    <section class="content-grid">
+      <section class="content-grid">
       <div class="side-stack">
         <section class="panel" aria-labelledby="single-submit-title">
           <div class="panel-header">
@@ -1282,6 +1276,52 @@ def dashboard_html() -> str:
         </section>
       </div>
     </section>
+    </section>
+
+    <section class="dashboard-view" id="dashboard-view-subtitle-quality" role="tabpanel" aria-labelledby="dashboard-tab-subtitle-quality" hidden>
+      <section class="panel" aria-labelledby="subtitle-quality-title">
+        <div class="panel-header">
+          <h2 id="subtitle-quality-title">Subtitle Quality</h2>
+          <div class="health-meta" id="subtitle-quality-latest">Loading latest scan</div>
+        </div>
+        <div class="subtitle-quality-grid">
+          <article class="subtitle-quality-card"><span>Bad</span><strong id="subtitle-quality-bad">—</strong></article>
+          <article class="subtitle-quality-card"><span>Invalid</span><strong id="subtitle-quality-invalid">—</strong></article>
+          <article class="subtitle-quality-card"><span>Missing</span><strong id="subtitle-quality-missing">—</strong></article>
+          <article class="subtitle-quality-card"><span>Review</span><strong id="subtitle-quality-review">—</strong></article>
+          <article class="subtitle-quality-card"><span>Audited / catalog</span><strong id="subtitle-quality-progress">—</strong></article>
+          <article class="subtitle-quality-card"><span>Top reasons</span><strong id="subtitle-quality-reasons">—</strong></article>
+        </div>
+        <div class="subtitle-quality-toolbar">
+          <label>Status
+            <select id="subtitle-quality-status-filter">
+              <option value="">All statuses</option>
+              <option value="bad">Bad</option>
+              <option value="invalid">Invalid</option>
+              <option value="missing">Missing</option>
+              <option value="review">Review</option>
+              <option value="warning">Warning</option>
+              <option value="pass">Pass</option>
+            </select>
+          </label>
+          <label>Language
+            <input id="subtitle-quality-language-filter" maxlength="128" autocomplete="off" placeholder="For example English_AI">
+          </label>
+        </div>
+        <div id="subtitle-quality-findings" aria-live="polite"></div>
+        <div class="browser-footer">
+          <div id="subtitle-quality-page">Page 1 of 1</div>
+          <div class="pager">
+            <button type="button" id="subtitle-quality-prev">Prev</button>
+            <button type="button" id="subtitle-quality-next">Next</button>
+          </div>
+        </div>
+        <p class="health-meta">
+          Historical repair planning is dry-run only. Run on the Mac:
+          <code>python -m orchestrator plan-historical-subtitle-repair --allowlist abc-001 --limit 1</code>
+        </p>
+      </section>
+    </section>
   </main>
 
   <script>
@@ -1295,6 +1335,24 @@ def dashboard_html() -> str:
     let subtitleQualityState = {page: 1, pages: 1, accessiblePages: 1, pageSize: 50};
     let subtitleAuditRequestGeneration = 0;
     let subtitleAuditAbortController = null;
+
+    function selectDashboardTab(tab) {
+      const selected = tab === "subtitle-quality" ? "subtitle-quality" : "operations";
+      for (const button of document.querySelectorAll(".dashboard-tab")) {
+        const active = button.dataset.dashboardTab === selected;
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-selected", active ? "true" : "false");
+      }
+      for (const view of document.querySelectorAll(".dashboard-view")) {
+        view.hidden = view.id !== `dashboard-view-${selected}`;
+      }
+      window.location.hash = tab === "operations" ? "" : `#${tab}`;
+    }
+
+    function restoreDashboardTabFromHash() {
+      const requested = window.location.hash.replace(/^#/, "");
+      selectDashboardTab(requested === "subtitle-quality" ? requested : "operations");
+    }
 
     async function fetchJson(url, options = {}) {
       const response = await fetch(url, {
@@ -1811,6 +1869,10 @@ def dashboard_html() -> str:
     });
     document.getElementById("single-movie-form").addEventListener("submit", submitSingle);
     document.getElementById("batch-movie-form").addEventListener("submit", submitBatch);
+    for (const tab of document.querySelectorAll(".dashboard-tab")) {
+      tab.addEventListener("click", () => selectDashboardTab(tab.dataset.dashboardTab));
+    }
+    window.addEventListener("hashchange", restoreDashboardTabFromHash);
     document.getElementById("subtitle-quality-status-filter").addEventListener("change", () => {
       subtitleQualityState.page = 1;
       refreshSubtitleQuality();
@@ -1828,6 +1890,7 @@ def dashboard_html() -> str:
       refreshSubtitleQuality();
     });
     window.addEventListener("load", () => {
+      restoreDashboardTabFromHash();
       refreshState();
       refreshSubtitleQuality();
     });

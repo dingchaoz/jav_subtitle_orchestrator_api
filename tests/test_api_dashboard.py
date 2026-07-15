@@ -295,6 +295,30 @@ def test_dashboard_contains_safe_independent_subtitle_quality_section(
     assert "subtitleRow.innerHTML" not in html
 
 
+def test_dashboard_separates_operations_and_subtitle_quality_into_tabs(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    html = TestClient(create_app(store)).get("/dashboard").text
+
+    assert 'class="dashboard-tabs"' in html
+    assert 'id="dashboard-tab-operations"' in html
+    assert 'data-dashboard-tab="operations"' in html
+    assert 'id="dashboard-tab-subtitle-quality"' in html
+    assert 'data-dashboard-tab="subtitle-quality"' in html
+    assert 'id="dashboard-view-operations"' in html
+    assert 'id="dashboard-view-subtitle-quality"' in html
+    assert 'aria-controls="dashboard-view-subtitle-quality"' in html
+    assert "function selectDashboardTab" in html
+    assert 'window.location.hash = tab === "operations" ? "" : `#${tab}`' in html
+
+    operations_start = html.index('id="dashboard-view-operations"')
+    quality_start = html.index('id="dashboard-view-subtitle-quality"')
+    operations_html = html[operations_start:quality_start]
+    assert 'id="subtitle-quality-title"' not in operations_html
+
+
 def test_dashboard_audit_refresh_failure_is_isolated_from_job_state(
     sqlite_path, mac_jobs_root
 ):

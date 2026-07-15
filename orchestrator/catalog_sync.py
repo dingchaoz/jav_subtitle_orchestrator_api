@@ -24,6 +24,62 @@ _SAFE_REASON_CODES = {
     "public_visibility_mismatch",
 }
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_CACHE_KEY_VARIANT_SUFFIXES = (
+    "-uncensored-leak",
+    "-uncensored",
+    "-english-subtitle",
+    "-chinese-subtitle",
+    "-subtitle",
+    "-leak",
+)
+
+
+def _matches_cache_code(code: str, canonical: str, *, allow_aliases: bool) -> bool:
+    return code == canonical or (
+        allow_aliases
+        and any(code == f"{canonical}{suffix}" for suffix in _CACHE_KEY_VARIANT_SUFFIXES)
+    )
+
+
+def _matches_full_cache_key(
+    key: str,
+    canonical: str,
+    *,
+    allow_aliases: bool = False,
+) -> bool:
+    prefix = "movie:full:"
+    if not key.startswith(prefix):
+        return False
+    payload = key[len(prefix) :]
+    if _matches_cache_code(payload, canonical, allow_aliases=allow_aliases):
+        return True
+    parts = payload.split(":")
+    if len(parts) != 2:
+        return False
+    version, code = parts
+    return (
+        _matches_cache_code(code, canonical, allow_aliases=allow_aliases)
+        and bool(version)
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "._-")
+            for character in version
+        )
+    )
+
+
+def _matches_light_cache_key(
+    key: str,
+    canonical: str,
+    *,
+    allow_aliases: bool = False,
+) -> bool:
+    prefix = "movie:light:"
+    return key.startswith(prefix) and _matches_cache_code(
+        key[len(prefix) :],
+        canonical,
+        allow_aliases=allow_aliases,
+    )
 
 
 class CatalogSyncSession(Protocol):
@@ -187,6 +243,7 @@ class CatalogSyncClient:
             f"movie:full:{canonical}",
             f"movie:light:{canonical}",
         }
+        expected_light_key = f"movie:light:{canonical}"
         kv_keys_valid = (
             isinstance(kv_keys_deleted, list)
             and all(isinstance(key, str) for key in kv_keys_deleted)
@@ -201,8 +258,27 @@ class CatalogSyncClient:
                 )
                 or (
                     not allow_alias_cache_keys
-                    and len(kv_keys_deleted) == 2
-                    and set(kv_keys_deleted) == expected_kv_keys
+                    and len(kv_keys_deleted) >= 2
+                    and len(set(kv_keys_deleted)) == len(kv_keys_deleted)
+                    and expected_light_key in set(kv_keys_deleted)
+                    and sum(
+                        _matches_full_cache_key(key, canonical)
+                        for key in kv_keys_deleted
+                    )
+                    == 1
+                    and all(
+                        _matches_full_cache_key(
+                            key,
+                            canonical,
+                            allow_aliases=True,
+                        )
+                        or _matches_light_cache_key(
+                            key,
+                            canonical,
+                            allow_aliases=True,
+                        )
+                        for key in kv_keys_deleted
+                    )
                 )
             )
         )

@@ -86,6 +86,28 @@ def _validate_expected_sha256(value: str, label: str) -> None:
         raise ValueError(f"{label} must be 64 lowercase hexadecimal characters")
 
 
+def _matches_catalog_full_cache_key(key: str, canonical: str) -> bool:
+    prefix = "movie:full:"
+    if not key.startswith(prefix):
+        return False
+    payload = key[len(prefix) :]
+    if payload == canonical:
+        return True
+    parts = payload.split(":")
+    if len(parts) != 2:
+        return False
+    version, code = parts
+    return (
+        code == canonical
+        and bool(version)
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "._-")
+            for character in version
+        )
+    )
+
+
 def _validate_verified_supabase_receipt(
     *,
     movie_code: str,
@@ -4043,6 +4065,61 @@ class JobStore:
             assert failed is not None
             return failed
 
+    def retry_failed_catalog_sync(self, job_id: str) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            error_prefix = "catalog_sync: "
+            reason_code = (
+                job.error[len(error_prefix) :]
+                if isinstance(job.error, str) and job.error.startswith(error_prefix)
+                else None
+            )
+            if (
+                job.status is not JobStatus.FAILED
+                or job.claimed_by is not None
+                or job.translation_origin != NORMAL_TRANSLATION_ORIGIN
+                or reason_code not in _CATALOG_SYNC_FAILURE_REASON_CODES
+            ):
+                raise ValueError("catalog failure is not eligible for retry")
+            _validate_verified_supabase_receipt(
+                movie_code=job.normalized_movie_number,
+                movie_uuid=job.catalog_movie_uuid,
+                metadata_status=job.metadata_status,
+                metadata_source=job.metadata_source,
+                subtitle_id=job.published_subtitle_id,
+                storage_path=job.published_storage_path,
+                content_sha256=job.published_content_sha256,
+                file_size=job.published_file_size,
+            )
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, catalog_sync_attempt_count = 0,
+                    next_catalog_sync_attempt_at = NULL,
+                    catalog_lease_token = NULL, lease_expires_at = NULL,
+                    updated_at = ?, error = NULL
+                WHERE id = ? AND status = ? AND claimed_by IS NULL
+                  AND translation_origin = ? AND error = ?
+                """,
+                (
+                    JobStatus.CATALOG_SYNC_PENDING.value,
+                    now,
+                    job_id,
+                    JobStatus.FAILED.value,
+                    NORMAL_TRANSLATION_ORIGIN,
+                    job.error,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("catalog failure changed before retry")
+            retried = self.get_job(job_id, conn=conn)
+            assert retried is not None
+            return retried
+
     def fail_historical_catalog_sync(
         self,
         job_id: str,
@@ -4175,13 +4252,15 @@ class JobStore:
             for value in (d1_rows_updated, subtitle_count)
         ):
             raise ValueError("catalog result counts must be positive integers")
-        expected_keys = {
-            f"movie:full:{canonical}",
-            f"movie:light:{canonical}",
-        }
+        expected_light_key = f"movie:light:{canonical}"
         if (
             not isinstance(kv_keys_deleted, tuple)
-            or not expected_keys.issubset(set(kv_keys_deleted))
+            or expected_light_key not in set(kv_keys_deleted)
+            or not any(
+                isinstance(key, str)
+                and _matches_catalog_full_cache_key(key, canonical)
+                for key in kv_keys_deleted
+            )
             or any(
                 not isinstance(key, str)
                 or not key.startswith(("movie:full:", "movie:light:"))

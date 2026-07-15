@@ -218,6 +218,38 @@ def test_sync_accepts_current_catalog_response_schema():
     )
 
 
+def test_sync_accepts_versioned_full_cache_key_from_deployed_catalog():
+    body = valid_body()
+    body["results"][0]["kvKeysDeleted"] = [
+        f"movie:full:v3:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    ]
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == (
+        f"movie:full:v3:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    )
+
+
+def test_sync_accepts_versioned_alias_keys_from_multirow_catalog():
+    body = valid_body()
+    body["results"][0].update(
+        d1RowsUpdated=2,
+        kvKeysDeleted=[
+            f"movie:full:v3:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+            f"movie:full:v3:{CANONICAL_CODE}-uncensored-leak",
+            f"movie:light:{CANONICAL_CODE}-uncensored-leak",
+        ],
+    )
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == tuple(body["results"][0]["kvKeysDeleted"])
+
+
 @pytest.mark.parametrize(
     ("status", "reason"),
     [

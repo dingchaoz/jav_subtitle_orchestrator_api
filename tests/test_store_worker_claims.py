@@ -1495,6 +1495,101 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
     assert ready.error is None
 
 
+def test_retry_failed_catalog_sync_preserves_verified_publication(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-030")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-030/abc-030-English_AI.srt",
+        content_sha256="c" * 64,
+        file_size=456,
+        lease_token=publishing.stage_lease_token,
+    )
+    syncing = store.claim_catalog_sync_job(
+        "catalog-worker", 60, job_id=receipt.id
+    )
+    failed = store.fail_catalog_sync(
+        syncing.id,
+        "catalog-worker",
+        "catalog_response_mismatch",
+        lease_token=syncing.catalog_lease_token,
+        max_catalog_sync_attempts=1,
+        retry_seconds=30,
+    )
+    assert failed.status is JobStatus.FAILED
+
+    retried = store.retry_failed_catalog_sync(failed.id)
+
+    assert retried.status is JobStatus.CATALOG_SYNC_PENDING
+    assert retried.catalog_sync_attempt_count == 0
+    assert retried.next_catalog_sync_attempt_at is None
+    assert retried.error is None
+    assert retried.catalog_movie_uuid == receipt.catalog_movie_uuid
+    assert retried.published_subtitle_id == receipt.published_subtitle_id
+    assert retried.published_content_sha256 == receipt.published_content_sha256
+
+
+def test_catalog_complete_accepts_versioned_full_cache_key(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-032")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    receipt = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-032/abc-032-English_AI.srt",
+        content_sha256="d" * 64,
+        file_size=456,
+        lease_token=publishing.stage_lease_token,
+    )
+    syncing = store.claim_catalog_sync_job(
+        "catalog-worker", 60, job_id=receipt.id
+    )
+
+    ready = store.complete_catalog_sync(
+        syncing.id,
+        "catalog-worker",
+        lease_token=syncing.catalog_lease_token,
+        canonical_code="abc-032",
+        d1_rows_updated=1,
+        subtitle_count=1,
+        kv_keys_deleted=("movie:full:v3:abc-032", "movie:light:abc-032"),
+    )
+
+    assert ready.status is JobStatus.ENGLISH_SRT_READY
+
+
+def test_retry_failed_catalog_sync_rejects_non_catalog_failure(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    failed = store.submit_job("abc-031", priority=100, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, error = ? WHERE id = ?",
+            (JobStatus.FAILED.value, "translating: quality_gate_failed", failed.id),
+        )
+
+    with pytest.raises(ValueError, match="catalog failure is not eligible"):
+        store.retry_failed_catalog_sync(failed.id)
+
+
 def test_expired_catalog_sync_lease_uses_only_catalog_counter(
     sqlite_path, mac_jobs_root
 ):
