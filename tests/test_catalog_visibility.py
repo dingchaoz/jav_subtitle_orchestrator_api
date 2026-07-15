@@ -137,6 +137,20 @@ def test_origin_normalization_accepts_leading_zero_numeric_ports(
 
 
 @pytest.mark.parametrize(
+    ("base_url", "expected_origin"),
+    [
+        ("https://[v1.fe]", "https://[v1.fe]"),
+        ("https://[vF.a:b]:0443", "https://[vF.a:b]:443"),
+    ],
+)
+def test_origin_normalization_preserves_valid_ipvfuture_brackets(
+    base_url: str,
+    expected_origin: str,
+):
+    assert normalize_catalog_api_origin(base_url) == expected_origin
+
+
+@pytest.mark.parametrize(
     "base_url",
     [
         "https://example.com\x00",
@@ -144,6 +158,16 @@ def test_origin_normalization_accepts_leading_zero_numeric_ports(
         "https://[::1]evil",
         "https://[::1].example",
         "https://[::1]]",
+        "https://[v.fe]",
+        "https://[v1]",
+        "https://[v1.]",
+        "https://[v1.fe%]",
+        "https://[v1.fe]junk",
+        "https://[:::1]",
+        "https://[v1.fe",
+        "https://[example.com]",
+        "https://[127.0.0.1]",
+        "http://[v1.fe]",
         "https://０.example.com",
     ],
 )
@@ -214,6 +238,49 @@ def test_requests_prepares_valid_nfkc_stable_unicode_idn_as_ascii():
         f"https://xn--r8jz45g.xn--zckzah/api/movie/{CANONICAL_CODE}"
         f"?cacheNonce={CONTENT_SHA256}"
     )
+
+
+def test_visibility_get_preserves_bracketed_ipvfuture_url():
+    session = FakeSession(FakeResponse(status_code=404))
+    client = PublicCatalogVisibilityClient(
+        "https://[v1.fe]:8443",
+        session=session,
+    )
+
+    result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+    assert result.status is VisibilityStatus.NOT_FOUND
+    assert client.base_url == "https://[v1.fe]:8443"
+    assert session.requests == [
+        (
+            f"https://[v1.fe]:8443/api/movie/{CANONICAL_CODE}"
+            f"?cacheNonce={CONTENT_SHA256}",
+            {"timeout": 30, "allow_redirects": False},
+        )
+    ]
+
+
+def test_requests_ipvfuture_parse_failure_is_safely_classified():
+    request_url = (
+        f"https://[v1.fe]:8443/api/movie/{CANONICAL_CODE}"
+        f"?cacheNonce={CONTENT_SHA256}"
+    )
+    with pytest.raises(requests.exceptions.InvalidURL):
+        requests.Request("GET", request_url).prepare()
+
+    session = PreparedRequestSession()
+    client = PublicCatalogVisibilityClient(
+        "https://[v1.fe]:8443",
+        session=session,
+    )
+
+    result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+    assert result.status is VisibilityStatus.FETCH_FAILED
+    assert result.reason_code == "public_visibility_fetch_failed"
+    assert client.base_url == "https://[v1.fe]:8443"
+    assert session.sent == []
+    assert "Failed to parse" not in repr(result)
 
 
 @pytest.mark.parametrize(

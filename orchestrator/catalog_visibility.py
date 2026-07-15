@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import re
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
@@ -38,14 +39,21 @@ class VisibilitySession(Protocol):
     def get(self, url: str, **kwargs: Any) -> Any: ...
 
 
-def _normalize_hostname(hostname: str) -> str | None:
-    if ":" in hostname:
-        try:
-            ipaddress.IPv6Address(hostname)
-        except ipaddress.AddressValueError:
-            return None
+def _normalize_bracketed_hostname(hostname: str) -> str | None:
+    try:
+        ipaddress.IPv6Address(hostname)
         return hostname
+    except ipaddress.AddressValueError:
+        pass
+    if re.fullmatch(
+        r"[vV][0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+",
+        hostname,
+    ):
+        return hostname
+    return None
 
+
+def _normalize_dns_hostname(hostname: str) -> str | None:
     if unicodedata.normalize("NFKC", hostname) != hostname:
         return None
     try:
@@ -78,7 +86,8 @@ def _normalize_authority(
     hostname: str,
     port: int | None,
 ) -> str | None:
-    if authority.startswith("["):
+    bracketed = authority.startswith("[")
+    if bracketed:
         closing_bracket = authority.find("]")
         if closing_bracket < 0:
             return None
@@ -110,12 +119,14 @@ def _normalize_authority(
 
     if raw_hostname.casefold() != hostname.casefold():
         return None
-    normalized_hostname = _normalize_hostname(raw_hostname)
+    normalized_hostname = (
+        _normalize_bracketed_hostname(raw_hostname)
+        if bracketed
+        else _normalize_dns_hostname(raw_hostname)
+    )
     if normalized_hostname is None:
         return None
-    host_authority = (
-        f"[{normalized_hostname}]" if ":" in normalized_hostname else normalized_hostname
-    )
+    host_authority = f"[{normalized_hostname}]" if bracketed else normalized_hostname
     return f"{host_authority}:{port}" if port is not None else host_authority
 
 
