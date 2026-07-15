@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -48,6 +49,8 @@ def _valid_hostname(hostname: str) -> bool:
         ascii_hostname = hostname.encode("idna").decode("ascii")
     except UnicodeError:
         return False
+    if ascii_hostname != hostname:
+        return False
     if ascii_hostname.endswith("."):
         ascii_hostname = ascii_hostname[:-1]
     labels = ascii_hostname.split(".")
@@ -65,6 +68,29 @@ def _valid_hostname(hostname: str) -> bool:
     )
 
 
+def _authority_matches_hostname(
+    authority: str,
+    hostname: str,
+    port: int | None,
+) -> bool:
+    host_authority = f"[{hostname}]" if ":" in hostname else hostname
+    expected_authority = (
+        f"{host_authority}:{port}" if port is not None else host_authority
+    )
+    return authority.lower() == expected_authority.lower()
+
+
+def validate_catalog_timeout_seconds(timeout_seconds: object) -> int | float:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or timeout_seconds <= 0
+        or (isinstance(timeout_seconds, float) and not math.isfinite(timeout_seconds))
+    ):
+        raise ValueError("timeout_seconds must be positive")
+    return timeout_seconds
+
+
 def normalize_catalog_api_origin(base_url: str) -> str:
     if (
         not isinstance(base_url, str)
@@ -77,11 +103,12 @@ def normalize_catalog_api_origin(base_url: str) -> str:
         parsed = urlsplit(base_url)
         hostname = parsed.hostname
         has_credentials = parsed.username is not None or parsed.password is not None
-        parsed.port
+        port = parsed.port
     except ValueError:
         parse_failed = True
         parsed = None
         hostname = None
+        port = None
         has_credentials = True
     if parse_failed:
         raise ValueError("catalog API base URL is invalid")
@@ -94,6 +121,7 @@ def normalize_catalog_api_origin(base_url: str) -> str:
         or not parsed.netloc
         or not hostname
         or not _valid_hostname(hostname)
+        or not _authority_matches_hostname(parsed.netloc, hostname, port)
         or has_credentials
         or parsed.netloc.endswith(":")
         or parsed.path not in {"", "/"}
@@ -114,13 +142,7 @@ class PublicCatalogVisibilityClient:
         session: VisibilitySession | None = None,
     ) -> None:
         self.base_url = normalize_catalog_api_origin(base_url)
-        if (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or not timeout_seconds > 0
-        ):
-            raise ValueError("timeout_seconds must be positive")
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = validate_catalog_timeout_seconds(timeout_seconds)
         self.session = session or requests.Session()
 
     def check(

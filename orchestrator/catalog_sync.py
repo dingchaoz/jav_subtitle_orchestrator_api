@@ -10,6 +10,7 @@ from orchestrator.catalog_visibility import (
     PublicCatalogVisibilityClient,
     VisibilityStatus,
     normalize_catalog_api_origin,
+    validate_catalog_timeout_seconds,
 )
 from orchestrator.movie_code import canonical_movie_code
 
@@ -123,14 +124,8 @@ class CatalogSyncClient:
         self.base_url, self.endpoint = self._endpoints(base_url)
         if not isinstance(admin_token, str) or not admin_token.strip():
             raise ValueError("catalog admin token is required")
-        if (
-            isinstance(timeout_seconds, bool)
-            or not isinstance(timeout_seconds, (int, float))
-            or timeout_seconds <= 0
-        ):
-            raise ValueError("timeout_seconds must be positive")
         self.admin_token = admin_token.strip()
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = validate_catalog_timeout_seconds(timeout_seconds)
         self.session = session or requests.Session()
         self.public_visibility_client = PublicCatalogVisibilityClient(
             self.base_url,

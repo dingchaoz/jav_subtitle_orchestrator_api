@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import fields
 
 import pytest
@@ -607,12 +608,27 @@ def test_admin_token_must_be_nonempty_string(token):
         CatalogSyncClient("https://javsubtitle.example", token, session=FakeSession())
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True])
+@pytest.mark.parametrize(
+    "timeout",
+    [0, -1, True, math.nan, math.inf, -math.inf],
+)
 def test_timeout_must_be_positive_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):
         CatalogSyncClient(
             "https://javsubtitle.example", TOKEN, timeout_seconds=timeout, session=FakeSession()
         )
+
+
+@pytest.mark.parametrize("timeout", [1, 0.25])
+def test_sync_accepts_positive_finite_timeout(timeout):
+    client = CatalogSyncClient(
+        "https://javsubtitle.example",
+        TOKEN,
+        timeout_seconds=timeout,
+        session=FakeSession(),
+    )
+
+    assert client.timeout_seconds == timeout
 
 
 def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():

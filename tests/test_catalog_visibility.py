@@ -60,6 +60,20 @@ class FakeSession:
         return self.response
 
 
+class PreparedRequestSession(requests.Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[tuple[requests.PreparedRequest, dict[str, object]]] = []
+
+    def send(self, request: requests.PreparedRequest, **kwargs: object) -> requests.Response:
+        self.sent.append((request, kwargs))
+        response = requests.Response()
+        response.status_code = 404
+        response.request = request
+        response.url = request.url
+        return response
+
+
 def check(session: FakeSession) -> PublicVisibilityResult:
     return PublicCatalogVisibilityClient(
         "https://javsubtitle.example/", session=session
@@ -113,6 +127,10 @@ def test_origin_normalization_rejects_malformed_ports(base_url: str):
     [
         "https://example.com\x00",
         "https://example.com\\evil",
+        "https://[::1]evil",
+        "https://[::1].example",
+        "https://[::1]]",
+        "https://０.example.com",
     ],
 )
 def test_origin_normalization_rejects_invalid_hostname_characters(base_url: str):
@@ -124,12 +142,45 @@ def test_origin_normalization_rejects_invalid_hostname_characters(base_url: str)
     assert raised.value.__context__ is None
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True, math.nan])
+@pytest.mark.parametrize(
+    "timeout",
+    [0, -1, True, math.nan, math.inf, -math.inf],
+)
 def test_timeout_must_be_a_positive_non_bool_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):
         PublicCatalogVisibilityClient(
             "https://javsubtitle.example", timeout_seconds=timeout, session=FakeSession()
         )
+
+
+@pytest.mark.parametrize("timeout", [1, 0.25])
+def test_positive_finite_timeout_is_preserved(timeout):
+    client = PublicCatalogVisibilityClient(
+        "https://javsubtitle.example", timeout_seconds=timeout, session=FakeSession()
+    )
+
+    assert client.timeout_seconds == timeout
+
+
+def test_requests_prepares_exact_validated_url_and_receives_finite_timeout():
+    session = PreparedRequestSession()
+    client = PublicCatalogVisibilityClient(
+        "https://javsubtitle.example:8443/",
+        timeout_seconds=2.5,
+        session=session,
+    )
+
+    result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+    assert result.status is VisibilityStatus.NOT_FOUND
+    assert len(session.sent) == 1
+    request, kwargs = session.sent[0]
+    assert request.url == (
+        f"https://javsubtitle.example:8443/api/movie/{CANONICAL_CODE}"
+        f"?cacheNonce={CONTENT_SHA256}"
+    )
+    assert kwargs["timeout"] == 2.5
+    assert kwargs["allow_redirects"] is False
 
 
 @pytest.mark.parametrize(
