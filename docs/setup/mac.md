@@ -159,31 +159,46 @@ Supabase or retranslates an SRT. Repair execution calls only the catalog sync
 endpoint for the exact, already-published receipt, then requires that same subtitle
 ID and content SHA-256 to be visible through the public catalog API.
 
-Give every audit one canonical output directory and keep it as the immutable audit
-ledger. To start with the `ktb-111` canary:
+Give every audit one fresh, unique canonical output directory and keep it as the
+immutable audit ledger. Never reuse a prior or superseded directory for a new
+audit, plan, or execution. Start the `ktb-111` canary in one terminal session by
+defining the paths once and refusing collisions:
 
 ```bash
 cd /Users/ytt/Documents/startup/JAV-Subtitle-Orchestrator
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+AUDIT_OUTPUT="reports/catalog-visibility-ktb111-canary-${RUN_ID}"
+REPAIR_OUTPUT="reports/catalog-visibility-ktb111-canary-repair-${RUN_ID}"
+REAUDIT_OUTPUT="reports/catalog-visibility-ktb111-canary-reaudit-${RUN_ID}"
+REPORT_PATH="${AUDIT_OUTPUT}/audit-report.json"
+
+if [[ -e "$AUDIT_OUTPUT" || -e "$REPAIR_OUTPUT" || -e "$REAUDIT_OUTPUT" ]]; then
+  echo "catalog visibility output already exists; choose a new RUN_ID" >&2
+  exit 1
+fi
+
 .venv/bin/python -m orchestrator catalog-visibility-audit \
-  --output reports/catalog-visibility-ktb111-canary \
+  --output "$AUDIT_OUTPUT" \
   --allowlist ktb-111 \
   --limit 1
 ```
 
-If interrupted, rerun the identical command with the identical output directory.
-The command resumes the manifest and findings checkpoint only when the database,
-API origin, allowlist, and limit still match. Do not delete or edit the ledger to
-force a different context. Inspect `audit-report.json`, its classification counts,
-and the printed `report_sha256`. A complete canary report must contain exactly the
-expected candidate. `missing` and `not_found` are repair-eligible; other findings
-require investigation rather than forced execution.
+The collision guard is for starting a new ledger. If interrupted, retain or
+reconstruct the exact variables and rerun only the identical audit command with
+the identical output directory. The command resumes the manifest and findings
+checkpoint only when the database, API origin, allowlist, and limit still match.
+Do not delete or edit the ledger to force a different context. Inspect
+`audit-report.json`, its classification counts, and the printed `report_sha256`.
+A complete canary report must contain exactly the expected candidate. `missing`
+and `not_found` are repair-eligible; other findings require investigation rather
+than forced execution.
 
 Generate and inspect an exact, immutable repair plan without `--execute`:
 
 ```bash
 .venv/bin/python -m orchestrator catalog-visibility-repair \
-  --report reports/catalog-visibility-ktb111-canary/audit-report.json \
-  --output reports/catalog-visibility-ktb111-canary-repair
+  --report "$REPORT_PATH" \
+  --output "$REPAIR_OUTPUT"
 ```
 
 Keep that repair output directory as the canonical plan and execution ledger.
@@ -212,15 +227,17 @@ this quiesced mutation window.
 
 > **Production mutation gate:** do not run the following form until an explicit
 > production approval names this exact report digest and allowlisted batch. Replace
-> the placeholder only with the lowercase digest printed by the reviewed dry run;
-> never put a real token or digest in this document.
+> the quoted, shell-safe placeholder only with the 64-character lowercase digest
+> printed by the reviewed dry run; never put a real token or digest in this
+> document.
 
 ```bash
+REVIEWED_REPORT_SHA256='replace-with-reviewed-64-character-lowercase-sha256'
 .venv/bin/python -m orchestrator catalog-visibility-repair \
-  --report reports/catalog-visibility-ktb111-canary/audit-report.json \
-  --output reports/catalog-visibility-ktb111-canary-repair \
+  --report "$REPORT_PATH" \
+  --output "$REPAIR_OUTPUT" \
   --execute \
-  --confirm-report-sha256 <reviewed-lowercase-report-sha256>
+  --confirm-report-sha256 "$REVIEWED_REPORT_SHA256"
 ```
 
 Execution stops immediately on catalog authentication failure and stops before the
@@ -231,11 +248,25 @@ ambiguous, it stops with `unresolved_claim` instead of blindly sending another
 sync. Preserve both ledgers and investigate before authorizing any specialized
 recovery.
 
-After an approved `ktb-111` execution, rerun a GET-only audit into a new canonical
-output directory and require `visible` for the exact receipt. Expand only through
-explicit, bounded allowlisted batches, re-auditing every repaired set. Proceed to
-the full eligible set only after the bounded batches remain visible and their
-ledgers have been reviewed.
+After an approved `ktb-111` execution, use the already reserved fresh re-audit
+directory and require `visible` for the exact receipt:
+
+```bash
+.venv/bin/python -m orchestrator catalog-visibility-audit \
+  --output "$REAUDIT_OUTPUT" \
+  --allowlist ktb-111 \
+  --limit 1
+```
+
+Expand only through explicit, bounded allowlisted batches, re-auditing every
+repaired set. Proceed to the full eligible set only after the bounded batches
+remain visible and their ledgers have been reviewed.
+
+For the 2026-07-15 handoff, consult the untracked
+`reports/CATALOG-VISIBILITY-KTB111-CANONICAL.txt` marker alongside the evidence.
+It designates the timestamped canonical audit/plan pair and labels the
+non-timestamped pair superseded. That handoff plan had `eligible=0`; it is evidence
+only and is not an execute recommendation.
 
 ## Recover one interrupted audio download
 
