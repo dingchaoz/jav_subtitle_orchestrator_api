@@ -462,7 +462,7 @@ def test_repair_execute_uses_exact_builder_and_canonical_output(
     )
 
 
-def test_repair_execute_passes_mismatched_digest_to_executor_and_sanitizes_error(
+def test_repair_execute_rejects_mismatched_digest_before_privileged_client_or_executor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -471,24 +471,35 @@ def test_repair_execute_passes_mismatched_digest_to_executor_and_sanitizes_error
     import orchestrator.catalog_visibility_repair as repair_module
 
     secret = "admin-secret-do-not-print"
-    _install_repair_fakes(monkeypatch, tmp_path, token=secret)
-    monkeypatch.setattr(
-        cli,
-        "build_catalog_sync_client",
-        lambda _settings: SimpleNamespace(),
-    )
+    events, _ = _install_repair_fakes(monkeypatch, tmp_path, token=secret)
+    privileged_events: list[str] = []
 
-    def reject_mismatch(*_args: object, **kwargs: object) -> object:
-        assert kwargs["confirm_report_sha256"] == OTHER_SHA256
-        raise ValueError(f"confirm_report_sha256 mismatch {secret}")
+    def build_client(_settings: object) -> object:
+        privileged_events.append("build_client")
+        return SimpleNamespace()
 
+    def execute(*_args: object, **_kwargs: object) -> object:
+        privileged_events.append("execute")
+        return SimpleNamespace(
+            action="executed",
+            repaired=(),
+            failed=(),
+            skipped_receipt_changed=(),
+            stopped_reason=None,
+            receipt_path=tmp_path / "repair" / "repair-execution.jsonl",
+        )
+
+    monkeypatch.setattr(cli, "build_catalog_sync_client", build_client)
     monkeypatch.setattr(
         repair_module,
         "execute_catalog_visibility_repair",
-        reject_mismatch,
+        execute,
     )
 
-    with pytest.raises(SystemExit, match="catalog visibility repair execution failed"):
+    with pytest.raises(
+        SystemExit,
+        match="catalog visibility repair authorization failed",
+    ):
         cli.run_catalog_visibility_repair(
             report=tmp_path / "audit-report.json",
             output=tmp_path / "repair",
@@ -497,6 +508,10 @@ def test_repair_execute_passes_mismatched_digest_to_executor_and_sanitizes_error
         )
 
     captured = capsys.readouterr()
+    assert [event[0] for event in events] == ["store", "plan"]
+    assert privileged_events == []
+    assert (tmp_path / "repair" / "repair-plan.json").is_file()
+    assert not (tmp_path / "repair" / "repair-execution.jsonl").exists()
     assert secret not in captured.out
     assert secret not in captured.err
 

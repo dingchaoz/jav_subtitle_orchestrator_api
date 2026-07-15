@@ -1,4 +1,5 @@
 import argparse
+import hmac
 import json
 import logging
 import os
@@ -1019,6 +1020,11 @@ def run_catalog_visibility_repair(
         )
         return 0
 
+    if (
+        not isinstance(confirm_report_sha256, str)
+        or not hmac.compare_digest(confirm_report_sha256, plan.report_sha256)
+    ):
+        raise SystemExit("catalog visibility repair authorization failed")
     if not settings.javsubtitle_admin_api_token:
         raise SystemExit("catalog visibility repair authorization failed")
     try:
