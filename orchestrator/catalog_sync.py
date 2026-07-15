@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
-from urllib.parse import quote, urlencode, urlsplit
 
 import requests
 
+from orchestrator.catalog_visibility import (
+    PublicCatalogVisibilityClient,
+    VisibilityStatus,
+    normalize_catalog_api_origin,
+)
 from orchestrator.movie_code import canonical_movie_code
 
 
@@ -23,7 +28,6 @@ _SAFE_REASON_CODES = {
     "public_visibility_response_invalid",
     "public_visibility_mismatch",
 }
-_LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _CACHE_KEY_VARIANT_SUFFIXES = (
     "-uncensored-leak",
     "-uncensored",
@@ -128,6 +132,11 @@ class CatalogSyncClient:
         self.admin_token = admin_token.strip()
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
+        self.public_visibility_client = PublicCatalogVisibilityClient(
+            self.base_url,
+            timeout_seconds=self.timeout_seconds,
+            session=self.session,
+        )
 
     def sync(
         self,
@@ -196,12 +205,16 @@ class CatalogSyncClient:
         result_rows = body.get("results")
         body_keys = set(body)
         allowed_body_keys = {"success", "requested", "synced", "failed", "results"}
-        if body_keys == allowed_body_keys | {"dryRun"}:
-            dry_run_valid = body.get("dryRun") is False
+        if body_keys == allowed_body_keys:
+            response_family = "legacy"
+        elif body_keys == allowed_body_keys | {"dryRun"} and body.get("dryRun") is False:
+            response_family = "current"
+        elif body_keys == allowed_body_keys | {"cacheSchemaVersion"}:
+            response_family = "strengthened"
         else:
-            dry_run_valid = body_keys == allowed_body_keys
+            response_family = None
         if (
-            not dry_run_valid
+            response_family is None
             or body.get("success") is not True
             or not self._exact_int(body.get("requested"), 1)
             or not self._exact_int(body.get("synced"), 1)
@@ -216,7 +229,7 @@ class CatalogSyncClient:
         d1_rows_updated = row.get("d1RowsUpdated")
         subtitle_count = row.get("subtitleCount")
         row_keys = set(row)
-        if row_keys == {
+        if response_family == "legacy" and row_keys == {
             "canonicalCode",
             "d1RowsUpdated",
             "subtitleCount",
@@ -226,7 +239,7 @@ class CatalogSyncClient:
             kv_keys_deleted = row.get("kvKeysDeleted")
             row_schema_valid = row.get("dryRun") is False
             allow_alias_cache_keys = False
-        elif row_keys == {
+        elif response_family == "current" and row_keys == {
             "canonicalCode",
             "d1RowsUpdated",
             "subtitleCount",
@@ -235,6 +248,38 @@ class CatalogSyncClient:
             kv_keys_deleted = row.get("kvKeysTouched")
             row_schema_valid = True
             allow_alias_cache_keys = True
+        elif response_family == "strengthened" and row_keys == {
+            "canonicalCode",
+            "d1RowsUpdated",
+            "d1Verified",
+            "subtitleCount",
+            "kvAction",
+            "kvKeysTouched",
+            "kvKeysDeleted",
+        }:
+            cache_schema_version = body.get("cacheSchemaVersion")
+            kv_keys_touched = row.get("kvKeysTouched")
+            kv_keys_deleted = row.get("kvKeysDeleted")
+            version_valid = isinstance(cache_schema_version, str) and re.fullmatch(
+                r"v[1-9][0-9]*", cache_schema_version
+            )
+            expected_active_keys = {
+                f"movie:full:{cache_schema_version}:{canonical}",
+                f"movie:light:{canonical}",
+            }
+            row_schema_valid = (
+                bool(version_valid)
+                and row.get("d1Verified") is True
+                and row.get("kvAction")
+                in {"written", "deleted_for_d1_fallback", "unchanged"}
+                and isinstance(kv_keys_touched, list)
+                and isinstance(kv_keys_deleted, list)
+                and kv_keys_touched == kv_keys_deleted
+                and len(kv_keys_deleted) == 2
+                and all(isinstance(key, str) for key in kv_keys_deleted)
+                and set(kv_keys_deleted) == expected_active_keys
+            )
+            allow_alias_cache_keys = False
         else:
             kv_keys_deleted = None
             row_schema_valid = False
@@ -244,44 +289,47 @@ class CatalogSyncClient:
             f"movie:light:{canonical}",
         }
         expected_light_key = f"movie:light:{canonical}"
-        kv_keys_valid = (
-            isinstance(kv_keys_deleted, list)
-            and all(isinstance(key, str) for key in kv_keys_deleted)
-            and (
-                (
-                    allow_alias_cache_keys
-                    and expected_kv_keys.issubset(set(kv_keys_deleted))
-                    and all(
-                        key.startswith(("movie:full:", "movie:light:"))
-                        for key in kv_keys_deleted
-                    )
-                )
-                or (
-                    not allow_alias_cache_keys
-                    and len(kv_keys_deleted) >= 2
-                    and len(set(kv_keys_deleted)) == len(kv_keys_deleted)
-                    and expected_light_key in set(kv_keys_deleted)
-                    and sum(
-                        _matches_full_cache_key(key, canonical)
-                        for key in kv_keys_deleted
-                    )
-                    == 1
-                    and all(
-                        _matches_full_cache_key(
-                            key,
-                            canonical,
-                            allow_aliases=True,
+        if response_family == "strengthened":
+            kv_keys_valid = row_schema_valid
+        else:
+            kv_keys_valid = (
+                isinstance(kv_keys_deleted, list)
+                and all(isinstance(key, str) for key in kv_keys_deleted)
+                and (
+                    (
+                        allow_alias_cache_keys
+                        and expected_kv_keys.issubset(set(kv_keys_deleted))
+                        and all(
+                            key.startswith(("movie:full:", "movie:light:"))
+                            for key in kv_keys_deleted
                         )
-                        or _matches_light_cache_key(
-                            key,
-                            canonical,
-                            allow_aliases=True,
+                    )
+                    or (
+                        not allow_alias_cache_keys
+                        and len(kv_keys_deleted) >= 2
+                        and len(set(kv_keys_deleted)) == len(kv_keys_deleted)
+                        and expected_light_key in set(kv_keys_deleted)
+                        and sum(
+                            _matches_full_cache_key(key, canonical)
+                            for key in kv_keys_deleted
                         )
-                        for key in kv_keys_deleted
+                        == 1
+                        and all(
+                            _matches_full_cache_key(
+                                key,
+                                canonical,
+                                allow_aliases=True,
+                            )
+                            or _matches_light_cache_key(
+                                key,
+                                canonical,
+                                allow_aliases=True,
+                            )
+                            for key in kv_keys_deleted
+                        )
                     )
                 )
             )
-        )
         if (
             not row_schema_valid
             or row.get("canonicalCode") != canonical
@@ -306,36 +354,7 @@ class CatalogSyncClient:
 
     @staticmethod
     def _endpoints(base_url: str) -> tuple[str, str]:
-        if not isinstance(base_url, str) or not base_url or base_url != base_url.strip():
-            raise ValueError("catalog API base URL is invalid")
-        parse_failed = False
-        try:
-            parsed = urlsplit(base_url)
-            hostname = parsed.hostname
-            has_credentials = parsed.username is not None or parsed.password is not None
-        except ValueError:
-            parse_failed = True
-            parsed = None
-            hostname = None
-            has_credentials = True
-        if parse_failed:
-            raise ValueError("catalog API base URL is invalid")
-        valid_transport = parsed.scheme == "https" or (
-            parsed.scheme == "http" and hostname in _LOCAL_HTTP_HOSTS
-        )
-        if (
-            not valid_transport
-            or not parsed.netloc
-            or not hostname
-            or has_credentials
-            or parsed.path not in {"", "/"}
-            or "?" in base_url
-            or "#" in base_url
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError("catalog API base URL is invalid")
-        root = f"{parsed.scheme}://{parsed.netloc}"
+        root = normalize_catalog_api_origin(base_url)
         return root, f"{root}{_SYNC_PATH}"
 
     def _verify_public_visibility(
@@ -345,36 +364,22 @@ class CatalogSyncClient:
         expected_subtitle_id: str,
         expected_content_sha256: str,
     ) -> None:
-        try:
-            response = self.session.get(
-                f"{self.base_url}/api/movie/{quote(canonical, safe='')}?"
-                f"{urlencode({'cacheNonce': expected_content_sha256})}",
-                timeout=self.timeout_seconds,
-                allow_redirects=False,
-            )
-        except requests.RequestException:
-            raise CatalogSyncError("public_visibility_fetch_failed") from None
-        if 300 <= response.status_code < 400:
-            raise CatalogSyncError("public_visibility_redirect_rejected")
-        if response.status_code == 404:
-            raise CatalogSyncError("public_visibility_not_found")
-        if response.status_code != 200:
-            raise CatalogSyncError("public_visibility_fetch_failed")
-        try:
-            body = response.json()
-        except (TypeError, ValueError):
-            raise CatalogSyncError("public_visibility_response_invalid") from None
-        if not isinstance(body, dict) or not isinstance(body.get("subtitles"), list):
-            raise CatalogSyncError("public_visibility_response_invalid")
-        if body.get("canonicalCode") != canonical:
-            raise CatalogSyncError("public_visibility_mismatch")
-        matching = [
-            row
-            for row in body["subtitles"]
-            if isinstance(row, dict) and row.get("id") == expected_subtitle_id
-        ]
-        if len(matching) != 1:
-            raise CatalogSyncError("public_visibility_mismatch")
+        result = self.public_visibility_client.check(
+            canonical,
+            expected_subtitle_id,
+            expected_content_sha256,
+        )
+        if result.status is VisibilityStatus.VISIBLE:
+            return
+        if result.status is VisibilityStatus.NOT_FOUND:
+            reason_code = "public_visibility_not_found"
+        elif result.status is VisibilityStatus.FETCH_FAILED:
+            reason_code = result.reason_code or "public_visibility_fetch_failed"
+        elif result.status is VisibilityStatus.RESPONSE_INVALID:
+            reason_code = "public_visibility_response_invalid"
+        else:
+            reason_code = "public_visibility_mismatch"
+        raise CatalogSyncError(reason_code)
 
     @staticmethod
     def _exact_int(value: object, expected: int) -> bool:

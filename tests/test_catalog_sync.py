@@ -61,6 +61,31 @@ def valid_current_body() -> dict[str, object]:
     }
 
 
+def valid_v4_body() -> dict[str, object]:
+    active_keys = [
+        f"movie:full:v4:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    ]
+    return {
+        "success": True,
+        "requested": 1,
+        "synced": 1,
+        "failed": [],
+        "cacheSchemaVersion": "v4",
+        "results": [
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "d1RowsUpdated": 1,
+                "d1Verified": True,
+                "subtitleCount": 1,
+                "kvAction": "written",
+                "kvKeysTouched": active_keys.copy(),
+                "kvKeysDeleted": active_keys.copy(),
+            }
+        ],
+    }
+
+
 def valid_public_body() -> dict[str, object]:
     return {
         "canonicalCode": CANONICAL_CODE,
@@ -216,6 +241,134 @@ def test_sync_accepts_current_catalog_response_schema():
             f"movie:light:{CANONICAL_CODE}-uncensored-leak",
         ),
     )
+
+
+def test_sync_accepts_strengthened_v4_catalog_response_schema():
+    result = sync_with_response(200, body=valid_v4_body())
+
+    assert result == CatalogSyncResult(
+        canonical_code=CANONICAL_CODE,
+        d1_rows_updated=1,
+        subtitle_count=1,
+        kv_keys_deleted=(
+            f"movie:full:v4:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+        ),
+    )
+
+
+def test_sync_accepts_other_positive_integer_cache_schema_version():
+    body = valid_v4_body()
+    active_keys = [
+        f"movie:full:v12:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    ]
+    body["cacheSchemaVersion"] = "v12"
+    body["results"][0]["kvKeysTouched"] = active_keys.copy()
+    body["results"][0]["kvKeysDeleted"] = active_keys.copy()
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == tuple(active_keys)
+
+
+def v4_response_mutations() -> list[tuple[str, object]]:
+    return [
+        ("zero schema version", lambda body: body.update(cacheSchemaVersion="v0")),
+        ("padded schema version", lambda body: body.update(cacheSchemaVersion="v01")),
+        ("arbitrary schema version", lambda body: body.update(cacheSchemaVersion="latest")),
+        (
+            "non-string schema version",
+            lambda body: (
+                body.update(cacheSchemaVersion=4),
+                body["results"][0].update(
+                    kvKeysTouched=[
+                        f"movie:full:4:{CANONICAL_CODE}",
+                        f"movie:light:{CANONICAL_CODE}",
+                    ],
+                    kvKeysDeleted=[
+                        f"movie:full:4:{CANONICAL_CODE}",
+                        f"movie:light:{CANONICAL_CODE}",
+                    ],
+                ),
+            ),
+        ),
+        (
+            "D1 verification false",
+            lambda body: body["results"][0].update(d1Verified=False),
+        ),
+        (
+            "D1 verification non-bool",
+            lambda body: body["results"][0].update(d1Verified=1),
+        ),
+        (
+            "bad KV action",
+            lambda body: body["results"][0].update(kvAction="replaced"),
+        ),
+        (
+            "unequal KV arrays",
+            lambda body: body["results"][0].update(
+                kvKeysDeleted=[f"movie:light:{CANONICAL_CODE}"]
+            ),
+        ),
+        (
+            "missing result key",
+            lambda body: body["results"][0].pop("d1Verified"),
+        ),
+        (
+            "extra result key",
+            lambda body: body["results"][0].update(extra=ADULT_TEXT),
+        ),
+        ("missing top-level key", lambda body: body.pop("cacheSchemaVersion")),
+        ("extra top-level key", lambda body: body.update(extra=ADULT_TEXT)),
+        (
+            "unversioned full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+            ),
+        ),
+        (
+            "wrong full-key version",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+            ),
+        ),
+        (
+            "extra active key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=body["results"][0]["kvKeysTouched"]
+                + [f"movie:light:{CANONICAL_CODE}-subtitle"],
+                kvKeysDeleted=body["results"][0]["kvKeysDeleted"]
+                + [f"movie:light:{CANONICAL_CODE}-subtitle"],
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("_name,mutate", v4_response_mutations(), ids=lambda value: str(value))
+def test_malformed_strengthened_v4_response_is_rejected(_name, mutate):
+    body = valid_v4_body()
+    mutate(body)
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+    assert ADULT_TEXT not in repr(raised.value)
 
 
 def test_sync_accepts_versioned_full_cache_key_from_deployed_catalog():
@@ -481,7 +634,10 @@ def test_public_movie_verification_accepts_real_public_subtitle_shape():
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ({"canonicalCode": "abc-123", "subtitles": []}, "public_visibility_mismatch"),
+        (
+            {"canonicalCode": "abc-123", "subtitles": []},
+            "public_visibility_response_invalid",
+        ),
         ({"canonicalCode": CANONICAL_CODE, "subtitles": []}, "public_visibility_mismatch"),
         (
             {
@@ -498,6 +654,10 @@ def test_public_movie_verification_accepts_real_public_subtitle_shape():
                 "canonicalCode": CANONICAL_CODE,
                 "subtitles": "not-an-array",
             },
+            "public_visibility_response_invalid",
+        ),
+        (
+            {"canonicalCode": CANONICAL_CODE, "subtitles": [{"id": 123}]},
             "public_visibility_response_invalid",
         ),
         ([], "public_visibility_response_invalid"),
