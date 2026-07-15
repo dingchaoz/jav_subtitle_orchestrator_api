@@ -1520,3 +1520,97 @@ def load_audit_report(path: str | os.PathLike[str]) -> AuditReport:
             "audit report",
         )
     )
+
+
+def load_private_json_artifact(
+    path: str | os.PathLike[str],
+    *,
+    label: str,
+    limit: int,
+) -> object:
+    """Load one private JSON artifact through the descriptor-pinned storage layer."""
+    if not isinstance(label, str) or not label:
+        raise ValueError("artifact label is invalid")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError("artifact size limit is invalid")
+    return _decode_json(
+        _safe_read_bytes(
+            Path(path),
+            label,
+            recover_owned_temp=True,
+            limit=limit,
+        ),
+        label,
+    )
+
+
+def write_private_json_artifact(
+    path: str | os.PathLike[str],
+    payload: object,
+    *,
+    label: str,
+    limit: int,
+) -> None:
+    """Canonically install a private JSON artifact, idempotently and without clobber."""
+    if not isinstance(label, str) or not label:
+        raise ValueError("artifact label is invalid")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError("artifact size limit is invalid")
+    data = _canonical_bytes(payload)
+    parent, name = _leaf_parent(path)
+    with _pinned_directory(parent, create=True) as directory_fd:
+        fcntl.flock(directory_fd, fcntl.LOCK_EX)
+        installed = _atomic_install_no_clobber(
+            directory_fd,
+            name,
+            data,
+            label,
+            limit,
+        )
+        if installed:
+            return
+        descriptor = _open_artifact_leaf(
+            directory_fd,
+            name,
+            os.O_RDWR,
+            label,
+        )
+        try:
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=None,
+            )
+            existing = _read_fd_limited(descriptor, label, limit)
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=None,
+            )
+            if not hmac.compare_digest(existing, data):
+                raise ValueError(f"existing {label} differs")
+            os.fchmod(descriptor, 0o600)
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=0o600,
+            )
+            os.fsync(descriptor)
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=0o600,
+            )
+        except BaseException:
+            _close_ignoring_error(descriptor)
+            raise
+        else:
+            os.close(descriptor)
