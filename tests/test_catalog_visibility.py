@@ -108,6 +108,22 @@ def test_origin_normalization_rejects_malformed_ports(base_url: str):
         normalize_catalog_api_origin(base_url)
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://example.com\x00",
+        "https://example.com\\evil",
+    ],
+)
+def test_origin_normalization_rejects_invalid_hostname_characters(base_url: str):
+    with pytest.raises(ValueError) as raised:
+        normalize_catalog_api_origin(base_url)
+
+    assert str(raised.value) == "catalog API base URL is invalid"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 @pytest.mark.parametrize("timeout", [0, -1, True, math.nan])
 def test_timeout_must_be_a_positive_non_bool_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):

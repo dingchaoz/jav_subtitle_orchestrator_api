@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -35,6 +36,35 @@ class VisibilitySession(Protocol):
     def get(self, url: str, **kwargs: Any) -> Any: ...
 
 
+def _valid_hostname(hostname: str) -> bool:
+    if ":" in hostname:
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ipaddress.AddressValueError:
+            return False
+        return True
+
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if ascii_hostname.endswith("."):
+        ascii_hostname = ascii_hostname[:-1]
+    labels = ascii_hostname.split(".")
+    return (
+        bool(ascii_hostname)
+        and len(ascii_hostname) <= 253
+        and all(
+            label
+            and len(label) <= 63
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        )
+    )
+
+
 def normalize_catalog_api_origin(base_url: str) -> str:
     if (
         not isinstance(base_url, str)
@@ -63,6 +93,7 @@ def normalize_catalog_api_origin(base_url: str) -> str:
         not valid_transport
         or not parsed.netloc
         or not hostname
+        or not _valid_hostname(hostname)
         or has_credentials
         or parsed.netloc.endswith(":")
         or parsed.path not in {"", "/"}

@@ -306,6 +306,22 @@ def v4_response_mutations() -> list[tuple[str, object]]:
             lambda body: body["results"][0].update(kvAction="replaced"),
         ),
         (
+            "array KV action",
+            lambda body: body["results"][0].update(kvAction=[]),
+        ),
+        (
+            "object KV action",
+            lambda body: body["results"][0].update(kvAction={}),
+        ),
+        (
+            "numeric KV action",
+            lambda body: body["results"][0].update(kvAction=1),
+        ),
+        (
+            "null KV action",
+            lambda body: body["results"][0].update(kvAction=None),
+        ),
+        (
             "unequal KV arrays",
             lambda body: body["results"][0].update(
                 kvKeysDeleted=[f"movie:light:{CANONICAL_CODE}"]

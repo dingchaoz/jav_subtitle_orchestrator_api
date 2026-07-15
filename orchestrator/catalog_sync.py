@@ -260,6 +260,7 @@ class CatalogSyncClient:
             cache_schema_version = body.get("cacheSchemaVersion")
             kv_keys_touched = row.get("kvKeysTouched")
             kv_keys_deleted = row.get("kvKeysDeleted")
+            kv_action = row.get("kvAction")
             version_valid = isinstance(cache_schema_version, str) and re.fullmatch(
                 r"v[1-9][0-9]*", cache_schema_version
             )
@@ -270,8 +271,8 @@ class CatalogSyncClient:
             row_schema_valid = (
                 bool(version_valid)
                 and row.get("d1Verified") is True
-                and row.get("kvAction")
-                in {"written", "deleted_for_d1_fallback", "unchanged"}
+                and isinstance(kv_action, str)
+                and kv_action in {"written", "deleted_for_d1_fallback", "unchanged"}
                 and isinstance(kv_keys_touched, list)
                 and isinstance(kv_keys_deleted, list)
                 and kv_keys_touched == kv_keys_deleted
