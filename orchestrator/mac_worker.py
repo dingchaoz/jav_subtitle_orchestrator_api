@@ -422,7 +422,12 @@ class MacTranslationWorker:
     def _process_claimed_stage(self, job: JobRecord) -> bool:
         if job.status is JobStatus.PUBLISHING:
             return self._process_claimed_publication(job)
-        if job.status is JobStatus.CATALOG_SYNCING:
+        if (
+            job.status is JobStatus.ENGLISH_SRT_READY
+            and job.artifact_status == "ready"
+            and job.catalog_sync_status == "pending"
+            and job.catalog_lease_token is not None
+        ):
             return self._process_claimed_catalog_sync(job)
         raise RuntimeError("claimed Mac stage is invalid")
 
@@ -452,7 +457,7 @@ class MacTranslationWorker:
                 return True
         elif current.status not in {
             JobStatus.PUBLISH_PENDING,
-            JobStatus.CATALOG_SYNC_PENDING,
+            JobStatus.ENGLISH_SRT_READY,
         }:
             raise RuntimeError(
                 f"exact job {job_id} is not claimable from stage "
@@ -476,7 +481,11 @@ class MacTranslationWorker:
                 )
             self._process_claimed_publication(publication)
             current = self.store.get_job(job_id)
-            if current is None or current.status is not JobStatus.CATALOG_SYNC_PENDING:
+            if (
+                current is None
+                or current.status is not JobStatus.ENGLISH_SRT_READY
+                or current.catalog_sync_status != "pending"
+            ):
                 return True
         catalog_job = self.store.claim_catalog_sync_job(
             self.worker_id,
@@ -1657,6 +1666,10 @@ class MacTranslationWorker:
             self.consecutive_quality_failures = 0
         else:
             self.historical_quality_failures = 0
+            self.store.mark_historical_success(
+                job.id,
+                updated.published_content_sha256,
+            )
         _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -1677,9 +1690,6 @@ class MacTranslationWorker:
             pass
         error: str | None = None
         try:
-            historical = (
-                job.translation_origin == HISTORICAL_TRANSLATION_ORIGIN
-            )
             try:
                 result = self.catalog_sync_client.sync(
                     job.normalized_movie_number,
@@ -1691,75 +1701,15 @@ class MacTranslationWorker:
                     exc.reason_code if isinstance(exc, CatalogSyncError) else "catalog_sync_failed"
                 )
                 error = f"catalog_sync: {reason_code}"
-                if historical:
-                    repair = self.store.get_historical_repair(job.id)
-                    paths = build_job_paths(
-                        job.normalized_movie_number,
-                        self.store.jobs_root_mac,
-                        self.store.jobs_root_windows,
-                    )
-                    try:
-                        if repair is None:
-                            raise RuntimeError("historical_repair_missing")
-                        with exclusive_job_files_lock(
-                            self.store.jobs_root_mac,
-                            job.normalized_movie_number,
-                            blocking=True,
-                        ) as files_lock:
-                            self._require_historical_preservation_locked(
-                                files_lock, repair, paths
-                            )
-                    except (OSError, RuntimeError):
-                        error = "catalog_sync: preservation_hash_changed"
-                        try:
-                            updated = (
-                                self.store.fail_historical_catalog_after_side_effect(
-                                    job.id,
-                                    self.worker_id,
-                                    lease_token=job.catalog_lease_token,
-                                    reason_code="preservation_hash_changed",
-                                )
-                            )
-                        except CatalogLeaseLostError:
-                            error = "catalog_sync: catalog_lease_lost"
-                            _append_job_log_safely(
-                                Path(job.job_dir_mac),
-                                "mac-translation.log",
-                                f"catalog_lease_lost {job.id}",
-                            )
-                            return True
-                        _write_job_snapshot_safely(updated)
-                        _append_job_log_safely(
-                            Path(job.job_dir_mac),
-                            "mac-translation.log",
-                            f"historical_failed {job.id} "
-                            "reason_code=preservation_hash_changed",
-                        )
-                        return True
                 try:
-                    if historical:
-                        outcome = self.store.fail_historical_catalog_sync(
-                            job.id,
-                            self.worker_id,
-                            reason_code,
-                            lease_token=job.catalog_lease_token,
-                            max_catalog_sync_attempts=(
-                                self.max_catalog_sync_attempts
-                            ),
-                            retry_seconds=self.catalog_sync_retry_seconds,
-                        )
-                        updated = outcome.job
-                    else:
-                        updated = self.store.fail_catalog_sync(
-                            job.id,
-                            self.worker_id,
-                            reason_code,
-                            lease_token=job.catalog_lease_token,
-                            max_catalog_sync_attempts=(
-                                self.max_catalog_sync_attempts
-                            ),
-                            retry_seconds=self.catalog_sync_retry_seconds,
-                        )
+                    updated = self.store.fail_catalog_sync(
+                        job.id,
+                        self.worker_id,
+                        reason_code,
+                        lease_token=job.catalog_lease_token,
+                        max_catalog_sync_attempts=self.max_catalog_sync_attempts,
+                        retry_seconds=self.catalog_sync_retry_seconds,
+                    )
                 except CatalogLeaseLostError:
                     error = "catalog_sync: catalog_lease_lost"
                     _append_job_log_safely(
@@ -1775,49 +1725,6 @@ class MacTranslationWorker:
                         f"catalog_sync_failed {job.id} reason_code={reason_code}",
                     )
             else:
-                if historical:
-                    repair = self.store.get_historical_repair(job.id)
-                    paths = build_job_paths(
-                        job.normalized_movie_number,
-                        self.store.jobs_root_mac,
-                        self.store.jobs_root_windows,
-                    )
-                    try:
-                        if repair is None:
-                            raise RuntimeError("historical_repair_missing")
-                        with exclusive_job_files_lock(
-                            self.store.jobs_root_mac,
-                            job.normalized_movie_number,
-                            blocking=True,
-                        ) as files_lock:
-                            self._require_historical_preservation_locked(
-                                files_lock, repair, paths
-                            )
-                    except Exception:
-                        error = "catalog_sync: preservation_hash_changed"
-                        try:
-                            updated = self.store.fail_historical_catalog_after_side_effect(
-                                job.id,
-                                self.worker_id,
-                                lease_token=job.catalog_lease_token,
-                                reason_code="preservation_hash_changed",
-                            )
-                        except CatalogLeaseLostError:
-                            error = "catalog_sync: catalog_lease_lost"
-                            _append_job_log_safely(
-                                Path(job.job_dir_mac),
-                                "mac-translation.log",
-                                f"catalog_lease_lost {job.id}",
-                            )
-                            return True
-                        _write_job_snapshot_safely(updated)
-                        _append_job_log_safely(
-                            Path(job.job_dir_mac),
-                            "mac-translation.log",
-                            f"historical_failed {job.id} "
-                            "reason_code=preservation_hash_changed",
-                        )
-                        return True
                 try:
                     updated = self.store.complete_catalog_sync(
                         job.id,
@@ -1836,16 +1743,6 @@ class MacTranslationWorker:
                         f"catalog_lease_lost {job.id}",
                     )
                 else:
-                    if historical:
-                        repair = self.store.get_historical_repair(job.id)
-                        if (
-                            repair is not None
-                            and repair.state is HistoricalRepairState.RUNNING
-                        ):
-                            self.store.mark_historical_success(
-                                job.id,
-                                job.published_content_sha256,
-                            )
                     _write_job_snapshot_safely(updated)
                     _append_job_log_safely(
                         Path(job.job_dir_mac),
