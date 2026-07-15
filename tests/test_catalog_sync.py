@@ -6,6 +6,7 @@ from dataclasses import fields
 import pytest
 import requests
 
+from orchestrator.catalog_visibility import MAX_CATALOG_TIMEOUT_SECONDS
 from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, CatalogSyncResult
 
 
@@ -610,7 +611,17 @@ def test_admin_token_must_be_nonempty_string(token):
 
 @pytest.mark.parametrize(
     "timeout",
-    [0, -1, True, math.nan, math.inf, -math.inf],
+    [
+        0,
+        -1,
+        True,
+        math.nan,
+        math.inf,
+        -math.inf,
+        MAX_CATALOG_TIMEOUT_SECONDS + 1,
+        MAX_CATALOG_TIMEOUT_SECONDS + 0.1,
+        1e20,
+    ],
 )
 def test_timeout_must_be_positive_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):
@@ -619,7 +630,7 @@ def test_timeout_must_be_positive_number(timeout):
         )
 
 
-@pytest.mark.parametrize("timeout", [1, 0.25])
+@pytest.mark.parametrize("timeout", [1, 0.25, 300, 300.0])
 def test_sync_accepts_positive_finite_timeout(timeout):
     client = CatalogSyncClient(
         "https://javsubtitle.example",
@@ -629,6 +640,21 @@ def test_sync_accepts_positive_finite_timeout(timeout):
     )
 
     assert client.timeout_seconds == timeout
+
+
+def test_sync_endpoint_uses_requests_aligned_idn_origin_for_bearer_request():
+    session = FakeSession()
+    client = CatalogSyncClient("https://faß.de", TOKEN, session=session)
+
+    result = sync(client)
+
+    assert result.canonical_code == CANONICAL_CODE
+    assert client.base_url == "https://xn--fa-hia.de"
+    assert client.endpoint == (
+        "https://xn--fa-hia.de/api/admin/catalog/sync-subtitles"
+    )
+    assert session.requests[0][0] == client.endpoint
+    assert session.requests[0][1]["headers"]["Authorization"] == f"Bearer {TOKEN}"
 
 
 def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():

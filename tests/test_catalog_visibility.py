@@ -7,6 +7,7 @@ import pytest
 import requests
 
 from orchestrator.catalog_visibility import (
+    MAX_CATALOG_TIMEOUT_SECONDS,
     PublicCatalogVisibilityClient,
     PublicVisibilityResult,
     VisibilityStatus,
@@ -182,7 +183,17 @@ def test_origin_normalization_rejects_invalid_hostname_characters(base_url: str)
 
 @pytest.mark.parametrize(
     "timeout",
-    [0, -1, True, math.nan, math.inf, -math.inf],
+    [
+        0,
+        -1,
+        True,
+        math.nan,
+        math.inf,
+        -math.inf,
+        MAX_CATALOG_TIMEOUT_SECONDS + 1,
+        MAX_CATALOG_TIMEOUT_SECONDS + 0.1,
+        1e20,
+    ],
 )
 def test_timeout_must_be_a_positive_non_bool_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):
@@ -191,8 +202,9 @@ def test_timeout_must_be_a_positive_non_bool_number(timeout):
         )
 
 
-@pytest.mark.parametrize("timeout", [1, 0.25])
+@pytest.mark.parametrize("timeout", [1, 0.25, 300, 300.0])
 def test_positive_finite_timeout_is_preserved(timeout):
+    assert MAX_CATALOG_TIMEOUT_SECONDS == 300
     client = PublicCatalogVisibilityClient(
         "https://javsubtitle.example", timeout_seconds=timeout, session=FakeSession()
     )
@@ -221,21 +233,32 @@ def test_requests_prepares_exact_validated_url_and_receives_finite_timeout():
     assert kwargs["allow_redirects"] is False
 
 
-def test_requests_prepares_valid_nfkc_stable_unicode_idn_as_ascii():
+@pytest.mark.parametrize(
+    ("hostname", "ascii_hostname"),
+    [
+        ("faß.de", "xn--fa-hia.de"),
+        ("βόλος.com", "xn--nxasmm1c.com"),
+        ("例え.テスト", "xn--r8jz45g.xn--zckzah"),
+    ],
+)
+def test_requests_and_origin_normalization_agree_on_unicode_idn_destination(
+    hostname: str,
+    ascii_hostname: str,
+):
     session = PreparedRequestSession()
     client = PublicCatalogVisibilityClient(
-        "https://例え.テスト",
+        f"https://{hostname}",
         session=session,
     )
 
     result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
 
     assert result.status is VisibilityStatus.NOT_FOUND
-    assert client.base_url == "https://xn--r8jz45g.xn--zckzah"
+    assert client.base_url == f"https://{ascii_hostname}"
     assert len(session.sent) == 1
     request, _kwargs = session.sent[0]
     assert request.url == (
-        f"https://xn--r8jz45g.xn--zckzah/api/movie/{CANONICAL_CODE}"
+        f"https://{ascii_hostname}/api/movie/{CANONICAL_CODE}"
         f"?cacheNonce={CONTENT_SHA256}"
     )
 
