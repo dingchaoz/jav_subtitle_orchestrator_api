@@ -5,7 +5,9 @@ import json
 import os
 import sqlite3
 import stat
-from dataclasses import asdict, FrozenInstanceError, replace
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 from pathlib import Path
 
 import pytest
@@ -108,6 +110,61 @@ def _one_missing_report(tmp_path: Path, store: JobStore, job):
     return report_dir / "audit-report.json", report
 
 
+def _one_missing_plan(tmp_path: Path, store: JobStore, job):
+    from orchestrator.catalog_visibility_repair import plan_catalog_visibility_repair
+
+    report_path, _ = _one_missing_report(tmp_path, store, job)
+    plan = plan_catalog_visibility_repair(
+        store,
+        report_path,
+        expected_api_origin=API_ORIGIN,
+        output_dir=tmp_path / "plan",
+    )
+    return plan
+
+
+def _missing_plan_for_jobs(tmp_path: Path, store: JobStore, jobs):
+    from orchestrator.catalog_visibility_repair import plan_catalog_visibility_repair
+
+    report_dir = tmp_path / "report"
+    _write_report(
+        report_dir,
+        store,
+        [
+            (AuditCandidateSnapshot.from_job(job), "missing")
+            for job in jobs
+        ],
+    )
+    return plan_catalog_visibility_repair(
+        store,
+        report_dir / "audit-report.json",
+        expected_api_origin=API_ORIGIN,
+        output_dir=tmp_path / "plan",
+    )
+
+
+class _RecordingSyncClient:
+    def __init__(self, errors: list[Exception | None] | None = None) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.errors = list(errors or [])
+
+    def sync(
+        self,
+        movie_code: str,
+        *,
+        expected_subtitle_id: str,
+        expected_content_sha256: str,
+    ) -> object:
+        self.calls.append(
+            (movie_code, expected_subtitle_id, expected_content_sha256)
+        )
+        if self.errors:
+            error = self.errors.pop(0)
+            if error is not None:
+                raise error
+        return object()
+
+
 def _rewrite_with_digest(path: Path, payload: dict[str, object], digest_field: str) -> None:
     unsigned = dict(payload)
     unsigned.pop(digest_field, None)
@@ -129,6 +186,833 @@ def test_catalog_visibility_repair_module_exposes_public_api():
     assert RepairPlanItem is not None
     assert callable(load_catalog_visibility_repair_plan)
     assert callable(plan_catalog_visibility_repair)
+
+
+def test_execution_result_has_exact_frozen_slotted_shape():
+    from orchestrator.catalog_visibility_repair import RepairExecutionResult
+
+    assert [field.name for field in fields(RepairExecutionResult)] == [
+        "action",
+        "repaired",
+        "failed",
+        "skipped_receipt_changed",
+        "stopped_reason",
+        "receipt_path",
+    ]
+    result = RepairExecutionResult(
+        action="dry_run",
+        repaired=(),
+        failed=(),
+        skipped_receipt_changed=(),
+        stopped_reason=None,
+        receipt_path=Path("receipt.jsonl"),
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.action = "executed"  # type: ignore[misc]
+    assert not hasattr(result, "__dict__")
+
+
+def test_execute_dry_run_is_inert_and_confirmation_mismatch_precedes_artifacts(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import (
+        execute_catalog_visibility_repair,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    output_dir = tmp_path / "execution"
+
+    dry_run = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=output_dir,
+    )
+
+    assert dry_run.action == "dry_run"
+    assert dry_run.repaired == ()
+    assert client.calls == []
+    assert not output_dir.exists()
+
+    with pytest.raises(ValueError, match="^confirm_report_sha256 mismatch$"):
+        execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256="0" * 64,
+        )
+    assert client.calls == []
+    assert not output_dir.exists()
+
+
+def test_execute_calls_exact_sync_once_and_does_not_change_job_row(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import (
+        execute_catalog_visibility_repair,
+    )
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    item = plan.items[0]
+    client = _RecordingSyncClient()
+    with store.connection() as conn:
+        before = tuple(conn.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone())
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    with store.connection() as conn:
+        after = tuple(conn.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone())
+    assert client.calls == [
+        (
+            item.receipt.movie_code,
+            item.receipt.subtitle_id,
+            item.receipt.content_sha256,
+        )
+    ]
+    assert after == before
+    assert result.action == "executed"
+    assert result.repaired == ("abc-001",)
+    assert result.failed == ()
+    assert result.receipt_path.is_file()
+    row = json.loads(result.receipt_path.read_text())
+    assert set(row) == {
+        "report_sha256",
+        "job_id",
+        "movie_code",
+        "expected_subtitle_id",
+        "starting_status",
+        "outcome",
+        "reason_code",
+        "finished_at",
+    }
+    assert row["outcome"] == "repaired"
+    assert row["reason_code"] is None
+
+
+@pytest.mark.parametrize("change", ["changed", "deleted", "not_ready", "invalid"])
+def test_execute_rechecks_receipt_and_classifies_changed_without_sync(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    change: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    with store.connection() as conn:
+        if change == "deleted":
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
+        elif change == "not_ready":
+            conn.execute(
+                "UPDATE jobs SET status = ? WHERE id = ?",
+                (JobStatus.FAILED.value, job.id),
+            )
+        elif change == "invalid":
+            conn.execute(
+                "UPDATE jobs SET published_subtitle_id = NULL WHERE id = ?",
+                (job.id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET updated_at = ? WHERE id = ?",
+                ("2026-07-15T11:00:00+00:00", job.id),
+            )
+    client = _RecordingSyncClient()
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    assert client.calls == []
+    assert result.repaired == ()
+    assert result.failed == ()
+    assert result.skipped_receipt_changed == ("abc-001",)
+    row = json.loads(result.receipt_path.read_text())
+    assert row["outcome"] == "skipped_receipt_changed"
+    assert row["reason_code"] == "receipt_changed"
+
+
+def test_auth_failure_stops_immediately_and_records_only_safe_code(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [_ready_job(store, f"abc-{index:03d}", index) for index in range(1, 4)]
+    plan = _missing_plan_for_jobs(tmp_path, store, jobs)
+    client = _RecordingSyncClient([CatalogSyncError("catalog_auth_failed")])
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    assert [call[0] for call in client.calls] == ["abc-001"]
+    assert result.failed == ("abc-001",)
+    assert result.stopped_reason == "catalog_auth_failed"
+    serialized = result.receipt_path.read_text()
+    assert "catalog_auth_failed" in serialized
+    assert str(client.errors) not in serialized
+
+
+def test_three_consecutive_remote_failures_stop_before_fourth(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [_ready_job(store, f"abc-{index:03d}", index) for index in range(1, 5)]
+    plan = _missing_plan_for_jobs(tmp_path, store, jobs)
+    client = _RecordingSyncClient(
+        [CatalogSyncError("catalog_fetch_failed") for _ in range(4)]
+    )
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    assert [call[0] for call in client.calls] == ["abc-001", "abc-002", "abc-003"]
+    assert result.failed == ("abc-001", "abc-002", "abc-003")
+    assert result.stopped_reason == "consecutive_remote_failures"
+
+
+def test_success_resets_consecutive_failure_breaker_and_visibility_failure_is_failure(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [_ready_job(store, f"abc-{index:03d}", index) for index in range(1, 7)]
+    plan = _missing_plan_for_jobs(tmp_path, store, jobs)
+    client = _RecordingSyncClient(
+        [
+            CatalogSyncError("public_visibility_mismatch"),
+            CatalogSyncError("catalog_fetch_failed"),
+            None,
+            CatalogSyncError("catalog_fetch_failed"),
+            CatalogSyncError("catalog_fetch_failed"),
+            None,
+        ]
+    )
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    assert len(client.calls) == 6
+    assert result.repaired == ("abc-003", "abc-006")
+    assert result.failed == ("abc-001", "abc-002", "abc-004", "abc-005")
+    assert result.stopped_reason is None
+    first = json.loads(result.receipt_path.read_text().splitlines()[0])
+    assert first["outcome"] == "failed"
+    assert first["reason_code"] == "public_visibility_mismatch"
+
+
+def test_completed_terminal_receipt_is_skipped_on_resume(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+
+    first = execute_catalog_visibility_repair(store, plan, **arguments)
+    original = first.receipt_path.read_bytes()
+    second = execute_catalog_visibility_repair(store, plan, **arguments)
+
+    assert len(client.calls) == 1
+    assert second == first
+    assert second.receipt_path.read_bytes() == original
+
+
+def test_truncated_trailing_receipt_fragment_is_recovered_without_repeat_sync(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    first = execute_catalog_visibility_repair(store, plan, **arguments)
+    complete = first.receipt_path.read_bytes()
+    with first.receipt_path.open("ab") as stream:
+        stream.write(b'{"report_sha256":"partial')
+
+    resumed = execute_catalog_visibility_repair(store, plan, **arguments)
+
+    assert len(client.calls) == 1
+    assert resumed.repaired == ("abc-001",)
+    assert resumed.receipt_path.read_bytes() == complete
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["cross_plan", "extra", "duplicate_key", "bad_outcome", "duplicate_row"],
+)
+def test_resume_rejects_tampered_or_conflicting_terminal_receipts(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    tamper: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    result = execute_catalog_visibility_repair(store, plan, **arguments)
+    original = result.receipt_path.read_text()
+    row = json.loads(original)
+    if tamper == "cross_plan":
+        row["report_sha256"] = "0" * 64
+        replacement = _canonical_bytes(row) + b"\n"
+    elif tamper == "extra":
+        row["admin_token"] = "SENTINELVALUE"
+        replacement = _canonical_bytes(row) + b"\n"
+    elif tamper == "duplicate_key":
+        replacement = original.replace(
+            '"outcome":"repaired"',
+            '"outcome":"repaired","outcome":"repaired"',
+        ).encode()
+    elif tamper == "bad_outcome":
+        row["outcome"] = "repaired"
+        row["reason_code"] = "catalog_fetch_failed"
+        replacement = _canonical_bytes(row) + b"\n"
+    else:
+        replacement = original.encode() * 2
+    result.receipt_path.write_bytes(replacement)
+
+    with pytest.raises(ValueError, match="repair execution receipt"):
+        execute_catalog_visibility_repair(store, plan, **arguments)
+    assert len(client.calls) == 1
+
+
+def test_resume_rejects_oversize_receipt_before_sync(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    import orchestrator.catalog_visibility_repair as repair_module
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    output_dir = tmp_path / "execution"
+    output_dir.mkdir(mode=0o700)
+    output_dir.chmod(0o700)
+    receipt = output_dir / "repair-execution.jsonl"
+    with receipt.open("wb") as stream:
+        stream.truncate(repair_module._MAX_EXECUTION_RECEIPT_BYTES + 1)
+    receipt.chmod(0o600)
+    client = _RecordingSyncClient()
+
+    with pytest.raises(ValueError, match="too large"):
+        repair_module.execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "permissions"])
+def test_execute_rejects_unsafe_receipt_filesystem_leaf(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    attack: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    output_dir = tmp_path / "execution"
+    output_dir.mkdir(mode=0o700)
+    receipt = output_dir / "repair-execution.jsonl"
+    victim = tmp_path / "victim"
+    victim.write_text("do-not-touch")
+    victim.chmod(0o600)
+    if attack == "symlink":
+        receipt.symlink_to(victim)
+    elif attack == "hardlink":
+        os.link(victim, receipt)
+    else:
+        receipt.write_bytes(b"")
+        receipt.chmod(0o644)
+    client = _RecordingSyncClient()
+
+    with pytest.raises(ValueError):
+        execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    assert client.calls == []
+    assert victim.read_text() == "do-not-touch"
+
+
+def test_persisted_claim_prevents_repeat_sync_after_terminal_append_crash(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import orchestrator.catalog_visibility_repair as repair_module
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    original_append = repair_module._append_execution_row_at
+
+    def crash_before_terminal(*args: object, **kwargs: object) -> None:
+        raise OSError("simulated terminal append crash")
+
+    monkeypatch.setattr(repair_module, "_append_execution_row_at", crash_before_terminal)
+    with pytest.raises(OSError, match="terminal append crash"):
+        repair_module.execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=tmp_path / "execution",
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    monkeypatch.setattr(repair_module, "_append_execution_row_at", original_append)
+
+    resumed = repair_module.execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    assert len(client.calls) == 1
+    assert resumed.repaired == ()
+    assert resumed.failed == ()
+    assert resumed.stopped_reason == "unresolved_claim"
+
+
+def test_concurrent_executors_claim_once_and_return_same_deterministic_result(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    entered = threading.Event()
+    release = threading.Event()
+    original_sync = client.sync
+
+    def blocking_sync(*args: object, **kwargs: object):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_sync(*args, **kwargs)
+
+    client.sync = blocking_sync  # type: ignore[method-assign]
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(execute_catalog_visibility_repair, store, plan, **arguments)
+        assert entered.wait(timeout=5)
+        second_future = pool.submit(execute_catalog_visibility_repair, store, plan, **arguments)
+        release.set()
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+
+    assert len(client.calls) == 1
+    assert first == second
+
+
+@pytest.mark.parametrize("journal", ["terminal", "claim"])
+def test_resume_rejects_noncanonical_journal_timestamp(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    journal: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    result = execute_catalog_visibility_repair(store, plan, **arguments)
+    path = (
+        result.receipt_path
+        if journal == "terminal"
+        else result.receipt_path.with_name("repair-execution-claims.jsonl")
+    )
+    row = json.loads(path.read_text())
+    timestamp_field = "finished_at" if journal == "terminal" else "claimed_at"
+    row[timestamp_field] = "2026-07-15T10:00:00Z"
+    path.write_bytes(_canonical_bytes(row) + b"\n")
+
+    with pytest.raises(ValueError, match="timestamp"):
+        execute_catalog_visibility_repair(store, plan, **arguments)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "3"])
+def test_execute_rejects_invalid_failure_limit_before_artifact_mutation(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    limit: object,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    output_dir = tmp_path / "execution"
+
+    with pytest.raises(ValueError, match="positive integer"):
+        execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+            consecutive_failure_limit=limit,  # type: ignore[arg-type]
+        )
+    assert client.calls == []
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("execute_value", [1, "true", None])
+def test_non_boolean_execute_flag_cannot_authorize_sync(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    execute_value: object,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    output_dir = tmp_path / "execution"
+
+    with pytest.raises(ValueError, match="execute must be a boolean"):
+        execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=execute_value,  # type: ignore[arg-type]
+            confirm_report_sha256=plan.report_sha256,
+        )
+    assert client.calls == []
+    assert not output_dir.exists()
+
+
+def test_execute_rejects_caller_forged_plan_before_artifact_mutation(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    forged = replace(plan, plan_sha256="0" * 64)
+    client = _RecordingSyncClient()
+    output_dir = tmp_path / "execution"
+
+    with pytest.raises(ValueError, match="persisted artifact"):
+        execute_catalog_visibility_repair(
+            store,
+            forged,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    assert client.calls == []
+    assert not output_dir.exists()
+
+
+def test_partial_terminal_append_rolls_back_and_durable_claim_blocks_repeat(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import orchestrator.catalog_visibility_repair as repair_module
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    real_write = os.write
+    journal_writes = 0
+
+    def fail_second_journal_write(descriptor: int, data: bytes) -> int:
+        nonlocal journal_writes
+        if b'"report_sha256"' in data and data.endswith(b"\n"):
+            journal_writes += 1
+            if journal_writes == 2:
+                real_write(descriptor, data[: len(data) // 2])
+                raise OSError("simulated partial terminal append")
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(repair_module.os, "write", fail_second_journal_write)
+    with pytest.raises(OSError, match="partial terminal append"):
+        repair_module.execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=tmp_path / "execution",
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    monkeypatch.setattr(repair_module.os, "write", real_write)
+    receipt = tmp_path / "execution" / "repair-execution.jsonl"
+    assert receipt.read_bytes() == b""
+
+    resumed = repair_module.execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+    assert len(client.calls) == 1
+    assert resumed.stopped_reason == "unresolved_claim"
+
+
+def test_execution_journals_redact_credentials_exception_text_and_content_hash(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    sentinel = "SENTINELVALUE-never-persist"
+    monkeypatch.setenv("ADMIN_TOKEN", sentinel)
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    content_hash = plan.items[0].receipt.content_sha256
+    client = _RecordingSyncClient([CatalogSyncError(sentinel)])
+
+    result = execute_catalog_visibility_repair(
+        store,
+        plan,
+        sync_client=client,
+        output_dir=tmp_path / "execution",
+        execute=True,
+        confirm_report_sha256=plan.report_sha256,
+    )
+
+    serialized = result.receipt_path.read_text() + result.receipt_path.with_name(
+        "repair-execution-claims.jsonl"
+    ).read_text()
+    assert sentinel not in serialized
+    assert content_hash not in serialized
+    assert "signed_url" not in serialized
+    assert "00:00:00,000 -->" not in serialized
+    assert result.failed == ("abc-001",)
+
+
+def test_execution_forces_private_journal_modes_under_restrictive_umask(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    output_dir = tmp_path / "execution"
+    output_dir.mkdir(mode=0o700)
+    previous_umask = os.umask(0o777)
+    try:
+        result = execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    claims_path = result.receipt_path.with_name("repair-execution-claims.jsonl")
+    assert stat.S_IMODE(result.receipt_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(claims_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("tamper", ["cross_plan", "extra", "duplicate_key", "duplicate_row"])
+def test_resume_rejects_tampered_or_conflicting_claim_journal(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    tamper: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    client = _RecordingSyncClient()
+    arguments = {
+        "sync_client": client,
+        "output_dir": tmp_path / "execution",
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    result = execute_catalog_visibility_repair(store, plan, **arguments)
+    claims_path = result.receipt_path.with_name("repair-execution-claims.jsonl")
+    original = claims_path.read_text()
+    row = json.loads(original)
+    if tamper == "cross_plan":
+        row["plan_sha256"] = "0" * 64
+        replacement = _canonical_bytes(row) + b"\n"
+    elif tamper == "extra":
+        row["admin_token"] = "SENTINELVALUE"
+        replacement = _canonical_bytes(row) + b"\n"
+    elif tamper == "duplicate_key":
+        replacement = original.replace(
+            '"schema_version":1',
+            '"schema_version":1,"schema_version":1',
+        ).encode()
+    else:
+        replacement = original.encode() * 2
+    claims_path.write_bytes(replacement)
+
+    with pytest.raises(ValueError, match="repair execution claim"):
+        execute_catalog_visibility_repair(store, plan, **arguments)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "permissions"])
+def test_execute_rejects_unsafe_claim_filesystem_leaf(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    attack: str,
+):
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    output_dir = tmp_path / "execution"
+    output_dir.mkdir(mode=0o700)
+    receipt = output_dir / "repair-execution.jsonl"
+    receipt.write_bytes(b"")
+    receipt.chmod(0o600)
+    claims = output_dir / "repair-execution-claims.jsonl"
+    victim = tmp_path / "claim-victim"
+    victim.write_text("do-not-touch")
+    victim.chmod(0o600)
+    if attack == "symlink":
+        claims.symlink_to(victim)
+    elif attack == "hardlink":
+        os.link(victim, claims)
+    else:
+        claims.write_bytes(b"")
+        claims.chmod(0o644)
+    client = _RecordingSyncClient()
+
+    with pytest.raises(ValueError):
+        execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=output_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+    assert client.calls == []
+    assert victim.read_text() == "do-not-touch"
 
 
 @pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
