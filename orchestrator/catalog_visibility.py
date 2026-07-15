@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import requests
 
 from orchestrator.movie_code import canonical_movie_code
+from orchestrator.store import JobRecord, validate_verified_supabase_receipt
 
 
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -24,6 +25,86 @@ class VisibilityStatus(str, Enum):
     FETCH_FAILED = "fetch_failed"
     RESPONSE_INVALID = "response_invalid"
     INVALID_RECEIPT = "invalid_receipt"
+
+
+@dataclass(frozen=True, slots=True)
+class AuditCandidateSnapshot:
+    job_id: str
+    movie_code: str
+    movie_uuid: str | None
+    metadata_status: str | None
+    metadata_source: str | None
+    subtitle_id: str | None
+    storage_path: str | None
+    content_sha256: str | None
+    file_size: int | None
+    job_updated_at: str
+
+    @classmethod
+    def from_job(cls, job: JobRecord) -> AuditCandidateSnapshot:
+        return cls(
+            job_id=job.id,
+            movie_code=canonical_movie_code(job.normalized_movie_number),
+            movie_uuid=job.catalog_movie_uuid,
+            metadata_status=job.metadata_status,
+            metadata_source=job.metadata_source,
+            subtitle_id=job.published_subtitle_id,
+            storage_path=job.published_storage_path,
+            content_sha256=job.published_content_sha256,
+            file_size=job.published_file_size,
+            job_updated_at=job.updated_at,
+        )
+
+    def validated_receipt(self) -> PublicationReceiptSnapshot:
+        return PublicationReceiptSnapshot.from_candidate(self)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationReceiptSnapshot:
+    job_id: str
+    movie_code: str
+    movie_uuid: str
+    metadata_status: str
+    metadata_source: str
+    subtitle_id: str
+    storage_path: str
+    content_sha256: str
+    file_size: int
+    job_updated_at: str
+
+    @classmethod
+    def from_candidate(
+        cls, candidate: AuditCandidateSnapshot
+    ) -> PublicationReceiptSnapshot:
+        validate_verified_supabase_receipt(
+            movie_code=candidate.movie_code,
+            movie_uuid=candidate.movie_uuid,
+            metadata_status=candidate.metadata_status,
+            metadata_source=candidate.metadata_source,
+            subtitle_id=candidate.subtitle_id,
+            storage_path=candidate.storage_path,
+            content_sha256=candidate.content_sha256,
+            file_size=candidate.file_size,
+        )
+        assert isinstance(candidate.movie_uuid, str)
+        assert isinstance(candidate.metadata_status, str)
+        assert isinstance(candidate.metadata_source, str)
+        assert isinstance(candidate.subtitle_id, str)
+        assert isinstance(candidate.storage_path, str)
+        assert isinstance(candidate.content_sha256, str)
+        assert isinstance(candidate.file_size, int)
+        return cls(
+            job_id=candidate.job_id,
+            movie_code=candidate.movie_code,
+            movie_uuid=candidate.movie_uuid,
+            metadata_status=candidate.metadata_status,
+            metadata_source=candidate.metadata_source,
+            subtitle_id=candidate.subtitle_id,
+            storage_path=candidate.storage_path,
+            content_sha256=candidate.content_sha256,
+            file_size=candidate.file_size,
+            job_updated_at=candidate.job_updated_at,
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import math
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 import requests
 
+import orchestrator.catalog_visibility as visibility_module
 from orchestrator.catalog_visibility import (
     PublicCatalogVisibilityClient,
     PublicVisibilityResult,
     VisibilityStatus,
     normalize_catalog_api_origin,
 )
+from orchestrator.models import JobStatus
+from orchestrator.store import JobStore
 
 
 CANONICAL_CODE = "ktb-111"
 SUBTITLE_ID = "00000000-0000-0000-0000-000000000001"
 CONTENT_SHA256 = "a" * 64
 SECRET = "never-expose-this-detail"
+MOVIE_UUID = "f1bd9932-5697-4f16-865a-c56edc73d491"
 
 
 class FakeResponse:
@@ -88,6 +92,135 @@ def check(session: FakeSession) -> PublicVisibilityResult:
     return PublicCatalogVisibilityClient(
         "https://javsubtitle.example/", session=session
     ).check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+
+def _receipt_candidate_job(store: JobStore):
+    job = store.submit_job("KTB111", priority=100, force=False).job
+    assert job is not None
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, updated_at = ?, catalog_movie_uuid = ?, "
+            "metadata_status = ?, metadata_source = ?, published_subtitle_id = ?, "
+            "published_storage_path = ?, published_content_sha256 = ?, "
+            "published_file_size = ? WHERE id = ?",
+            (
+                JobStatus.ENGLISH_SRT_READY.value,
+                "2026-07-15T10:00:00+00:00",
+                MOVIE_UUID,
+                "complete",
+                "public",
+                SUBTITLE_ID,
+                "ktb/ktb-111/ktb-111-English_AI.srt",
+                CONTENT_SHA256,
+                321,
+                job.id,
+            ),
+        )
+    selected = store.get_job(job.id)
+    assert selected is not None
+    return selected
+
+
+def test_receipt_candidate_and_validated_snapshot_are_exact_and_immutable(
+    sqlite_path, mac_jobs_root
+):
+    candidate_type = getattr(visibility_module, "AuditCandidateSnapshot", None)
+    receipt_type = getattr(visibility_module, "PublicationReceiptSnapshot", None)
+    assert candidate_type is not None
+    assert receipt_type is not None
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = _receipt_candidate_job(store)
+
+    candidate = candidate_type.from_job(job)
+    snapshot = candidate.validated_receipt()
+
+    expected_fields = [
+        "job_id",
+        "movie_code",
+        "movie_uuid",
+        "metadata_status",
+        "metadata_source",
+        "subtitle_id",
+        "storage_path",
+        "content_sha256",
+        "file_size",
+        "job_updated_at",
+    ]
+    assert [field.name for field in fields(candidate_type)] == expected_fields
+    assert [field.name for field in fields(receipt_type)] == expected_fields
+    assert candidate_type.__dataclass_params__.frozen is True
+    assert receipt_type.__dataclass_params__.frozen is True
+    assert hasattr(candidate_type, "__slots__")
+    assert hasattr(receipt_type, "__slots__")
+    assert candidate == candidate_type(
+        job_id=job.id,
+        movie_code="ktb-111",
+        movie_uuid=MOVIE_UUID,
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id=SUBTITLE_ID,
+        storage_path="ktb/ktb-111/ktb-111-English_AI.srt",
+        content_sha256=CONTENT_SHA256,
+        file_size=321,
+        job_updated_at="2026-07-15T10:00:00+00:00",
+    )
+    assert snapshot == receipt_type(
+        job_id=job.id,
+        movie_code="ktb-111",
+        movie_uuid=MOVIE_UUID,
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id=SUBTITLE_ID,
+        storage_path="ktb/ktb-111/ktb-111-English_AI.srt",
+        content_sha256=CONTENT_SHA256,
+        file_size=321,
+        job_updated_at="2026-07-15T10:00:00+00:00",
+    )
+    assert snapshot.subtitle_id == job.published_subtitle_id
+    assert snapshot.content_sha256 == job.published_content_sha256
+    with pytest.raises(FrozenInstanceError):
+        setattr(candidate, "movie_code", "abc-123")
+
+
+@pytest.mark.parametrize(
+    ("overrides"),
+    [
+        {"storage_path": "wrong/path.srt"},
+        {"subtitle_id": "not-a-uuid"},
+        {"movie_uuid": None},
+        {"metadata_status": None},
+        {"metadata_source": None},
+        {"subtitle_id": None},
+        {"storage_path": None},
+        {"content_sha256": None},
+        {"file_size": None},
+    ],
+)
+def test_receipt_snapshot_rejects_invalid_or_missing_verified_fields(overrides):
+    candidate_type = getattr(visibility_module, "AuditCandidateSnapshot", None)
+    assert candidate_type is not None
+    values = {
+        "job_id": "job-1",
+        "movie_code": CANONICAL_CODE,
+        "movie_uuid": MOVIE_UUID,
+        "metadata_status": "complete",
+        "metadata_source": "public",
+        "subtitle_id": SUBTITLE_ID,
+        "storage_path": "ktb/ktb-111/ktb-111-English_AI.srt",
+        "content_sha256": CONTENT_SHA256,
+        "file_size": 321,
+        "job_updated_at": "2026-07-15T10:00:00+00:00",
+    }
+    values.update(overrides)
+    candidate = candidate_type(**values)
+
+    with pytest.raises(
+        ValueError, match="^verified Supabase receipt is invalid$"
+    ) as raised:
+        candidate.validated_receipt()
+
+    assert raised.value.__cause__ is None
 
 
 def test_exact_expected_subtitle_once_is_visible_and_uses_bounded_get():

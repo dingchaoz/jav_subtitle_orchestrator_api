@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import orchestrator.store as store_module
+from orchestrator.catalog_visibility import AuditCandidateSnapshot
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
@@ -171,6 +172,166 @@ def test_job_record_reads_durable_catalog_fields_without_fallbacks(
     assert job.catalog_sync_attempt_count == 3
     assert job.next_catalog_sync_attempt_at == "2026-07-13T12:00:00+00:00"
     assert job.catalog_lease_token == "catalog-lease-token"
+
+
+def _set_catalog_visibility_job(
+    store: JobStore,
+    movie_code: str,
+    *,
+    status: JobStatus,
+    updated_at: str,
+    valid_receipt: bool,
+):
+    job = store.submit_job(movie_code, priority=100, force=False).job
+    assert job is not None
+    canonical = job.normalized_movie_number
+    values = (
+        status.value,
+        updated_at,
+        "f1bd9932-5697-4f16-865a-c56edc73d491" if valid_receipt else None,
+        "complete" if valid_receipt else None,
+        "public" if valid_receipt else None,
+        "f1bd9932-5697-4f16-865a-c56edc73d492" if valid_receipt else "not-a-uuid",
+        (
+            f"{canonical.split('-', 1)[0]}/{canonical}/"
+            f"{canonical}-English_AI.srt"
+            if valid_receipt
+            else "wrong/path.srt"
+        ),
+        "a" * 64 if valid_receipt else None,
+        123 if valid_receipt else 0,
+        job.id,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, updated_at = ?, catalog_movie_uuid = ?, "
+            "metadata_status = ?, metadata_source = ?, published_subtitle_id = ?, "
+            "published_storage_path = ?, published_content_sha256 = ?, "
+            "published_file_size = ? WHERE id = ?",
+            values,
+        )
+    selected = store.get_job(job.id)
+    assert selected is not None
+    return selected
+
+
+def test_catalog_visibility_candidates_include_every_ready_row_without_mutation(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    ktb = _set_catalog_visibility_job(
+        store,
+        "KTB111",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T10:00:00+00:00",
+        valid_receipt=True,
+    )
+    iene = _set_catalog_visibility_job(
+        store,
+        "IENE-963",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T11:00:00+00:00",
+        valid_receipt=True,
+    )
+    invalid = _set_catalog_visibility_job(
+        store,
+        "abc-007",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T12:00:00+00:00",
+        valid_receipt=False,
+    )
+    failed = _set_catalog_visibility_job(
+        store,
+        "xyz-999",
+        status=JobStatus.FAILED,
+        updated_at="2026-07-15T09:00:00+00:00",
+        valid_receipt=True,
+    )
+    before = {job.id: job for job in (ktb, iene, invalid, failed)}
+
+    candidates = store.list_catalog_visibility_candidates(
+        allowlist={"ktb-111", "iene963"}
+    )
+    all_candidates = store.list_catalog_visibility_candidates()
+
+    assert [job.normalized_movie_number for job in candidates] == [
+        "ktb-111",
+        "iene-963",
+    ]
+    snapshot = AuditCandidateSnapshot.from_job(candidates[0]).validated_receipt()
+    assert snapshot.subtitle_id == candidates[0].published_subtitle_id
+    assert snapshot.content_sha256 == candidates[0].published_content_sha256
+    assert [job.normalized_movie_number for job in all_candidates] == [
+        "ktb-111",
+        "iene-963",
+        "abc-007",
+    ]
+    invalid_snapshot = AuditCandidateSnapshot.from_job(all_candidates[-1])
+    assert invalid_snapshot.subtitle_id == "not-a-uuid"
+    assert invalid_snapshot.movie_uuid is None
+    with pytest.raises(ValueError, match="verified Supabase receipt is invalid"):
+        invalid_snapshot.validated_receipt()
+    assert failed.id not in {job.id for job in all_candidates}
+    assert {job_id: store.get_job(job_id) for job_id in before} == before
+
+
+def test_catalog_visibility_candidates_sort_by_updated_at_and_id_before_limit(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    newer = _set_catalog_visibility_job(
+        store,
+        "abc-010",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T12:00:00+00:00",
+        valid_receipt=True,
+    )
+    tied_one = _set_catalog_visibility_job(
+        store,
+        "abc-011",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T11:00:00+00:00",
+        valid_receipt=True,
+    )
+    tied_two = _set_catalog_visibility_job(
+        store,
+        "abc-012",
+        status=JobStatus.ENGLISH_SRT_READY,
+        updated_at="2026-07-15T11:00:00+00:00",
+        valid_receipt=True,
+    )
+    expected = sorted((tied_one, tied_two), key=lambda job: job.id) + [newer]
+
+    candidates = store.list_catalog_visibility_candidates(limit=2)
+
+    assert [job.id for job in candidates] == [job.id for job in expected[:2]]
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, -1, 1.0, "1", None])
+def test_catalog_visibility_candidate_limit_must_be_a_positive_integer(
+    sqlite_path, mac_jobs_root, limit
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    if limit is None:
+        assert store.list_catalog_visibility_candidates(limit=limit) == []
+    else:
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            store.list_catalog_visibility_candidates(limit=limit)
+
+
+@pytest.mark.parametrize("allowlist", [{""}, {"   "}, {"not-a-movie-code"}])
+def test_catalog_visibility_candidate_allowlist_rejects_invalid_entries(
+    sqlite_path, mac_jobs_root, allowlist
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    with pytest.raises(ValueError):
+        store.list_catalog_visibility_candidates(allowlist=allowlist)
 
 
 def _prepare_translation_job(store, root: Path, movie: str):
