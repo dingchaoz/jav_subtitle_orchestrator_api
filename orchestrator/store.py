@@ -641,6 +641,14 @@ class JobRecord:
     published_storage_path: str | None
     published_content_sha256: str | None
     published_file_size: int | None
+    artifact_status: str | None
+    catalog_sync_status: str | None
+    catalog_sync_warning_code: str | None
+    catalog_sync_warning_message: str | None
+    catalog_sync_last_http_status: int | None
+    catalog_sync_last_response_json: str | None
+    catalog_sync_last_attempt_at: str | None
+    callback_client_key: str | None
     catalog_sync_attempt_count: int
     next_catalog_sync_attempt_at: str | None
     catalog_lease_token: str | None
@@ -743,6 +751,14 @@ class JobStore:
                   published_storage_path TEXT,
                   published_content_sha256 TEXT,
                   published_file_size INTEGER,
+                  artifact_status TEXT,
+                  catalog_sync_status TEXT,
+                  catalog_sync_warning_code TEXT,
+                  catalog_sync_warning_message TEXT,
+                  catalog_sync_last_http_status INTEGER,
+                  catalog_sync_last_response_json TEXT,
+                  catalog_sync_last_attempt_at TEXT,
+                  callback_client_key TEXT,
                   catalog_sync_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_catalog_sync_attempt_at TEXT,
                   catalog_lease_token TEXT,
@@ -794,6 +810,14 @@ class JobStore:
                 "published_storage_path": "TEXT",
                 "published_content_sha256": "TEXT",
                 "published_file_size": "INTEGER",
+                "artifact_status": "TEXT",
+                "catalog_sync_status": "TEXT",
+                "catalog_sync_warning_code": "TEXT",
+                "catalog_sync_warning_message": "TEXT",
+                "catalog_sync_last_http_status": "INTEGER",
+                "catalog_sync_last_response_json": "TEXT",
+                "catalog_sync_last_attempt_at": "TEXT",
+                "callback_client_key": "TEXT",
                 "catalog_sync_attempt_count": "INTEGER NOT NULL DEFAULT 0",
                 "next_catalog_sync_attempt_at": "TEXT",
                 "catalog_lease_token": "TEXT",
@@ -4991,6 +5015,14 @@ class JobStore:
             published_storage_path=row["published_storage_path"],
             published_content_sha256=row["published_content_sha256"],
             published_file_size=row["published_file_size"],
+            artifact_status=row["artifact_status"],
+            catalog_sync_status=row["catalog_sync_status"],
+            catalog_sync_warning_code=row["catalog_sync_warning_code"],
+            catalog_sync_warning_message=row["catalog_sync_warning_message"],
+            catalog_sync_last_http_status=row["catalog_sync_last_http_status"],
+            catalog_sync_last_response_json=row["catalog_sync_last_response_json"],
+            catalog_sync_last_attempt_at=row["catalog_sync_last_attempt_at"],
+            callback_client_key=row["callback_client_key"],
             catalog_sync_attempt_count=row["catalog_sync_attempt_count"],
             next_catalog_sync_attempt_at=row["next_catalog_sync_attempt_at"],
             catalog_lease_token=row["catalog_lease_token"],

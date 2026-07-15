@@ -181,6 +181,14 @@ def test_initialize_migrates_legacy_row_idempotently(
     assert migrated["catalog_sync_attempt_count"] == 0
     assert migrated["next_catalog_sync_attempt_at"] is None
     assert migrated["catalog_lease_token"] is None
+    assert migrated["artifact_status"] is None
+    assert migrated["catalog_sync_status"] is None
+    assert migrated["catalog_sync_warning_code"] is None
+    assert migrated["catalog_sync_warning_message"] is None
+    assert migrated["catalog_sync_last_http_status"] is None
+    assert migrated["catalog_sync_last_response_json"] is None
+    assert migrated["catalog_sync_last_attempt_at"] is None
+    assert migrated["callback_client_key"] is None
     assert any(row["type"] == "table" for row in first_schema)
     assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
     assert foreign_key_violations == []

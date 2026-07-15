@@ -15,10 +15,19 @@ def test_post_job_creates_job(sqlite_path, mac_jobs_root):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["movie_number"] == "ktb-096"
-    assert body["status"] == "queued"
+    assert body == {
+        "id": body["id"],
+        "movie_number": "ktb-096",
+        "status": "queued",
+        "job_dir_mac": str(mac_jobs_root / "ktb-096"),
+        "job_dir_windows": "M:\\ktb-096",
+        "error": None,
+        "ready": False,
+        "artifact_status": None,
+        "catalog_sync_status": None,
+        "warnings": [],
+    }
     assert Path(body["job_dir_mac"]).name == "ktb-096"
-    assert body["job_dir_windows"] == "M:\\ktb-096"
 
 
 def test_post_batch_groups_created_existing_invalid(sqlite_path, mac_jobs_root):

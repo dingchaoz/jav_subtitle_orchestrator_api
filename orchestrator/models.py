@@ -58,6 +58,21 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ArtifactStatus(StrEnum):
+    READY = "ready"
+
+
+class CatalogSyncStatus(StrEnum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class JobWarning(BaseModel):
+    code: str
+    message: str
+
+
 class JobPaths(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -114,6 +129,10 @@ class JobResponse(BaseModel):
     job_dir_mac: str
     job_dir_windows: str
     error: str | None = None
+    ready: bool = False
+    artifact_status: ArtifactStatus | None = None
+    catalog_sync_status: CatalogSyncStatus | None = None
+    warnings: list[JobWarning] = Field(default_factory=list)
 
 
 class BatchJobResponse(BaseModel):

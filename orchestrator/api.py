@@ -23,6 +23,7 @@ from orchestrator.models import (
     JobDetailResponse,
     JobLogTailResponse,
     JobLogsResponse,
+    JobWarning,
     MAX_AUDIT_OFFSET,
     JobResponse,
     JobStatus,
@@ -56,6 +57,20 @@ class SubtitleAuditServiceProtocol(Protocol):
     def get_finding(self, subtitle_id: str) -> SubtitleAuditItem | None: ...
 
 
+def job_warnings(job: JobRecord) -> list[JobWarning]:
+    if not job.catalog_sync_warning_code:
+        return []
+    return [
+        JobWarning(
+            code=job.catalog_sync_warning_code,
+            message=(
+                job.catalog_sync_warning_message
+                or "Catalog synchronization failed."
+            ),
+        )
+    ]
+
+
 def job_response(job: JobRecord) -> JobResponse:
     return JobResponse(
         id=job.id,
@@ -64,6 +79,10 @@ def job_response(job: JobRecord) -> JobResponse:
         job_dir_mac=job.job_dir_mac,
         job_dir_windows=job.job_dir_windows,
         error=job.error,
+        ready=job.status is JobStatus.ENGLISH_SRT_READY,
+        artifact_status=job.artifact_status,
+        catalog_sync_status=job.catalog_sync_status,
+        warnings=job_warnings(job),
     )
 
 
