@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -514,31 +515,65 @@ def _validate_sync_client_binding(
     return visibility_client  # type: ignore[return-value]
 
 
-def _validate_canonical_execution_directory(
+def _open_pinned_canonical_execution_directory(
     output_dir: Path,
     plan: CatalogVisibilityRepairPlan,
-) -> Path:
+) -> tuple[Path, int]:
     requested = Path(output_dir)
     canonical = plan.plan_path.parent
     _report_storage._path_components(requested)
     _report_storage._path_components(canonical)
+    requested_fd: int | None = None
+    canonical_fd: int | None = None
     try:
-        with _report_storage._pinned_directory(requested, create=False) as requested_fd:
-            requested_stat = os.fstat(requested_fd)
-            with _report_storage._pinned_directory(canonical, create=False) as canonical_fd:
-                canonical_stat = os.fstat(canonical_fd)
+        requested_fd = _report_storage._open_directory_path(requested, create=False)
+        requested_stat = os.fstat(requested_fd)
+        canonical_fd = _report_storage._open_directory_path(canonical, create=False)
+        canonical_stat = os.fstat(canonical_fd)
+        if (
+            requested_stat.st_dev != canonical_stat.st_dev
+            or requested_stat.st_ino != canonical_stat.st_ino
+            or requested_stat.st_uid != os.geteuid()
+            or canonical_stat.st_uid != os.geteuid()
+            or (requested_stat.st_mode & 0o077) != 0
+            or (canonical_stat.st_mode & 0o077) != 0
+        ):
+            raise ValueError(
+                "execution output directory must be the private repair plan directory"
+            )
+        os.close(requested_fd)
+        requested_fd = None
+        result = canonical_fd
+        canonical_fd = None
+        return canonical, result
     except (FileNotFoundError, OSError, ValueError):
-        raise ValueError("execution output directory must be the repair plan directory") from None
+        raise ValueError(
+            "execution output directory must be the repair plan directory"
+        ) from None
+    finally:
+        _report_storage._close_ignoring_error(requested_fd)
+        _report_storage._close_ignoring_error(canonical_fd)
+
+
+def _validate_pinned_directory_path(
+    canonical: Path,
+    directory_fd: int,
+) -> None:
+    pinned = os.fstat(directory_fd)
+    try:
+        published = os.stat(canonical, follow_symlinks=False)
+    except OSError:
+        raise ValueError("execution plan directory changed after validation") from None
     if (
-        requested_stat.st_dev != canonical_stat.st_dev
-        or requested_stat.st_ino != canonical_stat.st_ino
-        or requested_stat.st_uid != os.geteuid()
-        or canonical_stat.st_uid != os.geteuid()
-        or (requested_stat.st_mode & 0o077) != 0
-        or (canonical_stat.st_mode & 0o077) != 0
+        not stat.S_ISDIR(pinned.st_mode)
+        or not stat.S_ISDIR(published.st_mode)
+        or pinned.st_dev != published.st_dev
+        or pinned.st_ino != published.st_ino
+        or pinned.st_uid != os.geteuid()
+        or published.st_uid != os.geteuid()
+        or (published.st_mode & 0o077) != 0
     ):
-        raise ValueError("execution output directory must be the private repair plan directory")
-    return canonical
+        raise ValueError("execution plan directory changed after validation")
 
 
 def _utc_timestamp() -> str:
@@ -963,12 +998,13 @@ def execute_catalog_visibility_repair(
         raise ValueError("consecutive_failure_limit must be a positive integer")
     validated = _validated_execution_plan(store, plan)
     visibility_client = _validate_sync_client_binding(sync_client, validated.api_origin)
-    canonical_output_dir = _validate_canonical_execution_directory(
+    canonical_output_dir, directory_fd = _open_pinned_canonical_execution_directory(
         Path(output_dir),
         validated,
     )
     receipt_path = _execution_receipt_path(canonical_output_dir)
     if not execute:
+        os.close(directory_fd)
         return RepairExecutionResult(
             action="dry_run",
             repaired=(),
@@ -981,16 +1017,15 @@ def execute_catalog_visibility_repair(
         not isinstance(confirm_report_sha256, str)
         or not hmac.compare_digest(confirm_report_sha256, validated.report_sha256)
     ):
+        os.close(directory_fd)
         raise ValueError("confirm_report_sha256 mismatch")
 
     with _EXECUTION_PROCESS_LOCK:
         # Lock order is process -> canonical ledger directory -> SQLite writer.
         # Store publication writers only take the SQLite lock, so there is no inverse.
-        with _report_storage._pinned_directory(
-            canonical_output_dir,
-            create=False,
-        ) as directory_fd:
+        try:
             fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            _validate_pinned_directory_path(canonical_output_dir, directory_fd)
             descriptor, created = _open_execution_receipt(directory_fd)
             claims_descriptor: int | None = None
             stopped_reason: str | None = None
@@ -1143,6 +1178,8 @@ def execute_catalog_visibility_repair(
                 if claims_descriptor is not None:
                     os.close(claims_descriptor)
                 os.close(descriptor)
+        finally:
+            os.close(directory_fd)
 
     terminal_by_job_id = {row["job_id"]: row for row in existing}
     return RepairExecutionResult(

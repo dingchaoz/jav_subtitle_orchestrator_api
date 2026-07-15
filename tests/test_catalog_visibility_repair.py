@@ -1109,6 +1109,60 @@ def test_same_plan_rejects_alternate_execution_directory_without_post_or_artifac
     assert first.receipt_path.is_file()
 
 
+def test_directory_replacement_after_pin_refuses_before_post_or_ledgers(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import orchestrator.catalog_visibility_repair as repair_module
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    canonical_dir = plan.plan_path.parent
+    moved_dir = tmp_path / "moved-plan"
+    plan_bytes = plan.plan_path.read_bytes()
+    client = _RecordingSyncClient()
+    real_validate = repair_module._validate_pinned_directory_path
+    swapped = False
+
+    def swap_directory_after_pin(canonical: Path, descriptor: int) -> object:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            canonical_dir.rename(moved_dir)
+            canonical_dir.mkdir(mode=0o700)
+            canonical_dir.chmod(0o700)
+            replacement_plan = canonical_dir / "repair-plan.json"
+            replacement_plan.write_bytes(plan_bytes)
+            replacement_plan.chmod(0o600)
+        return real_validate(canonical, descriptor)
+
+    monkeypatch.setattr(
+        repair_module,
+        "_validate_pinned_directory_path",
+        swap_directory_after_pin,
+    )
+
+    with pytest.raises(ValueError, match="changed after validation"):
+        repair_module.execute_catalog_visibility_repair(
+            store,
+            plan,
+            sync_client=client,
+            output_dir=canonical_dir,
+            execute=True,
+            confirm_report_sha256=plan.report_sha256,
+        )
+
+    assert swapped is True
+    assert client.calls == []
+    assert not (canonical_dir / "repair-execution.jsonl").exists()
+    assert not (canonical_dir / "repair-execution-claims.jsonl").exists()
+    assert not (moved_dir / "repair-execution.jsonl").exists()
+    assert not (moved_dir / "repair-execution-claims.jsonl").exists()
+
+
 def test_unresolved_remote_success_reconciles_exact_visibility_without_second_post(
     tmp_path: Path,
     sqlite_path: Path,
