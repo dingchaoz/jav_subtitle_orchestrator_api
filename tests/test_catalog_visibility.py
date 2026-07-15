@@ -123,6 +123,20 @@ def test_origin_normalization_rejects_malformed_ports(base_url: str):
 
 
 @pytest.mark.parametrize(
+    ("base_url", "expected_origin"),
+    [
+        ("https://example.com:0443", "https://example.com:443"),
+        ("http://localhost:03000", "http://localhost:3000"),
+    ],
+)
+def test_origin_normalization_accepts_leading_zero_numeric_ports(
+    base_url: str,
+    expected_origin: str,
+):
+    assert normalize_catalog_api_origin(base_url) == expected_origin
+
+
+@pytest.mark.parametrize(
     "base_url",
     [
         "https://example.com\x00",
@@ -181,6 +195,25 @@ def test_requests_prepares_exact_validated_url_and_receives_finite_timeout():
     )
     assert kwargs["timeout"] == 2.5
     assert kwargs["allow_redirects"] is False
+
+
+def test_requests_prepares_valid_nfkc_stable_unicode_idn_as_ascii():
+    session = PreparedRequestSession()
+    client = PublicCatalogVisibilityClient(
+        "https://例え.テスト",
+        session=session,
+    )
+
+    result = client.check("KTB111", SUBTITLE_ID, CONTENT_SHA256)
+
+    assert result.status is VisibilityStatus.NOT_FOUND
+    assert client.base_url == "https://xn--r8jz45g.xn--zckzah"
+    assert len(session.sent) == 1
+    request, _kwargs = session.sent[0]
+    assert request.url == (
+        f"https://xn--r8jz45g.xn--zckzah/api/movie/{CANONICAL_CODE}"
+        f"?cacheNonce={CONTENT_SHA256}"
+    )
 
 
 @pytest.mark.parametrize(

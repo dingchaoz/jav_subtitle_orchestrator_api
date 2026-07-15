@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -37,47 +38,85 @@ class VisibilitySession(Protocol):
     def get(self, url: str, **kwargs: Any) -> Any: ...
 
 
-def _valid_hostname(hostname: str) -> bool:
+def _normalize_hostname(hostname: str) -> str | None:
     if ":" in hostname:
         try:
             ipaddress.IPv6Address(hostname)
         except ipaddress.AddressValueError:
-            return False
-        return True
+            return None
+        return hostname
 
+    if unicodedata.normalize("NFKC", hostname) != hostname:
+        return None
     try:
         ascii_hostname = hostname.encode("idna").decode("ascii")
     except UnicodeError:
-        return False
-    if ascii_hostname != hostname:
-        return False
-    if ascii_hostname.endswith("."):
-        ascii_hostname = ascii_hostname[:-1]
-    labels = ascii_hostname.split(".")
-    return (
-        bool(ascii_hostname)
-        and len(ascii_hostname) <= 253
-        and all(
-            label
-            and len(label) <= 63
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and all(character.isalnum() or character == "-" for character in label)
+        return None
+    hostname_for_validation = ascii_hostname.removesuffix(".")
+    labels = hostname_for_validation.split(".")
+    if (
+        not hostname_for_validation
+        or len(hostname_for_validation) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or not label[0].isalnum()
+            or not label[-1].isalnum()
+            or any(
+                not character.isalnum() and character != "-"
+                for character in label
+            )
             for label in labels
         )
-    )
+    ):
+        return None
+    return ascii_hostname
 
 
-def _authority_matches_hostname(
+def _normalize_authority(
     authority: str,
     hostname: str,
     port: int | None,
-) -> bool:
-    host_authority = f"[{hostname}]" if ":" in hostname else hostname
-    expected_authority = (
-        f"{host_authority}:{port}" if port is not None else host_authority
+) -> str | None:
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        if closing_bracket < 0:
+            return None
+        raw_hostname = authority[1:closing_bracket]
+        suffix = authority[closing_bracket + 1 :]
+        if "[" in raw_hostname or "]" in raw_hostname:
+            return None
+    else:
+        if "[" in authority or "]" in authority or authority.count(":") > 1:
+            return None
+        raw_hostname, separator, raw_port = authority.rpartition(":")
+        if not separator:
+            raw_hostname = authority
+            suffix = ""
+        else:
+            suffix = f":{raw_port}"
+
+    if suffix:
+        if not suffix.startswith(":") or not suffix[1:].isdigit():
+            return None
+        try:
+            raw_port_value = int(suffix[1:])
+        except ValueError:
+            return None
+        if port is None or raw_port_value != port:
+            return None
+    elif port is not None:
+        return None
+
+    if raw_hostname.casefold() != hostname.casefold():
+        return None
+    normalized_hostname = _normalize_hostname(raw_hostname)
+    if normalized_hostname is None:
+        return None
+    host_authority = (
+        f"[{normalized_hostname}]" if ":" in normalized_hostname else normalized_hostname
     )
-    return authority.lower() == expected_authority.lower()
+    return f"{host_authority}:{port}" if port is not None else host_authority
 
 
 def validate_catalog_timeout_seconds(timeout_seconds: object) -> int | float:
@@ -113,6 +152,9 @@ def normalize_catalog_api_origin(base_url: str) -> str:
     if parse_failed:
         raise ValueError("catalog API base URL is invalid")
 
+    normalized_authority = (
+        _normalize_authority(parsed.netloc, hostname, port) if hostname else None
+    )
     valid_transport = parsed.scheme == "https" or (
         parsed.scheme == "http" and hostname in _LOCAL_HTTP_HOSTS
     )
@@ -120,8 +162,7 @@ def normalize_catalog_api_origin(base_url: str) -> str:
         not valid_transport
         or not parsed.netloc
         or not hostname
-        or not _valid_hostname(hostname)
-        or not _authority_matches_hostname(parsed.netloc, hostname, port)
+        or normalized_authority is None
         or has_credentials
         or parsed.netloc.endswith(":")
         or parsed.path not in {"", "/"}
@@ -131,7 +172,7 @@ def normalize_catalog_api_origin(base_url: str) -> str:
         or parsed.fragment
     ):
         raise ValueError("catalog API base URL is invalid")
-    return f"{parsed.scheme}://{parsed.netloc}"
+    return f"{parsed.scheme}://{normalized_authority}"
 
 
 class PublicCatalogVisibilityClient:
