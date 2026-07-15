@@ -592,6 +592,44 @@ def test_force_submit_returns_conflict_for_active_worker_statuses(
     assert result.job.claimed_by == "worker-1"
 
 
+def test_force_submit_cannot_reset_claimed_ready_catalog_work(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    created = store.submit_job("abc-034", priority=100, force=False)
+    set_job_fields(
+        sqlite_path,
+        created.job.id,
+        status=JobStatus.ENGLISH_SRT_READY.value,
+        artifact_status="ready",
+        catalog_sync_status="pending",
+        catalog_movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        published_subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        published_storage_path="abc/abc-034/abc-034-English_AI.srt",
+        published_content_sha256="f" * 64,
+        published_file_size=321,
+    )
+    claimed = store.claim_catalog_sync_job(
+        "catalog-worker",
+        60,
+        job_id=created.job.id,
+    )
+
+    result = store.submit_job("ABC034", priority=10, force=True)
+
+    assert result.kind == "conflict"
+    current = store.get_job(created.job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.claimed_by == "catalog-worker"
+    assert current.catalog_lease_token == claimed.catalog_lease_token
+    assert current.published_subtitle_id == claimed.published_subtitle_id
+    assert current.published_storage_path == claimed.published_storage_path
+
+
 def test_submit_invalid_movie_number(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

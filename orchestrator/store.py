@@ -5659,7 +5659,14 @@ class JobStore:
         callback_client_key: str | None,
         requested_priority: int,
     ) -> SubmitResult:
-        if existing.status in {
+        catalog_sync_claimed = (
+            existing.status is JobStatus.ENGLISH_SRT_READY
+            and existing.artifact_status == "ready"
+            and existing.catalog_sync_status == "pending"
+            and existing.claimed_by is not None
+            and existing.catalog_lease_token is not None
+        )
+        if catalog_sync_claimed or existing.status in {
             JobStatus.TRANSCRIPTION_CLAIMED,
             JobStatus.TRANSCRIBING,
             JobStatus.TRANSCRIPTION_DONE,
@@ -5702,6 +5709,11 @@ class JobStore:
                 japanese_srt_path_windows = NULL, english_srt_path_mac = NULL,
                 english_srt_path_windows = NULL
             WHERE id = ?
+              AND NOT (
+                status = ? AND COALESCE(artifact_status, '') = 'ready'
+                AND COALESCE(catalog_sync_status, '') = 'pending'
+                AND claimed_by IS NOT NULL AND catalog_lease_token IS NOT NULL
+              )
               AND status NOT IN (?, ?, ?, ?, ?, ?)
             """,
             (
@@ -5710,6 +5722,7 @@ class JobStore:
                 NORMAL_TRANSLATION_ORIGIN,
                 callback_client_key,
                 existing.id,
+                JobStatus.ENGLISH_SRT_READY.value,
                 *active_statuses,
             ),
         )
