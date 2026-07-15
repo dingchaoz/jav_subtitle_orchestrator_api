@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 from dataclasses import asdict, FrozenInstanceError, replace
 from pathlib import Path
@@ -128,6 +129,29 @@ def test_catalog_visibility_repair_module_exposes_public_api():
     assert RepairPlanItem is not None
     assert callable(load_catalog_visibility_repair_plan)
     assert callable(plan_catalog_visibility_repair)
+
+
+@pytest.mark.parametrize("non_finite", [float("nan"), float("inf"), float("-inf")])
+def test_private_json_artifact_rejects_non_finite_values_before_publish(
+    tmp_path: Path,
+    non_finite: float,
+):
+    from orchestrator.catalog_visibility_report import (
+        write_private_json_artifact,
+    )
+
+    artifact_path = tmp_path / "artifact.json"
+
+    with pytest.raises(ValueError, match="test artifact") as raised:
+        write_private_json_artifact(
+            artifact_path,
+            {"secret": "SENTINELVALUE", "value": non_finite},
+            label="test artifact",
+            limit=1024,
+        )
+
+    assert "SENTINELVALUE" not in str(raised.value)
+    assert not artifact_path.exists()
 
 
 def test_plan_includes_only_missing_and_not_found_in_report_order_and_writes_digest(
@@ -605,6 +629,64 @@ def test_planning_is_dry_run_uses_only_get_job_and_leaves_database_unchanged(
         after = [tuple(row) for row in conn.execute("SELECT * FROM jobs ORDER BY id")]
     assert get_job_calls == [jobs[0].id]
     assert after == before
+
+
+def test_multi_item_planning_uses_one_cohesive_shared_read_snapshot(
+    tmp_path: Path,
+    sqlite_path: Path,
+    mac_jobs_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from orchestrator.catalog_visibility_repair import plan_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    jobs = [_ready_job(store, f"abc-{index:03d}", index) for index in (1, 2)]
+    report_dir = tmp_path / "report"
+    _write_report(
+        report_dir,
+        store,
+        [
+            (AuditCandidateSnapshot.from_job(jobs[0]), "missing"),
+            (AuditCandidateSnapshot.from_job(jobs[1]), "not_found"),
+        ],
+    )
+    original_get_job = store.get_job
+    observed_connections: list[sqlite3.Connection | None] = []
+    changed_second_row = False
+
+    def get_job_and_change_second_row(
+        job_id: str,
+        conn: sqlite3.Connection | None = None,
+    ):
+        nonlocal changed_second_row
+        observed_connections.append(conn)
+        current = original_get_job(job_id, conn=conn)
+        if not changed_second_row:
+            changed_second_row = True
+            writer = sqlite3.connect(store.db_path)
+            try:
+                with writer:
+                    writer.execute(
+                        "UPDATE jobs SET updated_at = ? WHERE id = ?",
+                        ("2026-07-15T11:00:00+00:00", jobs[1].id),
+                    )
+            finally:
+                writer.close()
+        return current
+
+    monkeypatch.setattr(store, "get_job", get_job_and_change_second_row)
+
+    plan = plan_catalog_visibility_repair(
+        store,
+        report_dir / "audit-report.json",
+        expected_api_origin=API_ORIGIN,
+        output_dir=tmp_path / "plan",
+    )
+
+    assert [item.receipt.job_id for item in plan.items] == [job.id for job in jobs]
+    assert len(observed_connections) == 2
+    assert observed_connections[0] is not None
+    assert observed_connections[1] is observed_connections[0]
 
 
 def test_plan_serialization_omits_raw_paths_credentials_and_exception_text(

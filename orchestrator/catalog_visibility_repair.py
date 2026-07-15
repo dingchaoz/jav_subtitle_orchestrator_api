@@ -203,29 +203,31 @@ def plan_catalog_visibility_repair(
     )
     items: list[RepairPlanItem] = []
     skipped: dict[str, int] = {}
-    for finding in report.findings:
-        if finding.status not in REPAIR_ELIGIBLE:
-            skipped[finding.status] = skipped.get(finding.status, 0) + 1
-            continue
-        report_receipt = finding.candidate.validated_receipt()
-        current = store.get_job(report_receipt.job_id)
-        if current is None or current.status != JobStatus.ENGLISH_SRT_READY:
-            skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
-            continue
-        try:
-            current_receipt = AuditCandidateSnapshot.from_job(current).validated_receipt()
-        except (TypeError, ValueError):
-            skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
-            continue
-        if current_receipt != report_receipt:
-            skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
-            continue
-        items.append(
-            RepairPlanItem(
-                receipt=current_receipt,
-                starting_status=finding.status,
+    with store.connection() as connection:
+        connection.execute("BEGIN")
+        for finding in report.findings:
+            if finding.status not in REPAIR_ELIGIBLE:
+                skipped[finding.status] = skipped.get(finding.status, 0) + 1
+                continue
+            report_receipt = finding.candidate.validated_receipt()
+            current = store.get_job(report_receipt.job_id, conn=connection)
+            if current is None or current.status != JobStatus.ENGLISH_SRT_READY:
+                skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
+                continue
+            try:
+                current_receipt = AuditCandidateSnapshot.from_job(current).validated_receipt()
+            except (TypeError, ValueError):
+                skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
+                continue
+            if current_receipt != report_receipt:
+                skipped["receipt_changed"] = skipped.get("receipt_changed", 0) + 1
+                continue
+            items.append(
+                RepairPlanItem(
+                    receipt=current_receipt,
+                    starting_status=finding.status,
+                )
             )
-        )
 
     frozen_items = tuple(items)
     frozen_skipped = {key: count for key, count in skipped.items() if count}

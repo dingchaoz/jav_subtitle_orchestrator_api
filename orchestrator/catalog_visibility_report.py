@@ -1556,7 +1556,16 @@ def write_private_json_artifact(
         raise ValueError("artifact label is invalid")
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         raise ValueError("artifact size limit is invalid")
-    data = _canonical_bytes(payload)
+    try:
+        data = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        raise ValueError(f"{label} is not valid JSON") from None
     parent, name = _leaf_parent(path)
     with _pinned_directory(parent, create=True) as directory_fd:
         fcntl.flock(directory_fd, fcntl.LOCK_EX)
