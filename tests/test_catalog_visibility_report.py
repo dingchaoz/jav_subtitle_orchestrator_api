@@ -81,6 +81,40 @@ def canonical_line(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def encoded_finding_row(item: AuditFinding) -> bytes:
+    return (
+        canonical_line(
+            {
+                "schema_version": 1,
+                "candidate": asdict(item.candidate),
+                "status": item.status,
+                "reason_code": item.reason_code,
+                "observed_subtitle_ids": list(item.observed_subtitle_ids),
+            }
+        )
+        + "\n"
+    ).encode()
+
+
+def second_candidate(candidate: AuditCandidateSnapshot) -> AuditCandidateSnapshot:
+    return replace(
+        candidate,
+        job_id="job-2",
+        movie_code="abc-001",
+        subtitle_id="11111111-2222-4333-8444-555555555555",
+        storage_path="abc/abc-001/abc-001-English_AI.srt",
+    )
+
+
+def large_valid_finding(candidate: AuditCandidateSnapshot) -> AuditFinding:
+    return replace(
+        finding(candidate),
+        observed_subtitle_ids=tuple(
+            f"00000000-0000-4000-8000-{index:012d}" for index in range(20)
+        ),
+    )
+
+
 def test_catalog_visibility_report_module_exposes_public_constants():
     assert AUDIT_REPORT_SCHEMA_VERSION == 1
     assert REPAIR_ELIGIBLE == frozenset({"missing", "not_found"})
@@ -1040,6 +1074,90 @@ def test_checkpoint_line_and_document_and_report_limits_fail_safely(
     assert report.complete is True
 
 
+def test_checkpoint_append_crossing_document_limit_by_one_is_unchanged_and_resumable(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    second = second_candidate(candidate)
+    manifest = write_manifest(tmp_path, candidate, second)
+    first_finding = large_valid_finding(candidate)
+    append_audit_finding(tmp_path, first_finding)
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    checkpoint.chmod(0o640)
+    before = checkpoint.read_bytes()
+    before_mode = stat.S_IMODE(checkpoint.stat().st_mode)
+    second_finding = finding(second, "missing")
+    exact_final_size = len(before) + len(encoded_finding_row(second_finding))
+    monkeypatch.setattr(
+        report_module,
+        "MAX_AUDIT_DOCUMENT_BYTES",
+        exact_final_size - 1,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint|large|limit"):
+        append_audit_finding(tmp_path, second_finding)
+
+    assert checkpoint.read_bytes() == before
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == before_mode == 0o640
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", exact_final_size)
+    append_audit_finding(tmp_path, second_finding)
+    assert load_audit_findings(tmp_path, manifest) == (
+        first_finding,
+        second_finding,
+    )
+
+
+def test_checkpoint_append_exactly_at_document_limit_succeeds(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    second = second_candidate(candidate)
+    manifest = write_manifest(tmp_path, candidate, second)
+    first_finding = large_valid_finding(candidate)
+    append_audit_finding(tmp_path, first_finding)
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    second_finding = finding(second, "missing")
+    exact_final_size = checkpoint.stat().st_size + len(
+        encoded_finding_row(second_finding)
+    )
+    monkeypatch.setattr(
+        report_module,
+        "MAX_AUDIT_DOCUMENT_BYTES",
+        exact_final_size,
+    )
+
+    append_audit_finding(tmp_path, second_finding)
+
+    assert checkpoint.stat().st_size == exact_final_size
+    assert load_audit_findings(tmp_path, manifest) == (
+        first_finding,
+        second_finding,
+    )
+
+
+def test_checkpoint_append_rejects_an_existing_over_limit_file_unchanged(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    second = second_candidate(candidate)
+    write_manifest(tmp_path, candidate, second)
+    first_finding = large_valid_finding(candidate)
+    append_audit_finding(tmp_path, first_finding)
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    checkpoint.chmod(0o640)
+    before = checkpoint.read_bytes()
+    before_mode = stat.S_IMODE(checkpoint.stat().st_mode)
+    assert (tmp_path / "audit-manifest.json").stat().st_size < len(before)
+    monkeypatch.setattr(
+        report_module,
+        "MAX_AUDIT_DOCUMENT_BYTES",
+        len(before) - 1,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint|large|limit"):
+        append_audit_finding(tmp_path, finding(second, "missing"))
+
+    assert checkpoint.read_bytes() == before
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == before_mode == 0o640
+
+
 def test_cleanup_fault_does_not_mask_primary_error_and_temp_is_removed(
     tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
 ):
@@ -1112,18 +1230,7 @@ def test_waiting_writer_rollback_preserves_prior_locked_append(
     waiting_fd = None
     interleaved = False
     first = finding(candidate)
-    first_row = (
-        canonical_line(
-            {
-                "schema_version": 1,
-                "candidate": asdict(first.candidate),
-                "status": first.status,
-                "reason_code": first.reason_code,
-                "observed_subtitle_ids": list(first.observed_subtitle_ids),
-            }
-        )
-        + "\n"
-    ).encode()
+    first_row = encoded_finding_row(first)
 
     def interleaving_flock(descriptor: int, operation: int):
         nonlocal waiting_fd, interleaved

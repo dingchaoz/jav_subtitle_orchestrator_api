@@ -1111,6 +1111,8 @@ def _append_audit_finding_locked(
                 item.candidate.job_id for item in existing
             }:
                 raise ValueError("audit checkpoint already contains this job finding")
+            if original_size + len(row) > MAX_AUDIT_DOCUMENT_BYTES:
+                raise ValueError("audit checkpoint would exceed the document size limit")
             os.fchmod(descriptor, 0o600)
             _validate_regular_fd(descriptor, "audit checkpoint")
             written = os.write(descriptor, row)
