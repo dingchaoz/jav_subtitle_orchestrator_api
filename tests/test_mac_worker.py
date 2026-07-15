@@ -342,7 +342,21 @@ class RecordingCatalogSync:
                 f"movie:full:{movie}",
                 f"movie:light:{movie}",
             ),
+            diagnostic=SimpleNamespace(
+                http_status=200,
+                response_json='{"success":true}',
+            ),
         )
+
+
+class RecordingCallbackNotifier:
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+
+    def notify_subtitle_ready(self, job):
+        self.events.append(("webhook", job.normalized_movie_number))
+        self.calls.append(job)
 
 
 class ReclaimingCatalogSync:
@@ -375,6 +389,10 @@ class ReclaimingCatalogSync:
             kv_keys_deleted=(
                 f"movie:full:{movie}",
                 f"movie:light:{movie}",
+            ),
+            diagnostic=SimpleNamespace(
+                http_status=200,
+                response_json='{"success":true}',
             ),
         )
 
@@ -499,7 +517,7 @@ def test_normal_publication_wins_over_pending_historical_repair(
 
     assert worker.process_one() is True
 
-    assert store.get_job(normal.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(normal.id).status is JobStatus.ENGLISH_SRT_READY
     assert store.get_historical_repair(historical.id).state is HistoricalRepairState.PENDING
     assert [event[0] for event in events] == ["publish"]
 
@@ -651,7 +669,7 @@ def test_publication_orphan_resumes_publisher_without_retranslation(
     assert restarted.process_one() is True
     assert [event[0] for event in events] == ["publish"]
     published = store.get_job(job.id)
-    assert published.status is JobStatus.CATALOG_SYNC_PENDING
+    assert published.status is JobStatus.ENGLISH_SRT_READY
     assert published.publish_attempt_count == 1
 
 
@@ -705,8 +723,8 @@ def test_catalog_orphan_resumes_catalog_without_translation_or_reupload(
 
     resumed = store.get_job(job.id)
     repair = store.get_historical_repair(job.id)
-    assert resumed.status is JobStatus.CATALOG_SYNC_PENDING
-    assert repair.state is HistoricalRepairState.RUNNING
+    assert resumed.status is JobStatus.ENGLISH_SRT_READY
+    assert repair.state is HistoricalRepairState.SUCCEEDED
     assert resumed.catalog_sync_attempt_count == before.catalog_sync_attempt_count == 1
     assert resumed.next_catalog_sync_attempt_at == due
     assert (
@@ -766,11 +784,11 @@ def test_catalog_orphan_with_invalid_receipt_fails_closed(
             ),
         )
 
-    assert store.reconcile_orphaned_historical_repairs() == 1
+    assert store.reconcile_orphaned_historical_repairs() == 0
 
     repair = store.get_historical_repair(job.id)
     assert store.get_job(job.id).status is JobStatus.FAILED
-    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
+    assert repair.state is HistoricalRepairState.SUCCEEDED
     assert store.claim_catalog_sync_job("mac-restarted", 60, job_id=job.id) is None
 
 
@@ -1264,7 +1282,7 @@ def test_historical_publication_preservation_change_blocks_publisher_and_pauses(
     assert events == []
 
 
-def test_historical_catalog_failure_checks_preservation_before_retry(
+def test_historical_catalog_failure_does_not_reopen_published_artifact(
     sqlite_path, mac_jobs_root
 ):
     from orchestrator.catalog_sync import CatalogSyncError
@@ -1301,11 +1319,13 @@ def test_historical_catalog_failure_checks_preservation_before_retry(
     current = store.get_job(job.id)
     repair = store.get_historical_repair(job.id)
     lane = store.historical_lane_state()
-    assert current.status is JobStatus.FAILED
-    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
-    assert repair.reason_code == "preservation_hash_changed"
-    assert lane.paused is True
-    assert lane.reason_code == "preservation_hash_changed"
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.catalog_sync_status == "pending"
+    assert current.catalog_sync_warning_code == "catalog_sync_failed"
+    assert repair.state is HistoricalRepairState.SUCCEEDED
+    assert repair.reason_code is None
+    assert lane.paused is False
+    assert lane.reason_code is None
     assert lane.consecutive_quality_failures == 0
     assert (
         current.published_subtitle_id,
@@ -1373,7 +1393,7 @@ def test_good_historical_quality_pass_resets_durable_failure_streak(
     assert store.get_job(good.id).status is JobStatus.PUBLISH_PENDING
     assert store.historical_lane_state().consecutive_quality_failures == 1
     assert worker.process_one() is True
-    assert store.get_job(good.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(good.id).status is JobStatus.ENGLISH_SRT_READY
     assert store.historical_lane_state().consecutive_quality_failures == 0
 
 
@@ -1511,7 +1531,7 @@ def test_historical_publication_exhaustion_is_terminal_without_retranslation(
     assert resumed.counts["permanent_failed"] == 1
 
 
-def test_historical_catalog_exhaustion_is_terminal_without_reupload(
+def test_historical_catalog_exhaustion_only_fails_catalog_substate(
     sqlite_path, mac_jobs_root, tmp_path
 ):
     from orchestrator.catalog_sync import CatalogSyncError
@@ -1537,19 +1557,16 @@ def test_historical_catalog_exhaustion_is_terminal_without_reupload(
     assert worker.process_one() is True
     assert worker.process_one() is True
 
-    assert store.get_job(job.id).status is JobStatus.FAILED
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.catalog_sync_status == "failed"
+    assert current.catalog_sync_warning_code == "catalog_fetch_failed"
     repair = store.get_historical_repair(job.id)
-    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
-    assert repair.reason_code == "catalog_sync_failed"
+    assert repair.state is HistoricalRepairState.SUCCEEDED
+    assert repair.reason_code is None
     lane = store.historical_lane_state()
-    assert lane.paused is True
-    assert lane.reason_code == "catalog_sync_failed"
-    _assert_historical_controller_pause(
-        store,
-        tmp_path,
-        "old-142",
-        "catalog_sync_failed",
-    )
+    assert lane.paused is False
+    assert lane.reason_code is None
     assert [event[0] for event in events] == ["translate", "publish", "catalog"]
 
 
@@ -1565,7 +1582,7 @@ def test_historical_catalog_exhaustion_is_terminal_without_reupload(
         "public_visibility_mismatch",
     ],
 )
-def test_historical_structural_catalog_failure_pauses_on_first_attempt(
+def test_historical_structural_catalog_failure_is_only_a_warning(
     sqlite_path, mac_jobs_root, tmp_path, reason_code
 ):
     from orchestrator.catalog_sync import CatalogSyncError
@@ -1595,20 +1612,13 @@ def test_historical_structural_catalog_failure_pauses_on_first_attempt(
     assert worker.process_one() is True
 
     current = store.get_job(job.id)
-    assert current.status is JobStatus.CATALOG_SYNC_PENDING
-    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.SUCCEEDED
     lane = store.historical_lane_state()
-    assert lane.paused is True
-    assert lane.reason_code == reason_code
-    _assert_historical_controller_pause(
-        store,
-        tmp_path,
-        movie,
-        reason_code,
-    )
-    store.resume_historical_lane()
-    assert worker.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert lane.paused is False
+    assert lane.reason_code is None
+    assert current.catalog_sync_warning_code == reason_code
+    assert current.error is None
 
 
 @pytest.mark.parametrize(
@@ -1620,7 +1630,7 @@ def test_historical_structural_catalog_failure_pauses_on_first_attempt(
         ("public_visibility_not_found", "public_visibility_failed"),
     ],
 )
-def test_historical_transient_catalog_exhaustion_pauses_with_bounded_reason(
+def test_historical_transient_catalog_exhaustion_preserves_ready_artifact(
     sqlite_path, mac_jobs_root, tmp_path, reason_code, pause_reason
 ):
     from orchestrator.catalog_sync import CatalogSyncError
@@ -1648,22 +1658,19 @@ def test_historical_transient_catalog_exhaustion_pauses_with_bounded_reason(
     assert worker.process_one() is True
     assert worker.process_one() is True
 
-    assert store.get_job(job.id).status is JobStatus.FAILED
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.catalog_sync_status == "failed"
+    assert current.catalog_sync_warning_code == reason_code
     repair = store.get_historical_repair(job.id)
-    assert repair.state is HistoricalRepairState.PERMANENT_FAILED
-    assert repair.reason_code == pause_reason
+    assert repair.state is HistoricalRepairState.SUCCEEDED
+    assert repair.reason_code is None
     lane = store.historical_lane_state()
-    assert lane.paused is True
-    assert lane.reason_code == pause_reason
-    _assert_historical_controller_pause(
-        store,
-        tmp_path,
-        movie,
-        pause_reason,
-    )
+    assert lane.paused is False
+    assert lane.reason_code is None
 
 
-def test_historical_catalog_auth_failure_pauses_lane_before_exhaustion(
+def test_historical_catalog_auth_failure_does_not_pause_artifact_lane(
     sqlite_path, mac_jobs_root
 ):
     from orchestrator.catalog_sync import CatalogSyncError
@@ -1692,11 +1699,13 @@ def test_historical_catalog_auth_failure_pauses_lane_before_exhaustion(
     assert worker.process_one() is True
 
     current = store.get_job(job.id)
-    assert current.status is JobStatus.CATALOG_SYNC_PENDING
-    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.catalog_sync_status == "failed"
+    assert current.catalog_sync_warning_code == "catalog_auth_failed"
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.SUCCEEDED
     lane = store.historical_lane_state()
-    assert lane.paused is True
-    assert lane.reason_code == "catalog_auth_failed"
+    assert lane.paused is False
+    assert lane.reason_code is None
     assert store.get_historical_repair(second.id).state is HistoricalRepairState.PENDING
 
     normal = prepare_transcription_done_job(store, mac_jobs_root, movie="new-149")
@@ -1743,17 +1752,25 @@ def test_historical_terminal_stage_rolls_back_job_if_repair_update_fails(
             """
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected repair failure"):
-        worker.process_one()
+    if stage == "publication":
+        with pytest.raises(sqlite3.IntegrityError, match="injected repair failure"):
+            worker.process_one()
+    else:
+        assert worker.process_one() is True
 
     current = store.get_job(job.id)
     expected = (
         JobStatus.PUBLISHING
         if stage == "publication"
-        else JobStatus.CATALOG_SYNCING
+        else JobStatus.ENGLISH_SRT_READY
     )
     assert current.status is expected
-    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    expected_repair = (
+        HistoricalRepairState.RUNNING
+        if stage == "publication"
+        else HistoricalRepairState.SUCCEEDED
+    )
+    assert store.get_historical_repair(job.id).state is expected_repair
     assert store.historical_lane_state().paused is False
 
 
@@ -2076,7 +2093,7 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     assert worker.process_one() is True
     assert [event[0] for event in events] == ["translate", "publish"]
     published = store.get_job(job.id)
-    assert published.status is JobStatus.CATALOG_SYNC_PENDING
+    assert published.status is JobStatus.ENGLISH_SRT_READY
     assert published.published_subtitle_id == "00000000-0000-0000-0000-000000000002"
     assert published.published_storage_path == "ktb/ktb-096/ktb-096-English_AI.srt"
 
@@ -2092,6 +2109,138 @@ def test_good_translation_becomes_pending_then_publishes_without_retranslation(
     log = mac_jobs_root / "ktb-096" / "logs" / "mac-translation.log"
     assert "publish_verified" in log.read_text(encoding="utf-8")
     assert "Distinct English" not in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("catalog_failure", [False, True])
+def test_ready_webhook_fires_after_publish_before_catalog_and_never_downgrades(
+    sqlite_path,
+    mac_jobs_root,
+    catalog_failure,
+):
+    from orchestrator.catalog_sync import CatalogSyncError
+
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-201")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=RecordingCatalogSync(
+            events,
+            errors=(
+                [
+                    CatalogSyncError(
+                        "catalog_sync_failed",
+                        http_status=500,
+                        response_json='{"success":false}',
+                    )
+                ]
+                if catalog_failure
+                else None
+            ),
+        ),
+        callback_notifier=notifier,
+        max_catalog_sync_attempts=1,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+    published = store.get_job(job.id)
+    assert published.status is JobStatus.ENGLISH_SRT_READY
+    assert len(notifier.calls) == 1
+    assert worker.process_one() is True
+
+    assert [event[0] for event in events] == [
+        "translate",
+        "publish",
+        "webhook",
+        "catalog",
+    ]
+    current = store.get_job(job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.error is None
+    assert len(notifier.calls) == 1
+    assert current.catalog_sync_status == (
+        "failed" if catalog_failure else "succeeded"
+    )
+    catalog_log = (
+        mac_jobs_root / "abc-201" / "logs" / "mac-translation.log"
+    ).read_text(encoding="utf-8")
+    if catalog_failure:
+        assert 'http_status=500 response={"success":false}' in catalog_log
+    else:
+        assert 'http_status=200 response={"success":true}' in catalog_log
+
+
+def test_ready_webhook_is_not_sent_when_supabase_publication_fails(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-202")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(
+            events,
+            errors=[RuntimeError("supabase unavailable")],
+        ),
+        catalog_sync_client=RecordingCatalogSync(events),
+        callback_notifier=notifier,
+        max_publish_attempts=1,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert [event[0] for event in events] == ["translate", "publish"]
+    assert notifier.calls == []
+    assert store.get_job(job.id).status is JobStatus.FAILED
+
+
+def test_missing_catalog_client_cannot_block_verified_supabase_readiness(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-203")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=None,
+        callback_notifier=notifier,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert [event[0] for event in events] == ["translate", "publish", "webhook"]
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.artifact_status == "ready"
+    assert current.catalog_sync_status == "failed"
+    assert current.catalog_sync_warning_code == "catalog_sync_failed"
+    assert current.error is None
+    assert len(notifier.calls) == 1
 
 
 def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
@@ -2114,7 +2263,7 @@ def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):
     assert worker.process_one() is True
     assert store.get_job(job.id).status is JobStatus.PUBLISH_PENDING
     assert worker.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
     assert worker.process_one() is True
 
     refreshed = store.get_job(job.id)
@@ -2152,14 +2301,15 @@ def test_catalog_failure_retries_without_retranslation_or_reupload(
 
     assert worker.process_one() is True
     assert worker.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
     assert worker.process_one() is True
 
     failed = store.get_job(job.id)
-    assert failed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert failed.status is JobStatus.ENGLISH_SRT_READY
     assert failed.catalog_sync_attempt_count == 1
     assert failed.next_catalog_sync_attempt_at is not None
-    assert failed.error == f"catalog_sync: {reason_code}"
+    assert failed.error is None
+    assert failed.catalog_sync_warning_code == reason_code
     assert [event[0] for event in events].count("translate") == 1
     assert [event[0] for event in events].count("publish") == 1
 
@@ -2238,7 +2388,7 @@ def test_publish_retry_never_invokes_translator_again(sqlite_path, mac_jobs_root
 
     assert worker.process_one() is True
     refreshed = store.get_job(job.id)
-    assert refreshed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert refreshed.status is JobStatus.ENGLISH_SRT_READY
 
     assert worker.process_one() is True
     refreshed = store.get_job(job.id)
@@ -2468,7 +2618,7 @@ def test_due_publication_has_priority_over_new_translation(sqlite_path, mac_jobs
 
     assert worker.process_one() is True
 
-    assert store.get_job(pending.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(pending.id).status is JobStatus.ENGLISH_SRT_READY
     assert store.get_job(new_job.id).status is JobStatus.TRANSCRIPTION_DONE
     assert [event[0] for event in events] == ["translate", "publish"]
 
@@ -2737,7 +2887,7 @@ def test_worker_restart_resumes_only_catalog_stage(sqlite_path, mac_jobs_root):
     )
     assert first_worker.process_one() is True
     assert first_worker.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
 
     class MustNotRun:
         def __getattr__(self, name):
@@ -2782,7 +2932,7 @@ def test_publication_snapshot_failure_cannot_undo_committed_receipt(
     assert worker.process_one() is True
 
     committed = store.get_job(job.id)
-    assert committed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert committed.status is JobStatus.ENGLISH_SRT_READY
     assert committed.publish_attempt_count == 0
     assert committed.error is None
     assert "snapshot secret body" not in (
@@ -2810,7 +2960,7 @@ def test_catalog_snapshot_failure_keeps_ready_and_worker_continues(
     )
     assert worker.process_one() is True
     assert worker.process_one() is True
-    assert store.get_job(first.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(first.id).status is JobStatus.ENGLISH_SRT_READY
     monkeypatch.setattr(
         "orchestrator.mac_worker.write_job_snapshot",
         lambda job: (_ for _ in ()).throw(OSError("snapshot secret body")),
@@ -2847,7 +2997,7 @@ def test_catalog_worker_safely_yields_when_lease_is_recovered_and_reclaimed(
     )
     assert setup.process_one() is True
     assert setup.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
 
     catalog = ReclaimingCatalogSync(store, job.id, fail=catalog_fails)
     worker = MacTranslationWorker(
@@ -2864,7 +3014,7 @@ def test_catalog_worker_safely_yields_when_lease_is_recovered_and_reclaimed(
     assert worker.process_one() is True
 
     current = store.get_job(job.id)
-    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.status is JobStatus.ENGLISH_SRT_READY
     assert current.claimed_by == "replacement-worker"
     assert current.catalog_lease_token == catalog.reclaimed.catalog_lease_token
     assert current.catalog_sync_attempt_count == 1
@@ -2892,7 +3042,7 @@ def test_historical_catalog_preservation_failure_is_fenced_after_side_effect(
     )
     assert setup.process_one() is True
     assert setup.process_one() is True
-    assert store.get_job(job.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
 
     catalog = ReclaimingCatalogSync(store, job.id)
     worker = MacTranslationWorker(
@@ -2914,10 +3064,10 @@ def test_historical_catalog_preservation_failure_is_fenced_after_side_effect(
     assert worker.process_one() is True
 
     current = store.get_job(job.id)
-    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.status is JobStatus.ENGLISH_SRT_READY
     assert current.claimed_by == "replacement-worker"
     assert current.catalog_lease_token == catalog.reclaimed.catalog_lease_token
-    assert store.get_historical_repair(job.id).state is HistoricalRepairState.RUNNING
+    assert store.get_historical_repair(job.id).state is HistoricalRepairState.SUCCEEDED
 
 
 @pytest.mark.parametrize("database_failure_stage", ["complete", "fail"])
@@ -2973,7 +3123,7 @@ def test_catalog_worker_does_not_swallow_unknown_database_errors(
         worker.process_one()
 
     current = store.get_job(job.id)
-    assert current.status is JobStatus.CATALOG_SYNCING
+    assert current.status is JobStatus.ENGLISH_SRT_READY
     assert current.claimed_by == "database-error-worker"
 
 

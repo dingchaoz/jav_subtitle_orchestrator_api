@@ -39,7 +39,10 @@ MAC_ENV_ALIASES = (
     "JAVSUBTITLE_API_BASE",
     "JAVSUBTITLE_ADMIN_API_TOKEN",
     "CATALOG_SYNC_RETRY_SECONDS",
+    "CATALOG_SYNC_MAX_RETRY_SECONDS",
     "MAX_CATALOG_SYNC_ATTEMPTS",
+    "CALLBACK_CLIENTS_JSON",
+    "CALLBACK_TIMEOUT_SECONDS",
 )
 
 WINDOWS_ENV_ALIASES = (
@@ -245,7 +248,28 @@ def test_mac_settings_defaults_match_design_spec(monkeypatch, tmp_path):
     assert settings.javsubtitle_api_base is None
     assert settings.javsubtitle_admin_api_token is None
     assert settings.catalog_sync_retry_seconds == 30
+    assert settings.catalog_sync_max_retry_seconds == 900
     assert settings.max_catalog_sync_attempts == 10
+    assert settings.callback_clients == {}
+    assert settings.callback_timeout_seconds == 10
+
+
+def test_mac_callback_settings_parse_json_without_exposing_secrets(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    monkeypatch.setenv(
+        "CALLBACK_CLIENTS_JSON",
+        '{"machine-a.access":{"url":"https://client.example/ready",'
+        '"secret":"hmac-secret"}}',
+    )
+    monkeypatch.setenv("CALLBACK_TIMEOUT_SECONDS", "7")
+
+    settings = MacSettings(_env_file=None)
+
+    assert settings.callback_clients["machine-a.access"].url == (
+        "https://client.example/ready"
+    )
+    assert settings.callback_clients["machine-a.access"].secret == "hmac-secret"
+    assert settings.callback_timeout_seconds == 7
 
 
 def test_mac_catalog_sync_settings_load_overrides(monkeypatch):
@@ -253,6 +277,7 @@ def test_mac_catalog_sync_settings_load_overrides(monkeypatch):
     monkeypatch.setenv("JAVSUBTITLE_API_BASE", "https://javsubtitle.example")
     monkeypatch.setenv("JAVSUBTITLE_ADMIN_API_TOKEN", "test-admin-token")
     monkeypatch.setenv("CATALOG_SYNC_RETRY_SECONDS", "45")
+    monkeypatch.setenv("CATALOG_SYNC_MAX_RETRY_SECONDS", "180")
     monkeypatch.setenv("MAX_CATALOG_SYNC_ATTEMPTS", "12")
 
     settings = MacSettings(_env_file=None)
@@ -260,6 +285,7 @@ def test_mac_catalog_sync_settings_load_overrides(monkeypatch):
     assert settings.javsubtitle_api_base == "https://javsubtitle.example"
     assert settings.javsubtitle_admin_api_token == "test-admin-token"
     assert settings.catalog_sync_retry_seconds == 45
+    assert settings.catalog_sync_max_retry_seconds == 180
     assert settings.max_catalog_sync_attempts == 12
 
 
@@ -271,6 +297,7 @@ def test_mac_catalog_sync_settings_load_overrides(monkeypatch):
         ("MAC_PUBLISH_RETRY_SECONDS", "3601"),
         ("CATALOG_SYNC_RETRY_SECONDS", "0"),
         ("CATALOG_SYNC_RETRY_SECONDS", "3601"),
+        ("CATALOG_SYNC_MAX_RETRY_SECONDS", "0"),
         ("MAX_CATALOG_SYNC_ATTEMPTS", "0"),
     ],
 )
@@ -304,7 +331,7 @@ def test_catalog_sync_factory_is_disabled_with_local_publication():
 
 
 @pytest.mark.parametrize("missing", ["javsubtitle_api_base", "javsubtitle_admin_api_token"])
-def test_catalog_sync_factory_fails_closed_when_publication_enabled(missing):
+def test_catalog_sync_factory_is_optional_when_supabase_publication_is_enabled(missing):
     values = {
         "mac_translation_publish_enabled": True,
         "javsubtitle_api_base": "https://javsubtitle.example",
@@ -312,8 +339,7 @@ def test_catalog_sync_factory_fails_closed_when_publication_enabled(missing):
     }
     values[missing] = None
 
-    with pytest.raises(RuntimeError, match="catalog sync is enabled"):
-        build_catalog_sync_client(SimpleNamespace(**values))
+    assert build_catalog_sync_client(SimpleNamespace(**values)) is None
 
 
 def test_supabase_publisher_factory_shares_session_with_catalog_ensurer():

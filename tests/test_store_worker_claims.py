@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import orchestrator.store as store_module
-from orchestrator.models import JobStatus
+from orchestrator.models import ArtifactStatus, CatalogSyncStatus, JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import JobStore
 
@@ -1329,7 +1329,9 @@ def test_supabase_success_is_only_from_claim_and_records_verified_receipt(
         lease_token=claimed.stage_lease_token,
     )
 
-    assert completed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert completed.status is JobStatus.ENGLISH_SRT_READY
+    assert completed.artifact_status == ArtifactStatus.READY.value
+    assert completed.catalog_sync_status == CatalogSyncStatus.PENDING.value
     assert completed.catalog_movie_uuid == movie_uuid
     assert completed.metadata_status == "placeholder"
     assert completed.metadata_source == "placeholder"
@@ -1341,6 +1343,7 @@ def test_supabase_success_is_only_from_claim_and_records_verified_receipt(
     assert completed.error is None
     assert completed.claimed_by is None
     assert completed.lease_expires_at is None
+    assert completed.catalog_lease_token is None
 
 
 @pytest.mark.parametrize(
@@ -1456,7 +1459,9 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
     syncing = store.claim_catalog_sync_job(
         "catalog-worker", 60, job_id=receipt.id
     )
-    assert syncing.status is JobStatus.CATALOG_SYNCING
+    assert syncing.status is JobStatus.ENGLISH_SRT_READY
+    assert syncing.catalog_sync_status == CatalogSyncStatus.PENDING.value
+    assert syncing.claimed_by == "catalog-worker"
     failed = store.fail_catalog_sync(
         syncing.id,
         "catalog-worker",
@@ -1465,12 +1470,15 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
         max_catalog_sync_attempts=3,
         retry_seconds=0,
     )
-    assert failed.status is JobStatus.CATALOG_SYNC_PENDING
+    assert failed.status is JobStatus.ENGLISH_SRT_READY
+    assert failed.artifact_status == ArtifactStatus.READY.value
+    assert failed.catalog_sync_status == CatalogSyncStatus.PENDING.value
     assert failed.catalog_sync_attempt_count == 1
     assert failed.publish_attempt_count == 0
     assert failed.next_catalog_sync_attempt_at is not None
     assert failed.published_subtitle_id == receipt.published_subtitle_id
-    assert failed.error == "catalog_sync: catalog_fetch_failed"
+    assert failed.error is None
+    assert failed.catalog_sync_warning_code == "catalog_fetch_failed"
 
     syncing = store.claim_catalog_sync_job(
         "catalog-worker", 60, job_id=receipt.id
@@ -1490,12 +1498,14 @@ def test_catalog_sync_claim_failure_retry_and_exact_success(
         ),
     )
     assert ready.status is JobStatus.ENGLISH_SRT_READY
+    assert ready.artifact_status == ArtifactStatus.READY.value
+    assert ready.catalog_sync_status == CatalogSyncStatus.SUCCEEDED.value
     assert ready.claimed_by is None
     assert ready.lease_expires_at is None
     assert ready.error is None
 
 
-def test_retry_failed_catalog_sync_preserves_verified_publication(
+def test_exhausted_catalog_sync_preserves_verified_publication_ready_state(
     sqlite_path, mac_jobs_root
 ):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
@@ -1524,18 +1534,119 @@ def test_retry_failed_catalog_sync_preserves_verified_publication(
         lease_token=syncing.catalog_lease_token,
         max_catalog_sync_attempts=1,
         retry_seconds=30,
+        retryable=True,
+        http_status=500,
+        response_json='{"success":false}',
+        max_retry_seconds=300,
     )
-    assert failed.status is JobStatus.FAILED
+    assert failed.status is JobStatus.ENGLISH_SRT_READY
+    assert failed.artifact_status == ArtifactStatus.READY.value
+    assert failed.catalog_sync_status == CatalogSyncStatus.FAILED.value
+    assert failed.catalog_sync_attempt_count == 1
+    assert failed.next_catalog_sync_attempt_at is None
+    assert failed.error is None
+    assert failed.catalog_sync_warning_code == "catalog_response_mismatch"
+    assert failed.catalog_sync_last_http_status == 500
+    assert failed.catalog_sync_last_response_json == '{"success":false}'
+    assert failed.catalog_sync_last_attempt_at is not None
+    assert failed.catalog_movie_uuid == receipt.catalog_movie_uuid
+    assert failed.published_subtitle_id == receipt.published_subtitle_id
+    assert failed.published_content_sha256 == receipt.published_content_sha256
 
-    retried = store.retry_failed_catalog_sync(failed.id)
 
-    assert retried.status is JobStatus.CATALOG_SYNC_PENDING
-    assert retried.catalog_sync_attempt_count == 0
-    assert retried.next_catalog_sync_attempt_at is None
-    assert retried.error is None
-    assert retried.catalog_movie_uuid == receipt.catalog_movie_uuid
-    assert retried.published_subtitle_id == receipt.published_subtitle_id
-    assert retried.published_content_sha256 == receipt.published_content_sha256
+def test_catalog_sync_retry_uses_capped_exponential_backoff(
+    sqlite_path, mac_jobs_root, monkeypatch
+):
+    fixed_now = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz):
+            return fixed_now
+
+    monkeypatch.setattr(store_module, "datetime", FixedDatetime)
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-130")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    ready = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-130/abc-130-English_AI.srt",
+        content_sha256="1" * 64,
+        file_size=111,
+        lease_token=publishing.stage_lease_token,
+    )
+
+    for attempt, expected_delay in enumerate((30, 60, 120, 120, 120), start=1):
+        claimed = store.claim_catalog_sync_job("catalog-worker", 60, job_id=ready.id)
+        failed = store.fail_catalog_sync(
+            claimed.id,
+            "catalog-worker",
+            "catalog_sync_failed",
+            lease_token=claimed.catalog_lease_token,
+            max_catalog_sync_attempts=10,
+            retry_seconds=30,
+            max_retry_seconds=120,
+            retryable=True,
+            http_status=500,
+            response_json='{"success":false}',
+        )
+        scheduled = datetime.fromisoformat(failed.next_catalog_sync_attempt_at)
+        assert int((scheduled - fixed_now).total_seconds()) == expected_delay
+        assert failed.catalog_sync_attempt_count == attempt
+        assert failed.status is JobStatus.ENGLISH_SRT_READY
+        assert failed.catalog_sync_status == CatalogSyncStatus.PENDING.value
+        with store.connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET next_catalog_sync_attempt_at = NULL WHERE id = ?",
+                (ready.id,),
+            )
+
+
+def test_nonretryable_catalog_failure_only_fails_catalog_substate(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-131")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    ready = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-131/abc-131-English_AI.srt",
+        content_sha256="2" * 64,
+        file_size=222,
+        lease_token=publishing.stage_lease_token,
+    )
+    claimed = store.claim_catalog_sync_job("catalog-worker", 60, job_id=ready.id)
+
+    failed = store.fail_catalog_sync(
+        claimed.id,
+        "catalog-worker",
+        "catalog_auth_failed",
+        lease_token=claimed.catalog_lease_token,
+        max_catalog_sync_attempts=10,
+        retry_seconds=30,
+        max_retry_seconds=120,
+        retryable=False,
+        http_status=403,
+        response_json='{"success":false}',
+    )
+
+    assert failed.status is JobStatus.ENGLISH_SRT_READY
+    assert failed.artifact_status == ArtifactStatus.READY.value
+    assert failed.catalog_sync_status == CatalogSyncStatus.FAILED.value
+    assert failed.next_catalog_sync_attempt_at is None
+    assert failed.error is None
 
 
 def test_catalog_complete_accepts_versioned_full_cache_key(
@@ -1590,6 +1701,46 @@ def test_retry_failed_catalog_sync_rejects_non_catalog_failure(
         store.retry_failed_catalog_sync(failed.id)
 
 
+def test_legacy_catalog_retry_restores_ready_main_status_before_requeue(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-033")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    ready = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-033/abc-033-English_AI.srt",
+        content_sha256="e" * 64,
+        file_size=456,
+        lease_token=publishing.stage_lease_token,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, artifact_status = NULL, "
+            "catalog_sync_status = NULL, error = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "catalog_sync: catalog_sync_failed",
+                ready.id,
+            ),
+        )
+
+    retried = store.retry_failed_catalog_sync(ready.id)
+
+    assert retried.status is JobStatus.ENGLISH_SRT_READY
+    assert retried.artifact_status == "ready"
+    assert retried.catalog_sync_status == "pending"
+    assert retried.catalog_sync_warning_code == "catalog_sync_failed"
+    assert retried.error is None
+
+
 def test_expired_catalog_sync_lease_uses_only_catalog_counter(
     sqlite_path, mac_jobs_root
 ):
@@ -1616,11 +1767,13 @@ def test_expired_catalog_sync_lease_uses_only_catalog_counter(
     assert store.recover_expired_catalog_sync_leases(3, 0) == 1
 
     recovered = store.get_job(receipt.id)
-    assert recovered.status is JobStatus.CATALOG_SYNC_PENDING
+    assert recovered.status is JobStatus.ENGLISH_SRT_READY
+    assert recovered.catalog_sync_status == CatalogSyncStatus.PENDING.value
     assert recovered.catalog_sync_attempt_count == 1
     assert recovered.publish_attempt_count == 0
     assert recovered.translation_attempt_count == 0
-    assert recovered.error == "catalog_sync: catalog_sync_lease_expired"
+    assert recovered.error is None
+    assert recovered.catalog_sync_warning_code == "catalog_sync_lease_expired"
 
 
 def test_migrated_null_catalog_token_expired_lease_recovers(
@@ -1658,7 +1811,8 @@ def test_migrated_null_catalog_token_expired_lease_recovers(
 
     assert store.recover_expired_catalog_sync_leases(3, 0) == 1
     recovered = store.get_job(receipt.id)
-    assert recovered.status is JobStatus.CATALOG_SYNC_PENDING
+    assert recovered.status is JobStatus.ENGLISH_SRT_READY
+    assert recovered.catalog_sync_status == CatalogSyncStatus.PENDING.value
     assert recovered.claimed_by is None
     assert recovered.catalog_sync_attempt_count == 1
 
@@ -1694,7 +1848,7 @@ def test_catalog_recovery_includes_lease_expiring_exactly_now(
     monkeypatch.setattr(store_module, "datetime", FixedDatetime)
 
     assert store.recover_expired_catalog_sync_leases(3, 0) == 1
-    assert store.get_job(receipt.id).status is JobStatus.CATALOG_SYNC_PENDING
+    assert store.get_job(receipt.id).status is JobStatus.ENGLISH_SRT_READY
 
 
 def test_catalog_fencing_rejects_stale_same_worker_complete_and_fail(
@@ -1737,7 +1891,7 @@ def test_catalog_fencing_rejects_stale_same_worker_complete_and_fail(
             kv_keys_deleted=("movie:full:abc-027", "movie:light:abc-027"),
         )
     unchanged = store.get_job(receipt.id)
-    assert unchanged.status is JobStatus.CATALOG_SYNCING
+    assert unchanged.status is JobStatus.ENGLISH_SRT_READY
     assert unchanged.catalog_lease_token == second.catalog_lease_token
     assert unchanged.catalog_sync_attempt_count == 1
 
@@ -1751,7 +1905,7 @@ def test_catalog_fencing_rejects_stale_same_worker_complete_and_fail(
             retry_seconds=0,
         )
     unchanged = store.get_job(receipt.id)
-    assert unchanged.status is JobStatus.CATALOG_SYNCING
+    assert unchanged.status is JobStatus.ENGLISH_SRT_READY
     assert unchanged.catalog_lease_token == second.catalog_lease_token
     assert unchanged.catalog_sync_attempt_count == 1
 
@@ -1829,7 +1983,7 @@ def test_catalog_fencing_rejects_different_worker_and_expired_lease(
                     retry_seconds=0,
                 )
     unchanged = store.get_job(receipt.id)
-    assert unchanged.status is JobStatus.CATALOG_SYNCING
+    assert unchanged.status is JobStatus.ENGLISH_SRT_READY
     assert unchanged.catalog_sync_attempt_count == 0
 
 
@@ -1869,7 +2023,7 @@ def test_catalog_claim_refuses_strictly_invalid_verified_receipt(
 
     assert store.claim_catalog_sync_job("catalog-worker", 60, job_id=receipt.id) is None
     unchanged = store.get_job(receipt.id)
-    assert unchanged.status is JobStatus.CATALOG_SYNC_PENDING
+    assert unchanged.status is JobStatus.ENGLISH_SRT_READY
     assert unchanged.claimed_by is None
 
 
@@ -1910,7 +2064,7 @@ def test_catalog_complete_revalidates_receipt_after_claim(
             kv_keys_deleted=("movie:full:abc-029", "movie:light:abc-029"),
         )
     unchanged = store.get_job(receipt.id)
-    assert unchanged.status is JobStatus.CATALOG_SYNCING
+    assert unchanged.status is JobStatus.ENGLISH_SRT_READY
     assert unchanged.catalog_lease_token == syncing.catalog_lease_token
 
 
@@ -1962,7 +2116,8 @@ def test_catalog_sync_failure_rejects_unrecognized_reason_text(
         retry_seconds=0,
     )
 
-    assert failed.error == "catalog_sync: catalog_sync_failed"
+    assert failed.error is None
+    assert failed.catalog_sync_warning_code == "catalog_sync_failed"
 
 
 def test_expired_publication_lease_uses_publication_counter(

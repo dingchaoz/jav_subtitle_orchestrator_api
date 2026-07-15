@@ -1,12 +1,34 @@
+import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAC_ENV_FILE = PROJECT_ROOT / ".env"
 WINDOWS_ENV_FILE = PROJECT_ROOT / ".env.windows"
+
+
+class CallbackClientSettings(BaseModel):
+    url: str
+    secret: str = Field(min_length=1)
+
+    @field_validator("url")
+    @classmethod
+    def validate_https_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("callback URL must use HTTPS")
+        return value
 
 
 class MacSettings(BaseSettings):
@@ -96,10 +118,25 @@ class MacSettings(BaseSettings):
         le=3600,
         alias="CATALOG_SYNC_RETRY_SECONDS",
     )
+    catalog_sync_max_retry_seconds: int = Field(
+        default=900,
+        ge=1,
+        alias="CATALOG_SYNC_MAX_RETRY_SECONDS",
+    )
     max_catalog_sync_attempts: int = Field(
         default=10,
         ge=1,
         alias="MAX_CATALOG_SYNC_ATTEMPTS",
+    )
+    callback_clients: dict[str, CallbackClientSettings] = Field(
+        default_factory=dict,
+        alias="CALLBACK_CLIENTS_JSON",
+    )
+    callback_timeout_seconds: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        alias="CALLBACK_TIMEOUT_SECONDS",
     )
     supabase_subtitle_bucket: str = Field(
         default="subtitles",
@@ -121,6 +158,23 @@ class MacSettings(BaseSettings):
         le=120,
         alias="SUBTITLE_AUDIT_TIMEOUT_SECONDS",
     )
+
+    @field_validator("callback_clients", mode="before")
+    @classmethod
+    def parse_callback_clients_json(cls, value):
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                raise ValueError("callback clients JSON is invalid") from None
+        if not isinstance(value, dict) or any(
+            not isinstance(key, str) or not key or len(key) > 256
+            for key in value
+        ):
+            raise ValueError("callback clients JSON is invalid")
+        return value
 
 
 class WindowsSettings(BaseSettings):

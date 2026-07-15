@@ -39,7 +39,10 @@ SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
 JAVSUBTITLE_API_BASE=https://your-javsubtitle-api.example
 JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-server-side-admin-api-token
 CATALOG_SYNC_RETRY_SECONDS=30
+CATALOG_SYNC_MAX_RETRY_SECONDS=900
 MAX_CATALOG_SYNC_ATTEMPTS=10
+CALLBACK_CLIENTS_JSON={}
+CALLBACK_TIMEOUT_SECONDS=10
 LOCAL_AUDIT_TIMEOUT_SECONDS=30
 SUBTITLE_AUDIT_TIMEOUT_SECONDS=30
 ```
@@ -98,14 +101,17 @@ flow is:
 ```text
 audio_ready → transcription_claimed → transcribing → transcription_done
 → translating → publish_pending → publishing
-→ catalog_sync_pending → catalog_syncing → english_srt_ready
+→ english_srt_ready
+       └─ catalog_sync_status=pending → succeeded | failed
 ```
 
 Windows owns `transcription_claimed` through `transcription_done`. The one Mac
 translation worker then runs translation and the quality gate, verifies the
-Supabase Storage/catalog publication, enters `catalog_sync_pending`, synchronizes
-the exact movie through the javsubtitle.com admin API, verifies the public movie
-API, and only then marks `english_srt_ready`.
+Supabase Storage/catalog publication, and immediately marks
+`english_srt_ready` with `artifact_status=ready`, `catalog_sync_status=pending`,
+and `error=null`. It sends the configured signed `subtitle.ready` webhook at this
+point. It then synchronizes the exact movie through the javsubtitle.com admin API
+and verifies the public movie API as non-blocking follow-up work.
 
 When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker uses the
 local-only compatibility flow. After the quality gate it skips `publish_pending`,
@@ -115,8 +121,10 @@ local-only compatibility flow. After the quality gate it skips `publish_pending`
 quality-approved; it does not mean Supabase or javsubtitle.com verification
 occurred.
 
-With publication enabled, `english_srt_ready` means Supabase publication and
-javsubtitle.com synchronization/visibility verification all completed. A
+With publication enabled, `english_srt_ready` means the Storage object and exact
+Supabase `movie_languages` row are verified. javsubtitle.com D1/KV sync is exposed
+separately through `catalog_sync_status`; failure adds a safe warning and never
+changes the main status or `ready=true`. A
 `metadata_status=placeholder` result is successful: when neither usable local
 metadata nor a MissAV catalog match is available, the RPC creates a code-only
 `public.movies` row, publication continues, and later metadata enrichment keeps
@@ -135,20 +143,57 @@ Failure handling is separated by stage:
   English SRT and audio stay in place, and the worker does not translate again.
   After `MAX_PUBLISH_ATTEMPTS`, the job becomes `failed` while retaining those
   files.
-- Successful Supabase publication stores its verified receipt and advances the job
-  to `catalog_sync_pending`. From that point, a javsubtitle.com exact catalog-sync
-  or public-API visibility failure remains in or returns to
-  `catalog_sync_pending`. Its independent retry revalidates the durable Supabase
-  receipt and repeats only the exact sync/visibility checks; it does not
-  retranslate, republish Supabase, delete audio, or replace the verified English
-  SRT. Authentication failures and exhausted catalog retries hard-pause the
-  historical lane.
+- Successful Supabase publication stores its verified receipt and advances the
+  main job to `english_srt_ready`. From that point, a javsubtitle.com exact
+  catalog-sync or public-API visibility failure keeps
+  `catalog_sync_status=pending` for a bounded retry, or records
+  `catalog_sync_status=failed` after exhaustion. Its independent retry revalidates
+  the durable Supabase receipt and repeats only the exact sync/visibility checks;
+  it does not retranslate, republish Supabase, delete audio, replace the verified
+  English SRT, or send a failed webhook.
 
 `MAX_PUBLISH_ATTEMPTS` bounds publication attempts independently of translation.
 `MAC_PUBLISH_RETRY_SECONDS` controls the delay before a pending publication may be
 claimed again.
-`MAX_CATALOG_SYNC_ATTEMPTS` and `CATALOG_SYNC_RETRY_SECONDS` independently bound
-catalog synchronization after Supabase publication.
+`MAX_CATALOG_SYNC_ATTEMPTS`, `CATALOG_SYNC_RETRY_SECONDS`, and
+`CATALOG_SYNC_MAX_RETRY_SECONDS` define bounded exponential catalog retries after
+Supabase publication. Network errors, 5xx, HTTP 207, invalid JSON, recoverable
+response mismatches, and public-visibility uncertainty are retryable. HTTP status
+and response summaries are sanitized before storage/logging.
+
+`CALLBACK_CLIENTS_JSON` maps configured Cloudflare Access client IDs to callback
+URL/HMAC secret pairs; arbitrary callback URLs are not accepted from job request
+bodies. `CALLBACK_TIMEOUT_SECONDS` bounds each ready notification. A failed
+callback remains secondary operational state and cannot downgrade a ready job.
+
+## Reconcile historical catalog false failures
+
+The reconciliation command is dry-run by default. It selects only unclaimed jobs
+whose main status is `failed`, whose error starts with `catalog_sync:`, and whose
+stored publication receipt is complete. For every selected job it performs only
+an exact Supabase `movie_languages` GET and a streamed Storage GET with size and
+SHA-256 verification:
+
+```bash
+.venv/bin/python -m orchestrator reconcile-catalog-sync-failures \
+  --movie KTB-104 --movie KTB-110 --movie KTB-111 --limit 3
+```
+
+Review the deterministic JSON result before requesting a separate production
+change approval. Only then run the same allowlist with `--execute`; optional flags
+can requeue catalog sync and retry a missing/failed ready webhook:
+
+```bash
+.venv/bin/python -m orchestrator reconcile-catalog-sync-failures \
+  --movie KTB-104 --movie KTB-110 --movie KTB-111 --limit 3 \
+  --execute --retry-catalog-sync --resend-ready-webhook
+```
+
+Execution uses a receipt-level compare-and-swap. If the row, original error,
+claim, timestamp, or any publication receipt field changes after remote
+verification, that record is skipped. The command never deploys code, and this
+runbook does not authorize running it against production without separate
+approval.
 
 ## Recover one interrupted audio download
 
@@ -748,7 +793,10 @@ SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS=90
 JAVSUBTITLE_API_BASE=https://your-production-api.example
 JAVSUBTITLE_ADMIN_API_TOKEN=replace-with-server-side-admin-api-token
 CATALOG_SYNC_RETRY_SECONDS=30
+CATALOG_SYNC_MAX_RETRY_SECONDS=900
 MAX_CATALOG_SYNC_ATTEMPTS=10
+CALLBACK_CLIENTS_JSON={}
+CALLBACK_TIMEOUT_SECONDS=10
 ```
 
 Keep the Supabase service key server-side. Stop the general translation worker and
@@ -780,16 +828,17 @@ The one-shot worker runs startup smoke and can claim only that exact ID. It move
 the old English SRT into `rejected/`, retains it, preserves Japanese SRT and any
 preexisting `audio.wav`, and preserves audio absence when historical cleanup already
 removed it. It translates, runs the pair quality gate, upserts Supabase, and verifies
-Storage SHA-256 plus the `movie_languages` catalog record before entering
-`catalog_sync_pending`. A quality failure never creates catalog data or uploads and
-is permanent. A transient Supabase publication, Storage, or `movie_languages`
+Storage SHA-256 plus the `movie_languages` catalog record before entering main
+`english_srt_ready` with `catalog_sync_status=pending`. A quality failure never
+creates catalog data or uploads and is permanent. A transient Supabase publication, Storage, or `movie_languages`
 verification failure returns to `publish_pending` under the bounded, independent
 publication retry counter. Once Supabase publication has succeeded, a
-javsubtitle.com exact catalog-sync or public-API visibility failure remains in or
-returns to `catalog_sync_pending`; its retry only revalidates the stored verified
-Supabase receipt and repeats the exact sync/visibility checks. Neither retry path
-retranslates, and the catalog path never republishes Supabase. A code-only
-placeholder catalog result is allowed and successful.
+javsubtitle.com exact catalog-sync or public-API visibility failure remains a
+warning under `catalog_sync_status=pending` or `failed`; its retry only revalidates
+the stored verified Supabase receipt and repeats the exact sync/visibility checks.
+Neither retry path retranslates, the catalog path never republishes Supabase, and
+catalog failure never downgrades the ready main status. A code-only placeholder
+catalog result is allowed and successful.
 
 After local, Supabase, CDN, and `https://javsubtitle.com` verification succeeds,
 restart the normal `mac-translation-worker`. This procedure authorizes one canary

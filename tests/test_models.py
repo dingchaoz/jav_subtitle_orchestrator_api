@@ -1,4 +1,4 @@
-from orchestrator.models import JobStatus
+from orchestrator.models import ArtifactStatus, CatalogSyncStatus, JobStatus
 
 
 def test_job_statuses_match_design_spec_order():
@@ -24,3 +24,12 @@ def test_job_statuses_match_design_spec_order():
 def test_catalog_sync_job_status_values():
     assert JobStatus.CATALOG_SYNC_PENDING == "catalog_sync_pending"
     assert JobStatus.CATALOG_SYNCING == "catalog_syncing"
+
+
+def test_independent_artifact_and_catalog_status_values():
+    assert [status.value for status in ArtifactStatus] == ["ready"]
+    assert [status.value for status in CatalogSyncStatus] == [
+        "pending",
+        "succeeded",
+        "failed",
+    ]

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from orchestrator.dashboard import (
@@ -23,6 +23,7 @@ from orchestrator.models import (
     JobDetailResponse,
     JobLogTailResponse,
     JobLogsResponse,
+    JobWarning,
     MAX_AUDIT_OFFSET,
     JobResponse,
     JobStatus,
@@ -56,6 +57,20 @@ class SubtitleAuditServiceProtocol(Protocol):
     def get_finding(self, subtitle_id: str) -> SubtitleAuditItem | None: ...
 
 
+def job_warnings(job: JobRecord) -> list[JobWarning]:
+    if not job.catalog_sync_warning_code:
+        return []
+    return [
+        JobWarning(
+            code=job.catalog_sync_warning_code,
+            message=(
+                job.catalog_sync_warning_message
+                or "Catalog synchronization failed."
+            ),
+        )
+    ]
+
+
 def job_response(job: JobRecord) -> JobResponse:
     return JobResponse(
         id=job.id,
@@ -64,6 +79,10 @@ def job_response(job: JobRecord) -> JobResponse:
         job_dir_mac=job.job_dir_mac,
         job_dir_windows=job.job_dir_windows,
         error=job.error,
+        ready=job.status is JobStatus.ENGLISH_SRT_READY,
+        artifact_status=job.artifact_status,
+        catalog_sync_status=job.catalog_sync_status,
+        warnings=job_warnings(job),
     )
 
 
@@ -101,20 +120,31 @@ def create_app(
     max_worker_attempts: int = 3,
     final_file_exists: Callable[[str], bool] | None = None,
     subtitle_audit_service: SubtitleAuditServiceProtocol | None = None,
+    callback_clients: dict[str, object] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
     audit_close = getattr(subtitle_audit_service, "close", None)
     if callable(audit_close):
         app.router.add_event_handler("shutdown", audit_close)
     final_file_exists = final_file_exists or (lambda path: Path(path).exists())
+    callback_clients = callback_clients or {}
+
+    def callback_client_key(request: Request) -> str | None:
+        candidate = request.headers.get("cf-access-client-id")
+        return candidate if candidate in callback_clients else None
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard_page() -> str:
         return dashboard_html()
 
     @app.post("/jobs", response_model=JobResponse)
-    def submit_job(request: SubmitJobRequest) -> JobResponse:
-        result = store.submit_job(request.movie_number, request.priority, request.force)
+    def submit_job(request: SubmitJobRequest, http_request: Request) -> JobResponse:
+        result = store.submit_job(
+            request.movie_number,
+            request.priority,
+            request.force,
+            callback_client_key=callback_client_key(http_request),
+        )
         if result.kind == "invalid":
             raise HTTPException(status_code=422, detail="invalid movie_number")
         if result.kind == "conflict":
@@ -125,8 +155,16 @@ def create_app(
         return job_response(result.job)
 
     @app.post("/jobs/batch", response_model=BatchJobResponse)
-    def submit_batch(request: SubmitBatchRequest) -> BatchJobResponse:
-        result = store.submit_batch(request.movie_numbers, request.priority, request.force)
+    def submit_batch(
+        request: SubmitBatchRequest,
+        http_request: Request,
+    ) -> BatchJobResponse:
+        result = store.submit_batch(
+            request.movie_numbers,
+            request.priority,
+            request.force,
+            callback_client_key=callback_client_key(http_request),
+        )
         return BatchJobResponse(
             created=[job_response(item.job) for item in result.created],
             existing=[job_response(item.job) for item in result.existing if item.job is not None],

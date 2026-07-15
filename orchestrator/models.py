@@ -58,6 +58,21 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ArtifactStatus(StrEnum):
+    READY = "ready"
+
+
+class CatalogSyncStatus(StrEnum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class JobWarning(BaseModel):
+    code: str
+    message: str
+
+
 class JobPaths(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -114,6 +129,10 @@ class JobResponse(BaseModel):
     job_dir_mac: str
     job_dir_windows: str
     error: str | None = None
+    ready: bool = False
+    artifact_status: ArtifactStatus | None = None
+    catalog_sync_status: CatalogSyncStatus | None = None
+    warnings: list[JobWarning] = Field(default_factory=list)
 
 
 class BatchJobResponse(BaseModel):
@@ -236,6 +255,15 @@ class JobDetailResponse(BaseModel):
     translation_attempt_count: int
     publish_attempt_count: int
     next_publish_attempt_at: str | None = None
+    artifact_status: ArtifactStatus | None = None
+    catalog_sync_status: CatalogSyncStatus | None = None
+    catalog_sync_warning_code: str | None = None
+    catalog_sync_warning_message: str | None = None
+    catalog_sync_attempt_count: int = 0
+    next_catalog_sync_attempt_at: str | None = None
+    catalog_sync_last_http_status: int | None = None
+    catalog_sync_last_response_json: str | None = None
+    catalog_sync_last_attempt_at: str | None = None
     catalog_movie_uuid: str | None = None
     metadata_status: str | None = None
     metadata_source: str | None = None
