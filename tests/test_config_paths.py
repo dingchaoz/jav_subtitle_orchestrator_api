@@ -331,7 +331,7 @@ def test_catalog_sync_factory_is_disabled_with_local_publication():
 
 
 @pytest.mark.parametrize("missing", ["javsubtitle_api_base", "javsubtitle_admin_api_token"])
-def test_catalog_sync_factory_fails_closed_when_publication_enabled(missing):
+def test_catalog_sync_factory_is_optional_when_supabase_publication_is_enabled(missing):
     values = {
         "mac_translation_publish_enabled": True,
         "javsubtitle_api_base": "https://javsubtitle.example",
@@ -339,8 +339,7 @@ def test_catalog_sync_factory_fails_closed_when_publication_enabled(missing):
     }
     values[missing] = None
 
-    with pytest.raises(RuntimeError, match="catalog sync is enabled"):
-        build_catalog_sync_client(SimpleNamespace(**values))
+    assert build_catalog_sync_client(SimpleNamespace(**values)) is None
 
 
 def test_supabase_publisher_factory_shares_session_with_catalog_ensurer():

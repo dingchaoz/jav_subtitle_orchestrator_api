@@ -259,10 +259,7 @@ def build_catalog_sync_client(settings):
     if not settings.mac_translation_publish_enabled:
         return None
     if not settings.javsubtitle_api_base or not settings.javsubtitle_admin_api_token:
-        raise RuntimeError(
-            "Supabase publication and catalog sync is enabled but website API base "
-            "or admin token is missing"
-        )
+        return None
     from orchestrator.catalog_sync import CatalogSyncClient
 
     return CatalogSyncClient(
@@ -310,6 +307,8 @@ def build_callback_clients(settings):
 
 
 def build_callback_notifier(store, settings):
+    if not getattr(settings, "callback_clients", {}):
+        return None
     from orchestrator.callbacks import CallbackNotifier
 
     return CallbackNotifier(
@@ -339,7 +338,8 @@ def run_catalog_sync_reconciliation(
         settings.jobs_root_mac,
         settings.jobs_root_windows,
     )
-    store.initialize()
+    if execute:
+        store.initialize()
     reconciler = CatalogSyncReconciler(
         store,
         build_supabase_publication_verifier(settings),
@@ -529,7 +529,7 @@ def run_mac_translation_worker() -> None:
             max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
             catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
             catalog_sync_max_retry_seconds=(
-                settings.catalog_sync_max_retry_seconds
+                getattr(settings, "catalog_sync_max_retry_seconds", 900)
             ),
             callback_notifier=build_callback_notifier(store, settings),
         )
@@ -569,7 +569,11 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         catalog_sync_client=catalog_sync_client,
         max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
         catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
-        catalog_sync_max_retry_seconds=settings.catalog_sync_max_retry_seconds,
+        catalog_sync_max_retry_seconds=getattr(
+            settings,
+            "catalog_sync_max_retry_seconds",
+            900,
+        ),
         callback_notifier=build_callback_notifier(store, settings),
     )
     worker.process_job_id(job_id)

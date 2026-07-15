@@ -271,6 +271,30 @@ def test_sync_accepts_production_schema_semantically_and_redacts_unknown_values(
     assert ADULT_TEXT not in result.diagnostic.response_json
 
 
+@pytest.mark.parametrize(
+    "deleted",
+    [
+        [
+            f"movie:full:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+        ],
+        [
+            f"movie:full:{CANONICAL_CODE}",
+            {"unsafe": "entry"},
+        ],
+    ],
+)
+def test_both_kv_receipts_must_be_independently_well_formed(deleted):
+    body = production_body()
+    body["results"][0]["kvKeysDeleted"] = deleted
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+
+
 def test_http_207_is_retryable_and_retains_only_safe_partial_failure_metadata():
     body = {
         "success": False,
@@ -439,6 +463,15 @@ def response_mutations() -> list[tuple[str, object]]:
         ("results wrong type", lambda body: body.update(results={})),
         ("results wrong count", lambda body: body.update(results=[])),
         ("result not object", lambda body: body.update(results=[ADULT_TEXT])),
+        ("unexpected action", lambda body: body.update(action="claim-fence")),
+        (
+            "rejected fence",
+            lambda body: body.update(fence={"value": 42, "accepted": False}),
+        ),
+        (
+            "nonpositive fence",
+            lambda body: body.update(fence={"value": 0, "accepted": True}),
+        ),
         (
             "canonical code mismatch",
             lambda body: body["results"][0].update(canonicalCode="abc-123"),
@@ -613,6 +646,8 @@ def test_public_movie_verification_fails_closed_on_mismatch(body, reason):
         sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
 
     assert raised.value.reason_code == reason
+    assert raised.value.http_status == 200
+    assert '"success":true' in raised.value.response_json
     assert TOKEN not in repr(raised.value)
     assert ADULT_TEXT not in repr(raised.value)
 

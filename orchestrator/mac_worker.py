@@ -208,9 +208,9 @@ class MacTranslationWorker:
         self.max_publish_attempts = max_publish_attempts
         self.publish_retry_seconds = publish_retry_seconds
         self.catalog_sync_client = catalog_sync_client
-        self.publication_pipeline_configured = bool(
-            publisher is not None
-            and catalog_sync_client is not None
+        self.publication_pipeline_configured = publisher is not None
+        self.catalog_sync_configured = bool(
+            catalog_sync_client is not None
             and getattr(
                 catalog_sync_client,
                 "public_visibility_verification_enabled",
@@ -363,6 +363,16 @@ class MacTranslationWorker:
             self._finalize_ready_historical(ready_historical)
             return True
         if self.publication_pipeline_configured:
+            if not self.catalog_sync_configured:
+                unavailable = self.store.mark_catalog_sync_unavailable()
+                if unavailable is not None:
+                    _write_job_snapshot_safely(unavailable)
+                    _append_job_log_safely(
+                        Path(unavailable.job_dir_mac),
+                        "mac-translation.log",
+                        f"catalog_sync_unavailable {unavailable.id}",
+                    )
+                    return True
             inflight = self.store.claim_inflight_historical_stage(
                 self.worker_id,
                 self.lease_seconds,
@@ -492,6 +502,9 @@ class MacTranslationWorker:
                 or current.catalog_sync_status != "pending"
             ):
                 return True
+        if not self.catalog_sync_configured:
+            self.store.mark_catalog_sync_unavailable(job_id=job_id)
+            return True
         catalog_job = self.store.claim_catalog_sync_job(
             self.worker_id,
             self.lease_seconds,
@@ -1684,6 +1697,10 @@ class MacTranslationWorker:
                     "mac-translation.log",
                     f"callback_failed {job.id}",
                 )
+        if not self.catalog_sync_configured:
+            unavailable = self.store.mark_catalog_sync_unavailable(job_id=job.id)
+            if unavailable is not None:
+                updated = unavailable
         _write_job_snapshot_safely(updated)
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -1749,7 +1766,9 @@ class MacTranslationWorker:
                     _append_job_log_safely(
                         Path(job.job_dir_mac),
                         "mac-translation.log",
-                        f"catalog_sync_failed {job.id} reason_code={reason_code}",
+                        f"catalog_sync_failed {job.id} reason_code={reason_code} "
+                        f"http_status={http_status if http_status is not None else 'null'} "
+                        f"response={response_json if response_json is not None else 'null'}",
                     )
             else:
                 try:
@@ -1779,7 +1798,9 @@ class MacTranslationWorker:
                         f"catalog_sync_verified {job.id} "
                         f"code={result.canonical_code} "
                         f"d1_rows={result.d1_rows_updated} "
-                        f"subtitle_count={result.subtitle_count}",
+                        f"subtitle_count={result.subtitle_count} "
+                        f"http_status={result.diagnostic.http_status} "
+                        f"response={result.diagnostic.response_json}",
                     )
                     _append_job_log_safely(
                         Path(job.job_dir_mac),

@@ -408,10 +408,11 @@ class CatalogSyncClient:
             isinstance(fence, dict)
             and isinstance(fence.get("value"), int)
             and not isinstance(fence.get("value"), bool)
+            and fence.get("value") > 0
             and fence.get("accepted") is True
         )
         action = body.get("action")
-        action_valid = action is None or _safe_diagnostic_code(action) is not None
+        action_valid = action is None or action == "sync"
         if (
             not dry_run_valid
             or not fence_valid
@@ -436,42 +437,31 @@ class CatalogSyncClient:
         row_schema_valid = "dryRun" not in row or row.get("dryRun") is False
         touched = row.get("kvKeysTouched")
         deleted = row.get("kvKeysDeleted")
-        touched_valid_type = touched is None or isinstance(touched, list)
-        deleted_valid_type = deleted is None or isinstance(deleted, list)
-        keys_agree = not (
-            isinstance(touched, list)
-            and isinstance(deleted, list)
-            and set(touched) != set(deleted)
+        touched_valid = touched is None or self._valid_cache_keys(
+            touched,
+            canonical,
+        )
+        deleted_valid = deleted is None or self._valid_cache_keys(
+            deleted,
+            canonical,
+        )
+        keys_agree = (
+            touched is None
+            or deleted is None
+            or (
+                touched_valid
+                and deleted_valid
+                and set(touched) == set(deleted)
+            )
         )
         kv_keys_deleted = touched if isinstance(touched, list) else deleted
         expected_light_key = f"movie:light:{canonical}"
         kv_keys_valid = (
-            touched_valid_type
-            and deleted_valid_type
+            touched_valid
+            and deleted_valid
             and keys_agree
-            and
-            isinstance(kv_keys_deleted, list)
-            and all(isinstance(key, str) for key in kv_keys_deleted)
-            and len(kv_keys_deleted) >= 2
-            and len(set(kv_keys_deleted)) == len(kv_keys_deleted)
-            and expected_light_key in set(kv_keys_deleted)
-            and any(
-                _matches_full_cache_key(key, canonical)
-                for key in kv_keys_deleted
-            )
-            and all(
-                _matches_full_cache_key(
-                    key,
-                    canonical,
-                    allow_aliases=True,
-                )
-                or _matches_light_cache_key(
-                    key,
-                    canonical,
-                    allow_aliases=True,
-                )
-                for key in kv_keys_deleted
-            )
+            and self._valid_cache_keys(kv_keys_deleted, canonical)
+            and expected_light_key in kv_keys_deleted
         )
         try:
             response_canonical = canonical_movie_code(row.get("canonicalCode"))
@@ -490,11 +480,19 @@ class CatalogSyncClient:
                 **error_metadata,
             )
 
-        self._verify_public_visibility(
-            canonical,
-            expected_subtitle_id=expected_subtitle_id,
-            expected_content_sha256=expected_content_sha256,
-        )
+        try:
+            self._verify_public_visibility(
+                canonical,
+                expected_subtitle_id=expected_subtitle_id,
+                expected_content_sha256=expected_content_sha256,
+            )
+        except CatalogSyncError as exc:
+            raise CatalogSyncError(
+                exc.reason_code,
+                retryable=exc.retryable,
+                http_status=diagnostic.http_status,
+                response_json=diagnostic.response_json,
+            ) from None
 
         return CatalogSyncResult(
             canonical_code=canonical,
@@ -502,6 +500,22 @@ class CatalogSyncClient:
             subtitle_count=subtitle_count,
             kv_keys_deleted=tuple(kv_keys_deleted),
             diagnostic=diagnostic,
+        )
+
+    @staticmethod
+    def _valid_cache_keys(value: object, canonical: str) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) >= 2
+            and all(isinstance(key, str) for key in value)
+            and len(set(value)) == len(value)
+            and f"movie:light:{canonical}" in value
+            and any(_matches_full_cache_key(key, canonical) for key in value)
+            and all(
+                _matches_full_cache_key(key, canonical, allow_aliases=True)
+                or _matches_light_cache_key(key, canonical, allow_aliases=True)
+                for key in value
+            )
         )
 
     @staticmethod

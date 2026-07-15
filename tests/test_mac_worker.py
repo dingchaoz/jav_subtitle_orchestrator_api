@@ -2134,7 +2134,13 @@ def test_ready_webhook_fires_after_publish_before_catalog_and_never_downgrades(
         catalog_sync_client=RecordingCatalogSync(
             events,
             errors=(
-                [CatalogSyncError("catalog_sync_failed")]
+                [
+                    CatalogSyncError(
+                        "catalog_sync_failed",
+                        http_status=500,
+                        response_json='{"success":false}',
+                    )
+                ]
                 if catalog_failure
                 else None
             ),
@@ -2163,6 +2169,13 @@ def test_ready_webhook_fires_after_publish_before_catalog_and_never_downgrades(
     assert current.catalog_sync_status == (
         "failed" if catalog_failure else "succeeded"
     )
+    catalog_log = (
+        mac_jobs_root / "abc-201" / "logs" / "mac-translation.log"
+    ).read_text(encoding="utf-8")
+    if catalog_failure:
+        assert 'http_status=500 response={"success":false}' in catalog_log
+    else:
+        assert 'http_status=200 response={"success":true}' in catalog_log
 
 
 def test_ready_webhook_is_not_sent_when_supabase_publication_fails(
@@ -2195,6 +2208,39 @@ def test_ready_webhook_is_not_sent_when_supabase_publication_fails(
     assert [event[0] for event in events] == ["translate", "publish"]
     assert notifier.calls == []
     assert store.get_job(job.id).status is JobStatus.FAILED
+
+
+def test_missing_catalog_client_cannot_block_verified_supabase_readiness(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="abc-203")
+    events = []
+    notifier = RecordingCallbackNotifier(events)
+    worker = MacTranslationWorker(
+        store,
+        RecordingTranslator(events),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(events),
+        catalog_sync_client=None,
+        callback_notifier=notifier,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    current = store.get_job(job.id)
+    assert [event[0] for event in events] == ["translate", "publish", "webhook"]
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.artifact_status == "ready"
+    assert current.catalog_sync_status == "failed"
+    assert current.catalog_sync_warning_code == "catalog_sync_failed"
+    assert current.error is None
+    assert len(notifier.calls) == 1
 
 
 def test_placeholder_metadata_still_reaches_ready(sqlite_path, mac_jobs_root):

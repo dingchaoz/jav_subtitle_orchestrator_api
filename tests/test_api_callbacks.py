@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from fastapi.testclient import TestClient
 
 from orchestrator.api import create_app
@@ -208,3 +211,54 @@ def test_explicit_ready_resend_retries_failed_event_but_not_delivered_event(
     )
     assert event.status == "delivered"
     assert event.attempt_count == 2
+
+
+def test_concurrent_ready_notifications_claim_exactly_one_delivery(
+    sqlite_path,
+    mac_jobs_root,
+):
+    class RacingStore(JobStore):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.initial_reads = 0
+            self.read_lock = threading.Lock()
+            self.read_barrier = threading.Barrier(2)
+
+        def get_callback_event_for_client(self, *args, **kwargs):
+            event = super().get_callback_event_for_client(*args, **kwargs)
+            if kwargs.get("conn") is None:
+                with self.read_lock:
+                    self.initial_reads += 1
+                    should_wait = self.initial_reads <= 2
+                if should_wait:
+                    self.read_barrier.wait(timeout=5)
+            return event
+
+    store = RacingStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = ready_job(store)
+    sender = RecordingCallbackSender()
+    notifier = CallbackNotifier(
+        store,
+        {
+            "machine-a.access": CallbackClient(
+                "https://client.example/ready",
+                "hmac-secret",
+            )
+        },
+        sender=sender,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(notifier.notify_subtitle_ready, job) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    assert len(sender.calls) == 1
+    event = store.get_callback_event_for_client(
+        job.id,
+        "subtitle.ready",
+        "machine-a.access",
+    )
+    assert event.status == "delivered"
+    assert event.attempt_count == 1

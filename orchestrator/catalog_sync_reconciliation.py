@@ -72,6 +72,7 @@ class CatalogSyncReconciler:
         candidates = self.store.list_catalog_sync_failure_candidates(
             movie_codes=movie_codes,
             limit=limit,
+            read_only=not execute,
         )
         items: list[ReconciliationItem] = []
         for snapshot in candidates:

@@ -1701,6 +1701,46 @@ def test_retry_failed_catalog_sync_rejects_non_catalog_failure(
         store.retry_failed_catalog_sync(failed.id)
 
 
+def test_legacy_catalog_retry_restores_ready_main_status_before_requeue(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    pending = _prepare_publication_job(store, mac_jobs_root, "abc-033")
+    publishing = store.claim_publication_job("publisher", 60, job_id=pending.id)
+    ready = store.complete_supabase_publication(
+        publishing.id,
+        "publisher",
+        movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        storage_path="abc/abc-033/abc-033-English_AI.srt",
+        content_sha256="e" * 64,
+        file_size=456,
+        lease_token=publishing.stage_lease_token,
+    )
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, artifact_status = NULL, "
+            "catalog_sync_status = NULL, error = ? WHERE id = ?",
+            (
+                JobStatus.FAILED.value,
+                "catalog_sync: catalog_sync_failed",
+                ready.id,
+            ),
+        )
+
+    retried = store.retry_failed_catalog_sync(ready.id)
+
+    assert retried.status is JobStatus.ENGLISH_SRT_READY
+    assert retried.artifact_status == "ready"
+    assert retried.catalog_sync_status == "pending"
+    assert retried.catalog_sync_warning_code == "catalog_sync_failed"
+    assert retried.error is None
+
+
 def test_expired_catalog_sync_lease_uses_only_catalog_counter(
     sqlite_path, mac_jobs_root
 ):

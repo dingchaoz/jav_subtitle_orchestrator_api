@@ -116,14 +116,18 @@ class CallbackNotifier:
                 client_key,
             )
             if existing is None:
-                event = self.store.create_callback_event(
+                event = self.store.claim_new_callback_event(
                     job_id=job.id,
                     event_type="subtitle.ready",
                     target_url=client.url,
                     payload_json=canonical_payload_json(payload),
                     client_key=client_key,
                 )
-                if event.status != "pending" or event.attempt_count != 0:
+                if (
+                    event is None
+                    or event.status != "pending"
+                    or event.attempt_count != 0
+                ):
                     continue
             elif existing.status == "failed" and retry_failed:
                 event = self.store.prepare_failed_callback_retry(

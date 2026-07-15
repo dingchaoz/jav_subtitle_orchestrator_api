@@ -1,4 +1,5 @@
-from uuid import uuid5, NAMESPACE_URL
+import hashlib
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -90,6 +91,7 @@ def test_reconciliation_dry_run_verifies_ktb_records_without_mutating(
         _seed_catalog_failure(store, "KTB-111"),
     ]
     verifier = RecordingVerifier()
+    database_sha256_before = hashlib.sha256(sqlite_path.read_bytes()).hexdigest()
 
     report = CatalogSyncReconciler(store, verifier).run(
         movie_codes=["KTB-104", "KTB-110", "KTB-111"],
@@ -103,6 +105,7 @@ def test_reconciliation_dry_run_verifies_ktb_records_without_mutating(
         "ktb-111",
     ]
     assert len(verifier.calls) == 3
+    assert hashlib.sha256(sqlite_path.read_bytes()).hexdigest() == database_sha256_before
     for original in jobs:
         current = store.get_job(original.id)
         assert current is not None
@@ -214,7 +217,7 @@ def test_reconciliation_candidates_exclude_non_catalog_and_claimed_failures(
             (claimed.id,),
         )
         conn.execute(
-            "UPDATE jobs SET error = 'publishing: failed' WHERE id = ?",
+            "UPDATE jobs SET error = 'catalogXsync: failed' WHERE id = ?",
             (other.id,),
         )
 
