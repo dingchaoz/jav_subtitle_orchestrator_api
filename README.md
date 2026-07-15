@@ -23,13 +23,17 @@ The post-download production path is:
 ```text
 audio_ready → transcription_claimed → transcribing → transcription_done
 → translating → publish_pending → publishing
-→ catalog_sync_pending → catalog_syncing → english_srt_ready
+→ english_srt_ready
+       └─ catalog_sync_status=pending → succeeded | failed
 ```
 
 Windows owns the transcription states. The single Mac translation worker owns
-translation, its quality gate, verified Supabase publication, and javsubtitle.com
-catalog synchronization. `english_srt_ready` is the terminal production state only
-after both remote systems verify successfully.
+translation, its quality gate, verified Supabase publication, and the subsequent
+javsubtitle.com catalog synchronization. Once Storage and the exact Supabase
+`movie_languages` row verify, the public status is immediately
+`english_srt_ready`, `ready=true`, and `error=null`. D1/KV synchronization is a
+non-blocking substate and can add a warning, but cannot downgrade the published
+artifact to `failed`.
 
 When `MAC_TRANSLATION_PUBLISH_ENABLED=false` (the default), the worker remains in
 local-only compatibility mode. It skips `publish_pending`, `publishing`, catalog
@@ -41,8 +45,14 @@ A code-only `placeholder` catalog row is a successful publication result, not a
 translation failure. It has a stable movie UUID and can be enriched later without
 changing subtitle ownership when publication is enabled. Publication retries
 preserve the quality-approved English SRT and audio instead of translating again;
-catalog retries resume from `catalog_sync_pending` without republishing or
-retranslating.
+catalog retries operate on `catalog_sync_status=pending` without republishing or
+retranslating. The signed `subtitle.ready` webhook is sent immediately after the
+Supabase publication transaction, before catalog sync is attempted.
+
+Public job responses retain the existing `status` and `error` contract and add
+`ready`, `artifact_status`, `catalog_sync_status`, and `warnings`. Catalog HTTP
+status and response diagnostics are schema-aware, sanitized, and size-bounded;
+tokens, arbitrary upstream strings, and subtitle contents are never persisted.
 
 The repository migration and worker flow do not imply that the migration has been
 deployed. Production behavior remains unverified until a separately approved

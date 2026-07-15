@@ -171,6 +171,42 @@ def test_job_detail_endpoint_returns_full_paths(sqlite_path, mac_jobs_root):
         assert sensitive_key not in body
 
 
+def test_job_detail_endpoint_exposes_ready_catalog_warning_as_secondary_state(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-104", priority=50, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'english_srt_ready', artifact_status = 'ready',
+                catalog_sync_status = 'failed',
+                catalog_sync_warning_code = 'catalog_sync_failed',
+                catalog_sync_warning_message = 'Catalog synchronization failed.',
+                catalog_sync_last_http_status = 500, error = NULL
+            WHERE id = ?
+            """,
+            (job.id,),
+        )
+    client = TestClient(create_app(store))
+
+    detail = client.get(f"/jobs/{job.id}/detail")
+    ready = client.get("/jobs/browser?view=ready")
+    failed = client.get("/jobs/browser?view=failed")
+
+    assert detail.status_code == ready.status_code == failed.status_code == 200
+    assert detail.json()["status"] == "english_srt_ready"
+    assert detail.json()["artifact_status"] == "ready"
+    assert detail.json()["catalog_sync_status"] == "failed"
+    assert detail.json()["catalog_sync_warning_code"] == "catalog_sync_failed"
+    assert detail.json()["catalog_sync_last_http_status"] == 500
+    assert ready.json()["total"] == 1
+    assert failed.json()["total"] == 0
+
+
 def test_log_endpoints_list_and_tail_allowlisted_logs(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

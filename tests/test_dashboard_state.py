@@ -996,3 +996,43 @@ def test_build_job_browser_filters_sorts_and_paginates(sqlite_path, mac_jobs_roo
     assert [job.movie_number for job in queued_page.items] == ["abc-003", "abc-002"]
     assert [job.movie_number for job in ready_page.items] == ["abc-102", "abc-101"]
     assert [job.movie_number for job in search_page.items] == ["abc-102"]
+
+
+def test_ready_artifact_with_catalog_warning_stays_ready_and_exposes_diagnostics(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-104", priority=100, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'english_srt_ready', artifact_status = 'ready',
+                catalog_sync_status = 'failed',
+                catalog_sync_warning_code = 'catalog_response_mismatch',
+                catalog_sync_warning_message = 'Catalog synchronization failed.',
+                catalog_sync_last_http_status = 207,
+                catalog_sync_last_response_json = '{"success":false}',
+                error = NULL
+            WHERE id = ?
+            """,
+            (job.id,),
+        )
+    current = store.get_job(job.id)
+
+    ready = build_job_browser(store, view="ready")
+    failed = build_job_browser(store, view="failed")
+    detail = build_job_detail(current)
+
+    assert [item.id for item in ready.items] == [job.id]
+    assert failed.items == []
+    assert detail.status is JobStatus.ENGLISH_SRT_READY
+    assert detail.artifact_status == "ready"
+    assert detail.catalog_sync_status == "failed"
+    assert detail.catalog_sync_warning_code == "catalog_response_mismatch"
+    assert detail.catalog_sync_warning_message == "Catalog synchronization failed."
+    assert detail.catalog_sync_last_http_status == 207
+    assert detail.catalog_sync_last_response_json == '{"success":false}'
+    assert detail.error is None
