@@ -18,6 +18,7 @@ from typing import Mapping
 from uuid import UUID, uuid4
 
 from orchestrator.catalog_visibility import (
+    MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS,
     AuditCandidateSnapshot,
     VisibilityStatus,
     normalize_catalog_api_origin,
@@ -30,7 +31,7 @@ REPAIR_ELIGIBLE = frozenset({"missing", "not_found"})
 MAX_AUDIT_CANDIDATES = 10_000
 MAX_AUDIT_ALLOWLIST = 10_000
 MAX_AUDIT_FINDINGS = 10_000
-MAX_OBSERVED_SUBTITLE_IDS = 10_000
+MAX_OBSERVED_SUBTITLE_IDS = MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS
 MAX_AUDIT_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_AUDIT_REPORT_OVERHEAD_BYTES = 8 * 1024 * 1024
 MAX_CHECKPOINT_LINE_BYTES = 64 * 1024

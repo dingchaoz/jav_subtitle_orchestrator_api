@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
-from typing import Callable
+from types import MappingProxyType
+from typing import Callable, get_type_hints
 
 import pytest
 import requests
 
 import orchestrator.catalog_visibility as visibility_module
+import orchestrator.catalog_visibility_report as report_module
 from orchestrator.catalog_visibility import (
     AuditRunSummary,
     CatalogVisibilityAuditor,
@@ -43,6 +46,15 @@ def test_audit_runner_public_api_is_present():
         "report_sha256",
     ]
     assert CatalogVisibilityAuditor.scan
+    assert (
+        getattr(
+            visibility_module,
+            "MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS",
+            None,
+        )
+        == 1_000
+    )
+    assert get_type_hints(AuditRunSummary)["counts"] == Mapping[str, int]
 
 
 class FakeResponse:
@@ -211,6 +223,13 @@ def _receipt_candidate_jobs(store: JobStore, codes: list[str]):
         assert selected is not None
         jobs.append(selected)
     return jobs
+
+
+def _canonical_observed_ids(count: int) -> list[str]:
+    return [
+        f"20000000-0000-4000-8000-{index:012d}"
+        for index in range(1, count + 1)
+    ]
 
 
 def test_auditor_freezes_population_writes_manifest_then_gets_without_mutation(
@@ -550,9 +569,159 @@ def test_zero_candidate_audit_is_complete_and_summary_counts_are_immutable(
         summary.counts["visible"] = 1
 
     source = {"visible": 1}
-    copied = AuditRunSummary(1, 1, 0, source, Path("audit-report.json"), "a" * 64)
+    copied = AuditRunSummary(
+        1,
+        1,
+        0,
+        MappingProxyType(source),
+        Path("audit-report.json"),
+        "a" * 64,
+    )
     source["visible"] = 9
     assert copied.counts == {"visible": 1}
+
+
+def test_oversized_observed_ids_are_terminal_response_invalid_and_resumable(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    _receipt_candidate_jobs(store, ["KTB111"])
+    output_dir = tmp_path / "oversized-observed-audit"
+    session = AuditRecordingSession(
+        [
+            FakeResponse(
+                body={
+                    "canonicalCode": "ktb-111",
+                    "subtitles": [
+                        {"id": subtitle_id}
+                        for subtitle_id in _canonical_observed_ids(1_001)
+                    ],
+                }
+            )
+        ]
+    )
+
+    first = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example", session=session
+        ),
+    ).scan(output_dir)
+
+    assert first.checked == 1
+    assert first.skipped == 0
+    assert first.counts == {"response_invalid": 1}
+    assert session.methods == ["GET"]
+    report = load_audit_report(output_dir / "audit-report.json")
+    assert report.findings[0].status == "response_invalid"
+    assert report.findings[0].observed_subtitle_ids == ()
+
+    monkeypatch.setattr(
+        store,
+        "list_catalog_visibility_candidates",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("completed audit must not query the store")
+        ),
+    )
+    resume_session = AuditRecordingSession([])
+    second = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example/", session=resume_session
+        ),
+    ).scan(output_dir)
+
+    assert second.checked == 0
+    assert second.skipped == 1
+    assert second.report_sha256 == first.report_sha256
+    assert resume_session.methods == []
+
+
+def test_maximum_observed_ids_persist_within_checkpoint_limit_and_resume(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path, monkeypatch
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = _receipt_candidate_jobs(store, ["KTB111"])[0]
+    expected_id = job.published_subtitle_id
+    assert expected_id is not None
+    observed_ids = _canonical_observed_ids(999) + [expected_id]
+    output_dir = tmp_path / "maximum-observed-audit"
+    session = AuditRecordingSession(
+        [
+            FakeResponse(
+                body={
+                    "canonicalCode": "ktb-111",
+                    "subtitles": [
+                        {"id": subtitle_id} for subtitle_id in observed_ids
+                    ],
+                }
+            )
+        ]
+    )
+
+    first = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example", session=session
+        ),
+    ).scan(output_dir)
+
+    checkpoint = (output_dir / "audit-findings.jsonl").read_bytes()
+    assert first.counts == {"visible": 1}
+    assert len(checkpoint) <= report_module.MAX_CHECKPOINT_LINE_BYTES
+    assert checkpoint.endswith(b"\n")
+    monkeypatch.setattr(
+        store,
+        "list_catalog_visibility_candidates",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("completed audit must not query the store")
+        ),
+    )
+    resume_session = AuditRecordingSession([])
+
+    second = CatalogVisibilityAuditor(
+        store,
+        PublicCatalogVisibilityClient(
+            "https://javsubtitle.example/", session=resume_session
+        ),
+    ).scan(output_dir)
+
+    assert second.checked == 0
+    assert second.skipped == 1
+    assert second.report_sha256 == first.report_sha256
+    assert resume_session.methods == []
+
+
+def test_report_validation_uses_shared_persistable_observed_id_bound(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = _receipt_candidate_jobs(store, ["KTB111"])[0]
+    candidate = visibility_module.AuditCandidateSnapshot.from_job(job)
+    output_dir = tmp_path / "direct-report-bound"
+    manifest = report_module.create_audit_manifest(
+        api_origin="https://javsubtitle.example",
+        database_path=store.db_path,
+        candidates=(candidate,),
+        selection={"allowlist": None, "limit": None},
+    )
+    report_module.write_audit_manifest(output_dir, manifest)
+    oversized_finding = report_module.AuditFinding(
+        candidate=manifest.candidates[0],
+        status="missing",
+        reason_code="public_visibility_mismatch",
+        observed_subtitle_ids=tuple(_canonical_observed_ids(1_001)),
+    )
+
+    with pytest.raises(ValueError, match="finding contains too many observed subtitle IDs"):
+        report_module.append_audit_finding(output_dir, oversized_finding)
+
+    assert report_module.MAX_OBSERVED_SUBTITLE_IDS == (
+        visibility_module.MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS
+    )
 
 
 def test_receipt_candidate_and_validated_snapshot_are_exact_and_immutable(

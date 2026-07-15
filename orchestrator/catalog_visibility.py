@@ -4,6 +4,7 @@ import ipaddress
 import math
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -19,6 +20,7 @@ from orchestrator.store import JobRecord, JobStore, validate_verified_supabase_r
 
 
 _LOCAL_HTTP_HOSTS = {"localhost", "127.0.0.1", "::1"}
+MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS = 1_000
 
 
 class VisibilityStatus(str, Enum):
@@ -124,7 +126,7 @@ class AuditRunSummary:
     discovered: int
     checked: int
     skipped: int
-    counts: dict[str, int]
+    counts: Mapping[str, int]
     report_path: Path
     report_sha256: str
 
@@ -526,6 +528,7 @@ class PublicCatalogVisibilityClient:
             not isinstance(body, dict)
             or body.get("canonicalCode") != canonical
             or not isinstance(body.get("subtitles"), list)
+            or len(body["subtitles"]) > MAX_PERSISTABLE_OBSERVED_SUBTITLE_IDS
             or any(
                 not isinstance(row, dict) or not _is_canonical_uuid(row.get("id"))
                 for row in body.get("subtitles", ())
