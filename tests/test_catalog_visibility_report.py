@@ -218,6 +218,204 @@ def test_manifest_rejects_malformed_candidate_base_fields(
         make_manifest(tmp_path, replace(candidate, **changed))
 
 
+@pytest.mark.parametrize(
+    ("field_name", "unsafe_value"),
+    [
+        ("job_id", "authorization-SENTINELVALUE"),
+        (
+            "movie_uuid",
+            "eyJhbGciOiJIUzI1NiJ9.SENTINELVALUE.c2lnbmF0dXJl",
+        ),
+        ("metadata_status", "bearer-SENTINELVALUE"),
+        ("metadata_status", "secret-SENTINELVALUE"),
+        ("metadata_source", "service-role-SENTINELVALUE"),
+        ("metadata_source", "credential-SENTINELVALUE"),
+        ("subtitle_id", "token-SENTINELVALUE"),
+        ("content_sha256", "api-key-SENTINELVALUE"),
+        (
+            "storage_path",
+            "https://storage.example/file.srt?X-Amz-Signature=SENTINELVALUE",
+        ),
+        ("storage_path", "../SENTINELVALUE/file.srt"),
+        ("storage_path", "/SENTINELVALUE/file.srt"),
+        (
+            "storage_path",
+            "safe/SENTINELVALUE.srt\n00:00:00,000 --> 00:00:01,000\nsubtitle",
+        ),
+    ],
+)
+def test_manifest_rejects_sensitive_or_content_bearing_candidate_strings_without_leakage(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    field_name: str,
+    unsafe_value: str,
+):
+    manifest = make_manifest(tmp_path, candidate)
+    unsafe_candidate = replace(candidate, **{field_name: unsafe_value})
+    unsafe_manifest = replace(manifest, candidates=(unsafe_candidate,))
+    output_dir = tmp_path / "unsafe-output"
+
+    with pytest.raises((TypeError, ValueError)) as raised:
+        write_audit_manifest(output_dir, unsafe_manifest)
+
+    assert "SENTINELVALUE" not in str(raised.value)
+    assert not output_dir.exists() or not any(output_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("field_name", "oversized_value"),
+    [
+        ("job_id", "a" * 129),
+        ("movie_code", f"{'a' * 65}-111"),
+        ("movie_uuid", "a" * 257),
+        ("storage_path", "a" * 1025),
+    ],
+)
+def test_manifest_rejects_excessively_long_candidate_strings(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    field_name: str,
+    oversized_value: str,
+):
+    with pytest.raises(ValueError):
+        make_manifest(tmp_path, replace(candidate, **{field_name: oversized_value}))
+
+
+def test_manifest_rejects_excessively_long_selection_movie_code(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    with pytest.raises(ValueError):
+        create_audit_manifest(
+            api_origin="https://javsubtitle.example",
+            database_path=tmp_path / "jobs.sqlite3",
+            candidates=(candidate,),
+            selection={"allowlist": [f"{'a' * 65}-111"], "limit": 1},
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_observed_id",
+    [
+        "not-a-uuid-SENTINELVALUE",
+        "https://catalog.example/subtitle?token=SENTINELVALUE",
+        "bearer-SENTINELVALUE",
+        "eyJhbGciOiJIUzI1NiJ9.SENTINELVALUE.c2lnbmF0dXJl",
+        "SENTINELVALUE\n00:00:00,000 --> 00:00:01,000\nsubtitle",
+    ],
+)
+def test_append_rejects_unsafe_observed_ids_without_writing_or_leaking(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    unsafe_observed_id: str,
+):
+    write_manifest(tmp_path, candidate)
+    unsafe_finding = replace(
+        finding(candidate),
+        observed_subtitle_ids=(unsafe_observed_id,),
+    )
+
+    with pytest.raises((TypeError, ValueError)) as raised:
+        append_audit_finding(tmp_path, unsafe_finding)
+
+    assert "SENTINELVALUE" not in str(raised.value)
+    assert not (tmp_path / "audit-findings.jsonl").exists()
+    assert b"SENTINELVALUE" not in (tmp_path / "audit-manifest.json").read_bytes()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"subtitle_id": "bad-uuid"},
+        {"storage_path": "safe/incorrect.srt"},
+        {"movie_uuid": None},
+    ],
+)
+def test_safe_malformed_or_missing_receipts_remain_reportable(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    overrides: dict[str, object],
+):
+    invalid = replace(candidate, **overrides)
+    manifest = write_manifest(tmp_path, invalid)
+    invalid_finding = finding(invalid, "invalid_receipt")
+
+    append_audit_finding(tmp_path, invalid_finding)
+
+    assert load_audit_findings(tmp_path, manifest) == (invalid_finding,)
+
+
+def test_duplicate_canonical_observed_ids_remain_reportable(
+    tmp_path: Path, candidate: AuditCandidateSnapshot
+):
+    manifest = write_manifest(tmp_path, candidate)
+    duplicate_finding = replace(
+        finding(candidate, "missing"),
+        observed_subtitle_ids=(SUBTITLE_ID, SUBTITLE_ID),
+    )
+
+    append_audit_finding(tmp_path, duplicate_finding)
+
+    assert load_audit_findings(tmp_path, manifest) == (duplicate_finding,)
+
+
+@pytest.mark.parametrize(
+    "invalid_timestamp",
+    [
+        "2026-07-15Q10:00:00+00:00",
+        "2026-07-15 10:00:00+00:00",
+        "2026-07-15T10:00:00+01:00",
+        "2026-07-15T10:00:00",
+        "2026-07-15T10:00:00.1234567+00:00",
+        "2026-02-30T10:00:00+00:00",
+        "2026-07-15T24:00:00+00:00",
+    ],
+)
+def test_manifest_and_candidate_timestamps_require_exact_utc_iso_contract(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    invalid_timestamp: str,
+):
+    manifest = make_manifest(tmp_path, candidate)
+
+    with pytest.raises(ValueError) as created_at_error:
+        write_audit_manifest(
+            tmp_path / "bad-created-at",
+            replace(manifest, created_at=invalid_timestamp),
+        )
+    with pytest.raises(ValueError) as job_updated_at_error:
+        make_manifest(
+            tmp_path / "bad-job-updated-at",
+            replace(candidate, job_updated_at=invalid_timestamp),
+        )
+
+    assert invalid_timestamp not in str(created_at_error.value)
+    assert invalid_timestamp not in str(job_updated_at_error.value)
+
+
+@pytest.mark.parametrize(
+    "valid_timestamp",
+    [
+        "2026-07-15T10:00:00Z",
+        "2026-07-15T10:00:00.1Z",
+        "2026-07-15T10:00:00.123456+00:00",
+    ],
+)
+def test_manifest_and_candidate_timestamps_accept_exact_utc_iso_forms(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    valid_timestamp: str,
+):
+    timestamped_candidate = replace(candidate, job_updated_at=valid_timestamp)
+    manifest = replace(
+        make_manifest(tmp_path, timestamped_candidate),
+        created_at=valid_timestamp,
+    )
+
+    write_audit_manifest(tmp_path, manifest)
+
+    assert load_audit_manifest(tmp_path / "audit-manifest.json") == manifest
+
+
 def test_jsonl_append_load_resume_and_duplicate_rejection(
     tmp_path: Path, candidate: AuditCandidateSnapshot
 ):

@@ -67,6 +67,36 @@ _SELECTION_FIELDS = frozenset({"allowlist", "limit"})
 _STATUS_VALUES = frozenset(status.value for status in VisibilityStatus)
 _LOWERCASE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SAFE_MOVIE_CODE_INPUT_RE = re.compile(r"^[A-Za-z]+-?[0-9]+$")
+_SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._-]{1,256}$")
+_SAFE_STORAGE_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,1024}$")
+_JWT_LIKE_RE = re.compile(
+    r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"
+)
+_STRICT_UTC_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?(?:Z|\+00:00)$"
+)
+_SENSITIVE_STRING_MARKERS = (
+    "bearer",
+    "token",
+    "secret",
+    "service-role",
+    "service_role",
+    "service role",
+    "api-key",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "x-amz-",
+    "x-goog-",
+    "signature=",
+    "signed-url",
+    "signed_url",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,22 +142,100 @@ def _exact_dict(value: object, fields: frozenset[str], label: str) -> dict[str, 
     return value
 
 
-def _validate_optional_string(value: object, label: str) -> None:
-    if value is not None and not isinstance(value, str):
+def _contains_sensitive_string_material(value: str) -> bool:
+    folded = value.casefold()
+    return (
+        any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or "://" in folded
+        or any(marker in folded for marker in _SENSITIVE_STRING_MARKERS)
+        or _JWT_LIKE_RE.fullmatch(value) is not None
+    )
+
+
+def _validate_safe_job_id(value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or not _SAFE_JOB_ID_RE.fullmatch(value)
+        or _contains_sensitive_string_material(value)
+    ):
+        raise ValueError("candidate job_id is unsafe")
+
+
+def _canonical_safe_movie_code(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) > 64
+        or not _SAFE_MOVIE_CODE_INPUT_RE.fullmatch(value)
+        or _contains_sensitive_string_material(value)
+    ):
+        raise ValueError(f"{label} is invalid")
+    try:
+        canonical = canonical_movie_code(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"{label} is invalid") from None
+    if len(canonical) > 64:
+        raise ValueError(f"{label} is invalid")
+    return canonical
+
+
+def _validate_optional_safe_token(value: object, label: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
         raise TypeError(f"{label} must be a string or null")
+    if not _SAFE_TOKEN_RE.fullmatch(value) or _contains_sensitive_string_material(value):
+        raise ValueError(f"{label} is unsafe")
+
+
+def _validate_optional_safe_storage_path(value: object) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise TypeError("candidate storage_path must be a string or null")
+    segments = value.split("/")
+    if (
+        not _SAFE_STORAGE_PATH_RE.fullmatch(value)
+        or value.startswith("/")
+        or any(segment in {"", ".", ".."} for segment in segments)
+        or _contains_sensitive_string_material(value)
+    ):
+        raise ValueError("candidate storage_path is unsafe")
+
+
+def _validate_strict_utc_timestamp(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _STRICT_UTC_TIMESTAMP_RE.fullmatch(value):
+        raise ValueError(f"{label} is invalid")
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise ValueError(f"{label} is invalid") from None
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _validate_canonical_uuid(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string")
+    try:
+        if str(UUID(value)) != value:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"{label} is invalid") from None
+    return value
 
 
 def _validate_candidate(candidate: object) -> AuditCandidateSnapshot:
     if not isinstance(candidate, AuditCandidateSnapshot):
         raise TypeError("candidate must be an AuditCandidateSnapshot")
-    if not isinstance(candidate.job_id, str) or not candidate.job_id:
-        raise ValueError("candidate job_id is invalid")
+    _validate_safe_job_id(candidate.job_id)
     if not isinstance(candidate.movie_code, str):
         raise TypeError("candidate movie_code must be a string")
-    try:
-        canonical = canonical_movie_code(candidate.movie_code)
-    except (AttributeError, TypeError, ValueError):
-        raise ValueError("candidate movie_code is invalid") from None
+    canonical = _canonical_safe_movie_code(
+        candidate.movie_code,
+        "candidate movie_code",
+    )
     if canonical != candidate.movie_code:
         raise ValueError("candidate movie_code must be canonical")
     for field_name in (
@@ -135,16 +243,21 @@ def _validate_candidate(candidate: object) -> AuditCandidateSnapshot:
         "metadata_status",
         "metadata_source",
         "subtitle_id",
-        "storage_path",
         "content_sha256",
     ):
-        _validate_optional_string(getattr(candidate, field_name), f"candidate {field_name}")
+        _validate_optional_safe_token(
+            getattr(candidate, field_name),
+            f"candidate {field_name}",
+        )
+    _validate_optional_safe_storage_path(candidate.storage_path)
     if candidate.file_size is not None and (
         not isinstance(candidate.file_size, int) or isinstance(candidate.file_size, bool)
     ):
         raise TypeError("candidate file_size must be an integer or null")
-    if not isinstance(candidate.job_updated_at, str) or not candidate.job_updated_at:
-        raise ValueError("candidate job_updated_at is invalid")
+    _validate_strict_utc_timestamp(
+        candidate.job_updated_at,
+        "candidate job_updated_at",
+    )
     return candidate
 
 
@@ -192,10 +305,12 @@ def _normalize_selection(selection: object) -> dict[str, object]:
         for code in raw_allowlist:
             if not isinstance(code, str):
                 raise TypeError("selection allowlist entries must be strings")
-            try:
-                normalized_codes.append(canonical_movie_code(code))
-            except (AttributeError, TypeError, ValueError):
-                raise ValueError("selection allowlist contains an invalid movie code") from None
+            normalized_codes.append(
+                _canonical_safe_movie_code(
+                    code,
+                    "selection allowlist movie code",
+                )
+            )
         allowlist = sorted(set(normalized_codes))
 
     limit = payload["limit"]
@@ -220,15 +335,7 @@ def _validate_manifest(manifest: object) -> AuditManifest:
             raise ValueError
     except (AttributeError, TypeError, ValueError):
         raise ValueError("manifest audit_id is not a canonical UUID") from None
-    if not isinstance(manifest.created_at, str):
-        raise TypeError("manifest created_at must be a string")
-    try:
-        created_at = datetime.fromisoformat(manifest.created_at)
-        offset = created_at.utcoffset()
-    except (TypeError, ValueError):
-        raise ValueError("manifest created_at is invalid") from None
-    if created_at.tzinfo is None or offset is None or offset.total_seconds() != 0:
-        raise ValueError("manifest created_at must be UTC")
+    _validate_strict_utc_timestamp(manifest.created_at, "manifest created_at")
     if not isinstance(manifest.api_origin, str):
         raise TypeError("manifest api_origin must be a string")
     try:
@@ -458,10 +565,13 @@ def _validate_finding(finding: object) -> AuditFinding:
         or not _REASON_CODE_RE.fullmatch(finding.reason_code)
     ):
         raise ValueError("finding reason_code is invalid")
-    if not isinstance(finding.observed_subtitle_ids, tuple) or any(
-        not isinstance(item, str) for item in finding.observed_subtitle_ids
-    ):
+    if not isinstance(finding.observed_subtitle_ids, tuple):
         raise TypeError("finding observed_subtitle_ids must be a string tuple")
+    for observed_subtitle_id in finding.observed_subtitle_ids:
+        _validate_canonical_uuid(
+            observed_subtitle_id,
+            "finding observed_subtitle_id",
+        )
     try:
         candidate.validated_receipt()
     except ValueError:
