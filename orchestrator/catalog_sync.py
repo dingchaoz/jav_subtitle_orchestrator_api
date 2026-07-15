@@ -37,6 +37,52 @@ _CACHE_KEY_VARIANT_SUFFIXES = (
     "-subtitle",
     "-leak",
 )
+_STRENGTHENED_CACHE_SCHEMA_VERSION = "v4"
+_MAX_STRENGTHENED_CACHE_KEY_PAIRS = 64
+_MAX_STRENGTHENED_CACHE_CODE_LENGTH = 128
+_SAFE_CACHE_CODE_RE = re.compile(r"[a-z0-9]+(?:[-_][a-z0-9]+)*\Z")
+
+
+def _matches_strengthened_v4_code(code: str, canonical: str) -> bool:
+    if (
+        not isinstance(code, str)
+        or len(code) > _MAX_STRENGTHENED_CACHE_CODE_LENGTH
+        or _SAFE_CACHE_CODE_RE.fullmatch(code) is None
+    ):
+        return False
+    return code == canonical or code.startswith(f"{canonical}-") or code.startswith(
+        f"{canonical}_"
+    )
+
+
+def _valid_strengthened_v4_cache_key_pairs(
+    keys: object,
+    canonical: str,
+) -> bool:
+    if (
+        not isinstance(keys, list)
+        or len(keys) < 2
+        or len(keys) % 2 != 0
+        or len(keys) > _MAX_STRENGTHENED_CACHE_KEY_PAIRS * 2
+        or any(not isinstance(key, str) for key in keys)
+        or len(set(keys)) != len(keys)
+    ):
+        return False
+
+    codes: list[str] = []
+    for index in range(0, len(keys), 2):
+        full_key, light_key = keys[index : index + 2]
+        full_prefix = "movie:full:v4:"
+        light_prefix = "movie:light:"
+        if not full_key.startswith(full_prefix) or not light_key.startswith(light_prefix):
+            return False
+        full_code = full_key[len(full_prefix) :]
+        light_code = light_key[len(light_prefix) :]
+        if full_code != light_code or not _matches_strengthened_v4_code(full_code, canonical):
+            return False
+        codes.append(full_code)
+
+    return canonical in codes and len(set(codes)) == len(codes)
 
 
 def _matches_cache_code(code: str, canonical: str, *, allow_aliases: bool) -> bool:
@@ -256,24 +302,15 @@ class CatalogSyncClient:
             kv_keys_touched = row.get("kvKeysTouched")
             kv_keys_deleted = row.get("kvKeysDeleted")
             kv_action = row.get("kvAction")
-            version_valid = isinstance(cache_schema_version, str) and re.fullmatch(
-                r"v[1-9][0-9]*", cache_schema_version
-            )
-            expected_active_keys = {
-                f"movie:full:{cache_schema_version}:{canonical}",
-                f"movie:light:{canonical}",
-            }
             row_schema_valid = (
-                bool(version_valid)
+                cache_schema_version == _STRENGTHENED_CACHE_SCHEMA_VERSION
                 and row.get("d1Verified") is True
                 and isinstance(kv_action, str)
                 and kv_action in {"written", "deleted_for_d1_fallback", "unchanged"}
                 and isinstance(kv_keys_touched, list)
                 and isinstance(kv_keys_deleted, list)
                 and kv_keys_touched == kv_keys_deleted
-                and len(kv_keys_deleted) == 2
-                and all(isinstance(key, str) for key in kv_keys_deleted)
-                and set(kv_keys_deleted) == expected_active_keys
+                and _valid_strengthened_v4_cache_key_pairs(kv_keys_deleted, canonical)
             )
             allow_alias_cache_keys = False
         else:

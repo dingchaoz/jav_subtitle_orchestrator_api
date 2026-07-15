@@ -63,10 +63,7 @@ def valid_current_body() -> dict[str, object]:
 
 
 def valid_v4_body() -> dict[str, object]:
-    active_keys = [
-        f"movie:full:v4:{CANONICAL_CODE}",
-        f"movie:light:{CANONICAL_CODE}",
-    ]
+    active_keys = v4_active_keys([CANONICAL_CODE])
     return {
         "success": True,
         "requested": 1,
@@ -85,6 +82,25 @@ def valid_v4_body() -> dict[str, object]:
             }
         ],
     }
+
+
+def v4_active_keys(codes: list[str]) -> list[str]:
+    return [
+        key
+        for code in codes
+        for key in (
+            f"movie:full:v4:{code}",
+            f"movie:light:{code}",
+        )
+    ]
+
+
+def valid_v4_body_for_codes(codes: list[str]) -> dict[str, object]:
+    body = valid_v4_body()
+    active_keys = v4_active_keys(codes)
+    body["results"][0]["kvKeysTouched"] = active_keys.copy()
+    body["results"][0]["kvKeysDeleted"] = active_keys.copy()
+    return body
 
 
 def valid_public_body() -> dict[str, object]:
@@ -258,7 +274,7 @@ def test_sync_accepts_strengthened_v4_catalog_response_schema():
     )
 
 
-def test_sync_accepts_other_positive_integer_cache_schema_version():
+def test_sync_rejects_non_v4_strengthened_cache_schema_version():
     body = valid_v4_body()
     active_keys = [
         f"movie:full:v12:{CANONICAL_CODE}",
@@ -268,9 +284,140 @@ def test_sync_accepts_other_positive_integer_cache_schema_version():
     body["results"][0]["kvKeysTouched"] = active_keys.copy()
     body["results"][0]["kvKeysDeleted"] = active_keys.copy()
 
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+
+
+def test_sync_accepts_strengthened_v4_catalog_response_with_multi_variant_pairs():
+    codes = [CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"]
+    body = valid_v4_body_for_codes(codes)
+
     result = sync_with_response(200, body=body)
 
-    assert result.kv_keys_deleted == tuple(active_keys)
+    assert result.kv_keys_deleted == tuple(v4_active_keys(codes))
+
+
+def v4_variant_response_mutations() -> list[tuple[str, object]]:
+    variant_codes = [CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"]
+    return [
+        (
+            "legacy full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "old version full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "unsafe normalized suffix",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}-bad/variant",
+                    f"movie:light:{CANONICAL_CODE}-bad/variant",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}-bad/variant",
+                    f"movie:light:{CANONICAL_CODE}-bad/variant",
+                ],
+            ),
+        ),
+        (
+            "variant outside canonical family",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys([CANONICAL_CODE, "other-291"]),
+                kvKeysDeleted=v4_active_keys([CANONICAL_CODE, "other-291"]),
+            ),
+        ),
+        (
+            "reversed full-light pair",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "duplicate variant pair",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys(variant_codes + [variant_codes[1]]),
+                kvKeysDeleted=v4_active_keys(variant_codes + [variant_codes[1]]),
+            ),
+        ),
+        (
+            "odd number of keys",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=body["results"][0]["kvKeysTouched"]
+                + [f"movie:full:v4:{variant_codes[1]}"],
+                kvKeysDeleted=body["results"][0]["kvKeysDeleted"]
+                + [f"movie:full:v4:{variant_codes[1]}"],
+            ),
+        ),
+        (
+            "too many variant pairs",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys(
+                    [CANONICAL_CODE] + [f"{CANONICAL_CODE}-variant-{index}" for index in range(64)]
+                ),
+                kvKeysDeleted=v4_active_keys(
+                    [CANONICAL_CODE] + [f"{CANONICAL_CODE}-variant-{index}" for index in range(64)]
+                ),
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "_name,mutate", v4_variant_response_mutations(), ids=lambda value: str(value)
+)
+def test_malformed_strengthened_v4_multi_variant_response_is_rejected(_name, mutate):
+    body = valid_v4_body_for_codes([CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"])
+    mutate(body)
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
 
 
 def v4_response_mutations() -> list[tuple[str, object]]:
