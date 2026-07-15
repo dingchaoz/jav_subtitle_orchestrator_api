@@ -1223,6 +1223,67 @@ def test_unresolved_remote_success_reconciles_exact_visibility_without_second_po
     assert resumed.stopped_reason is None
 
 
+def test_unresolved_claim_revalidates_current_receipt_before_visibility_probe(
+    tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
+):
+    from orchestrator.catalog_visibility import PublicVisibilityResult, VisibilityStatus
+    from orchestrator.catalog_visibility_repair import execute_catalog_visibility_repair
+
+    store = _store(sqlite_path, mac_jobs_root)
+    job = _ready_job(store, "abc-001", 1)
+    plan = _one_missing_plan(tmp_path, store, job)
+    old_receipt = plan.items[0].receipt
+    client = _RecordingSyncClient([RuntimeError("crash before remote call")])
+    arguments = {
+        "sync_client": client,
+        "output_dir": plan.plan_path.parent,
+        "execute": True,
+        "confirm_report_sha256": plan.report_sha256,
+    }
+    with pytest.raises(RuntimeError, match="crash before remote call"):
+        execute_catalog_visibility_repair(store, plan, **arguments)
+    with store.connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET published_subtitle_id = ?, "
+            "published_content_sha256 = ?, updated_at = ? WHERE id = ?",
+            (
+                "00000000-0000-4000-8000-000000000099",
+                "9" * 64,
+                "2026-07-15T12:00:00+00:00",
+                job.id,
+            ),
+        )
+    client.public_visibility_client.results.append(
+        PublicVisibilityResult(
+            VisibilityStatus.VISIBLE,
+            old_receipt.movie_code,
+            old_receipt.subtitle_id,
+            observed_subtitle_ids=(old_receipt.subtitle_id,),
+        )
+    )
+    with store.connection() as connection:
+        before = tuple(
+            connection.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone()
+        )
+
+    resumed = execute_catalog_visibility_repair(store, plan, **arguments)
+
+    with store.connection() as connection:
+        after = tuple(
+            connection.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone()
+        )
+    assert before == after
+    assert len(client.calls) == 1
+    assert client.public_visibility_client.calls == []
+    assert resumed.repaired == ()
+    assert resumed.failed == ()
+    assert resumed.skipped_receipt_changed == (old_receipt.movie_code,)
+    assert resumed.stopped_reason is None
+    row = json.loads(resumed.receipt_path.read_text())
+    assert row["outcome"] == "skipped_receipt_changed"
+    assert row["reason_code"] == "receipt_changed"
+
+
 def test_unresolved_claim_requires_explicit_recovery_before_revalidated_retry(
     tmp_path: Path, sqlite_path: Path, mac_jobs_root: Path
 ):

@@ -1066,40 +1066,84 @@ def execute_catalog_visibility_repair(
                     row["job_id"]: row for row in existing
                 }
                 claim_by_job_id = {row["job_id"]: row for row in claims}
-                retry_claimed: set[str] = set()
                 unresolved_job_ids = set(claim_by_job_id) - set(terminal_by_job_id)
                 for item in validated.items:
                     job_id = item.receipt.job_id
                     if job_id not in unresolved_job_ids:
                         continue
-                    try:
-                        probe = visibility_client.check(
-                            item.receipt.movie_code,
-                            item.receipt.subtitle_id,
-                            item.receipt.content_sha256,
-                        )
-                    except Exception:
-                        exact_visible, definitely_not_exact = False, False
-                    else:
-                        exact_visible, definitely_not_exact = (
-                            _classify_unresolved_visibility(probe, item)
-                        )
-                    if exact_visible:
-                        row = _execution_row(
+                    terminal_row: dict[str, object] | None = None
+                    with store.connection() as connection:
+                        connection.execute("BEGIN IMMEDIATE")
+                        current_receipt = _current_receipt_in_write_transaction(
+                            store,
+                            connection,
                             item,
-                            report_sha256=validated.report_sha256,
-                            outcome="repaired",
-                            reason_code=None,
                         )
-                        _append_execution_row_at(directory_fd, descriptor, row)
-                        existing += (row,)
-                        terminal_by_job_id[job_id] = row
-                        continue
-                    if recover_unresolved_claims and definitely_not_exact:
-                        retry_claimed.add(job_id)
-                        continue
-                    stopped_reason = "unresolved_claim"
-                    break
+                        if current_receipt != item.receipt:
+                            terminal_row = _execution_row(
+                                item,
+                                report_sha256=validated.report_sha256,
+                                outcome="skipped_receipt_changed",
+                                reason_code="receipt_changed",
+                            )
+                        else:
+                            try:
+                                probe = visibility_client.check(
+                                    item.receipt.movie_code,
+                                    item.receipt.subtitle_id,
+                                    item.receipt.content_sha256,
+                                )
+                            except Exception:
+                                exact_visible, definitely_not_exact = False, False
+                            else:
+                                exact_visible, definitely_not_exact = (
+                                    _classify_unresolved_visibility(probe, item)
+                                )
+                            if exact_visible:
+                                terminal_row = _execution_row(
+                                    item,
+                                    report_sha256=validated.report_sha256,
+                                    outcome="repaired",
+                                    reason_code=None,
+                                )
+                            elif recover_unresolved_claims and definitely_not_exact:
+                                try:
+                                    sync_client.sync(
+                                        item.receipt.movie_code,
+                                        expected_subtitle_id=item.receipt.subtitle_id,
+                                        expected_content_sha256=(
+                                            item.receipt.content_sha256
+                                        ),
+                                    )
+                                except CatalogSyncError as exc:
+                                    terminal_row = _execution_row(
+                                        item,
+                                        report_sha256=validated.report_sha256,
+                                        outcome="failed",
+                                        reason_code=exc.reason_code,
+                                    )
+                                else:
+                                    terminal_row = _execution_row(
+                                        item,
+                                        report_sha256=validated.report_sha256,
+                                        outcome="repaired",
+                                        reason_code=None,
+                                    )
+                            else:
+                                stopped_reason = "unresolved_claim"
+                        if terminal_row is not None:
+                            _append_execution_row_at(
+                                directory_fd,
+                                descriptor,
+                                terminal_row,
+                            )
+                    if terminal_row is None:
+                        break
+                    existing += (terminal_row,)
+                    terminal_by_job_id[job_id] = terminal_row
+                    if terminal_row["reason_code"] == "catalog_auth_failed":
+                        stopped_reason = "catalog_auth_failed"
+                        break
 
                 consecutive_failures = _trailing_consecutive_failures(
                     validated,
@@ -1115,9 +1159,6 @@ def execute_catalog_visibility_repair(
                     job_id = item.receipt.job_id
                     if job_id in terminal_by_job_id:
                         continue
-                    if job_id in unresolved_job_ids and job_id not in retry_claimed:
-                        stopped_reason = "unresolved_claim"
-                        break
                     with store.connection() as connection:
                         connection.execute("BEGIN IMMEDIATE")
                         current_receipt = _current_receipt_in_write_transaction(
