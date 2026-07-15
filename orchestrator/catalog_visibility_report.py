@@ -32,6 +32,7 @@ MAX_AUDIT_ALLOWLIST = 10_000
 MAX_AUDIT_FINDINGS = 10_000
 MAX_OBSERVED_SUBTITLE_IDS = 10_000
 MAX_AUDIT_DOCUMENT_BYTES = 64 * 1024 * 1024
+MAX_AUDIT_REPORT_OVERHEAD_BYTES = 8 * 1024 * 1024
 MAX_CHECKPOINT_LINE_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 100
 _SECURE_DIR_FD_SUPPORTED = all(
@@ -569,6 +570,41 @@ def _validate_regular_fd(descriptor: int, label: str) -> os.stat_result:
     return file_stat
 
 
+def _validate_published_leaf_identity(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+    label: str,
+    *,
+    expected_mode: int | None,
+) -> os.stat_result:
+    descriptor_stat = os.fstat(descriptor)
+    try:
+        published_stat = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} is not a private published leaf") from exc
+    descriptor_mode = stat.S_IMODE(descriptor_stat.st_mode)
+    published_mode = stat.S_IMODE(published_stat.st_mode)
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(published_stat.st_mode)
+        or descriptor_stat.st_dev != published_stat.st_dev
+        or descriptor_stat.st_ino != published_stat.st_ino
+        or descriptor_stat.st_nlink != 1
+        or published_stat.st_nlink != 1
+        or descriptor_stat.st_uid != os.geteuid()
+        or published_stat.st_uid != os.geteuid()
+        or descriptor_mode != published_mode
+        or (expected_mode is not None and descriptor_mode != expected_mode)
+    ):
+        raise ValueError(f"{label} is not a private published leaf")
+    return descriptor_stat
+
+
 def _open_leaf_without_link_validation(
     directory_fd: int,
     name: str,
@@ -698,7 +734,10 @@ def _safe_read_bytes(
     label: str = "audit file",
     *,
     recover_owned_temp: bool = False,
+    limit: int | None = None,
 ) -> bytes:
+    if limit is None:
+        limit = MAX_AUDIT_DOCUMENT_BYTES
     parent, name = _leaf_parent(path)
     with _pinned_directory(parent, create=False) as directory_fd:
         if recover_owned_temp:
@@ -706,7 +745,21 @@ def _safe_read_bytes(
         opener = _open_artifact_leaf if recover_owned_temp else _open_existing_leaf
         descriptor = opener(directory_fd, name, os.O_RDONLY, label)
         try:
-            data = _read_fd_limited(descriptor, label, MAX_AUDIT_DOCUMENT_BYTES)
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=0o600,
+            )
+            data = _read_fd_limited(descriptor, label, limit)
+            _validate_published_leaf_identity(
+                directory_fd,
+                name,
+                descriptor,
+                label,
+                expected_mode=0o600,
+            )
         except BaseException:
             _close_ignoring_error(descriptor)
             raise
@@ -792,8 +845,9 @@ def _atomic_install_no_clobber(
     final_name: str,
     data: bytes,
     label: str,
+    limit: int,
 ) -> bool:
-    if len(data) > MAX_AUDIT_DOCUMENT_BYTES:
+    if len(data) > limit:
         raise ValueError(f"{label} is too large")
     temp_name = f".{final_name}.{uuid4().hex}.tmp"
     descriptor: int | None = None
@@ -809,8 +863,6 @@ def _atomic_install_no_clobber(
         os.fchmod(descriptor, 0o600)
         _write_all_fd(descriptor, data)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
         try:
             os.link(
                 temp_name,
@@ -825,6 +877,16 @@ def _atomic_install_no_clobber(
             installed = True
         os.unlink(temp_name, dir_fd=directory_fd)
         _fsync_directory_fd(directory_fd)
+        if installed:
+            _validate_published_leaf_identity(
+                directory_fd,
+                final_name,
+                descriptor,
+                label,
+                expected_mode=0o600,
+            )
+        os.close(descriptor)
+        descriptor = None
         return installed
     except BaseException:
         _close_ignoring_error(descriptor)
@@ -863,6 +925,7 @@ def write_audit_manifest(
             _MANIFEST_FILE_NAME,
             data,
             "audit manifest",
+            MAX_AUDIT_DOCUMENT_BYTES,
         )
         if installed:
             return
@@ -873,11 +936,39 @@ def write_audit_manifest(
             "audit manifest",
         )
         try:
+            _validate_published_leaf_identity(
+                directory_fd,
+                _MANIFEST_FILE_NAME,
+                descriptor,
+                "audit manifest",
+                expected_mode=None,
+            )
             existing = _load_manifest_fd(descriptor)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _MANIFEST_FILE_NAME,
+                descriptor,
+                "audit manifest",
+                expected_mode=None,
+            )
             if existing != manifest:
                 raise ValueError("existing audit manifest differs")
             os.fchmod(descriptor, 0o600)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _MANIFEST_FILE_NAME,
+                descriptor,
+                "audit manifest",
+                expected_mode=0o600,
+            )
             os.fsync(descriptor)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _MANIFEST_FILE_NAME,
+                descriptor,
+                "audit manifest",
+                expected_mode=0o600,
+            )
         except BaseException:
             _close_ignoring_error(descriptor)
             raise
@@ -984,7 +1075,21 @@ def _load_manifest_at(directory_fd: int) -> AuditManifest:
         "audit manifest",
     )
     try:
+        _validate_published_leaf_identity(
+            directory_fd,
+            _MANIFEST_FILE_NAME,
+            descriptor,
+            "audit manifest",
+            expected_mode=0o600,
+        )
         manifest = _load_manifest_fd(descriptor)
+        _validate_published_leaf_identity(
+            directory_fd,
+            _MANIFEST_FILE_NAME,
+            descriptor,
+            "audit manifest",
+            expected_mode=0o600,
+        )
     except BaseException:
         _close_ignoring_error(descriptor)
         raise
@@ -1052,7 +1157,21 @@ def _load_findings_at(
         return ()
     try:
         fcntl.flock(descriptor, fcntl.LOCK_SH)
+        _validate_published_leaf_identity(
+            directory_fd,
+            _CHECKPOINT_FILE_NAME,
+            descriptor,
+            "audit checkpoint",
+            expected_mode=0o600,
+        )
         findings = _load_findings_from_fd(descriptor, manifest)
+        _validate_published_leaf_identity(
+            directory_fd,
+            _CHECKPOINT_FILE_NAME,
+            descriptor,
+            "audit checkpoint",
+            expected_mode=0o600,
+        )
     except BaseException:
         _close_ignoring_error(descriptor)
         raise
@@ -1101,11 +1220,20 @@ def _append_audit_finding_locked(
         row_durable = False
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            _validate_regular_fd(descriptor, "audit checkpoint")
-            existing = _load_findings_from_fd(descriptor, manifest)
-            original_size = _validate_regular_fd(
+            _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
                 descriptor,
                 "audit checkpoint",
+                expected_mode=None,
+            )
+            existing = _load_findings_from_fd(descriptor, manifest)
+            original_size = _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                descriptor,
+                "audit checkpoint",
+                expected_mode=None,
             ).st_size
             if finding.candidate.job_id in {
                 item.candidate.job_id for item in existing
@@ -1114,18 +1242,41 @@ def _append_audit_finding_locked(
             if original_size + len(row) > MAX_AUDIT_DOCUMENT_BYTES:
                 raise ValueError("audit checkpoint would exceed the document size limit")
             os.fchmod(descriptor, 0o600)
-            _validate_regular_fd(descriptor, "audit checkpoint")
+            _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                descriptor,
+                "audit checkpoint",
+                expected_mode=0o600,
+            )
             written = os.write(descriptor, row)
             if written != len(row):
                 raise OSError("audit checkpoint append was incomplete")
-            if os.fstat(descriptor).st_nlink != 1:
-                raise ValueError("audit checkpoint hardlink race detected")
+            _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                descriptor,
+                "audit checkpoint",
+                expected_mode=0o600,
+            )
             os.fsync(descriptor)
-            if os.fstat(descriptor).st_nlink != 1:
-                raise ValueError("audit checkpoint hardlink race detected")
-            row_durable = True
+            _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                descriptor,
+                "audit checkpoint",
+                expected_mode=0o600,
+            )
             if created:
                 _fsync_directory_fd(directory_fd)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _CHECKPOINT_FILE_NAME,
+                descriptor,
+                "audit checkpoint",
+                expected_mode=0o600,
+            )
+            row_durable = True
         except BaseException:
             if original_size is not None and not row_durable:
                 try:
@@ -1170,6 +1321,10 @@ def _report_to_obj(report: AuditReport) -> dict[str, object]:
     payload = _report_payload_without_digest(report)
     payload["report_sha256"] = report.report_sha256
     return payload
+
+
+def _max_audit_report_bytes() -> int:
+    return 2 * MAX_AUDIT_DOCUMENT_BYTES + MAX_AUDIT_REPORT_OVERHEAD_BYTES
 
 
 def _validate_report(report: object) -> AuditReport:
@@ -1227,7 +1382,7 @@ def _load_report_fd(descriptor: int) -> AuditReport:
     data = _read_fd_limited(
         descriptor,
         "audit report",
-        MAX_AUDIT_DOCUMENT_BYTES,
+        _max_audit_report_bytes(),
     )
     return _report_from_obj(_decode_json(data, "audit report"))
 
@@ -1259,11 +1414,15 @@ def _finalize_audit_report_locked(
         report = replace(unsigned, report_sha256=audit_report_sha256(unsigned))
         _validate_report(report)
         data = _canonical_bytes(_report_to_obj(report))
+        report_limit = _max_audit_report_bytes()
+        if len(data) > report_limit:
+            raise ValueError("audit report is too large")
         installed = _atomic_install_no_clobber(
             directory_fd,
             _REPORT_FILE_NAME,
             data,
             "audit report",
+            report_limit,
         )
         if installed:
             return report
@@ -1274,11 +1433,39 @@ def _finalize_audit_report_locked(
             "audit report",
         )
         try:
+            _validate_published_leaf_identity(
+                directory_fd,
+                _REPORT_FILE_NAME,
+                descriptor,
+                "audit report",
+                expected_mode=None,
+            )
             existing = _load_report_fd(descriptor)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _REPORT_FILE_NAME,
+                descriptor,
+                "audit report",
+                expected_mode=None,
+            )
             if existing != report:
                 raise ValueError("existing audit report differs")
             os.fchmod(descriptor, 0o600)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _REPORT_FILE_NAME,
+                descriptor,
+                "audit report",
+                expected_mode=0o600,
+            )
             os.fsync(descriptor)
+            _validate_published_leaf_identity(
+                directory_fd,
+                _REPORT_FILE_NAME,
+                descriptor,
+                "audit report",
+                expected_mode=0o600,
+            )
         except BaseException:
             _close_ignoring_error(descriptor)
             raise
@@ -1299,6 +1486,7 @@ def load_audit_report(path: str | os.PathLike[str]) -> AuditReport:
                 Path(path),
                 "audit report",
                 recover_owned_temp=True,
+                limit=_max_audit_report_bytes(),
             ),
             "audit report",
         )

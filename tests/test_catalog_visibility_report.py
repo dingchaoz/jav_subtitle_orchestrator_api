@@ -115,6 +115,12 @@ def large_valid_finding(candidate: AuditCandidateSnapshot) -> AuditFinding:
     )
 
 
+def replace_published_leaf(path: Path, detached: Path, content: bytes) -> None:
+    path.rename(detached)
+    path.write_bytes(content)
+    path.chmod(0o640)
+
+
 def test_catalog_visibility_report_module_exposes_public_constants():
     assert AUDIT_REPORT_SCHEMA_VERSION == 1
     assert REPAIR_ELIGIBLE == frozenset({"missing", "not_found"})
@@ -1068,7 +1074,7 @@ def test_checkpoint_line_and_document_and_report_limits_fail_safely(
 
     monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 64 * 1024 * 1024)
     report = finalize_audit_report(tmp_path)
-    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", 10)
+    monkeypatch.setattr(report_module, "_max_audit_report_bytes", lambda: 10)
     with pytest.raises(ValueError):
         load_audit_report(tmp_path / "audit-report.json")
     assert report.complete is True
@@ -1344,3 +1350,244 @@ def test_checkpoint_post_write_hardlink_race_rolls_back_without_data_loss(
     assert external.read_bytes() == before
     external.unlink()
     assert load_audit_findings(tmp_path, manifest) == (finding(candidate),)
+
+
+@pytest.mark.parametrize("replacement_stage", ["before_write", "after_write", "after_fsync"])
+def test_checkpoint_append_rejects_published_leaf_replacement_and_rolls_back(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    monkeypatch,
+    replacement_stage: str,
+):
+    second = second_candidate(candidate)
+    write_manifest(tmp_path, candidate, second)
+    append_audit_finding(tmp_path, finding(candidate))
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    detached = tmp_path / f"detached-{replacement_stage}.jsonl"
+    before = checkpoint.read_bytes()
+    checkpoint_inode = checkpoint.stat().st_ino
+    real_fchmod = os.fchmod
+    real_write = os.write
+    real_fsync = os.fsync
+    replaced = False
+
+    def is_checkpoint(descriptor: int) -> bool:
+        return os.fstat(descriptor).st_ino == checkpoint_inode
+
+    def replace_once() -> None:
+        nonlocal replaced
+        replace_published_leaf(checkpoint, detached, before)
+        replaced = True
+
+    def replacing_fchmod(descriptor: int, mode: int):
+        result = real_fchmod(descriptor, mode)
+        if replacement_stage == "before_write" and not replaced and is_checkpoint(descriptor):
+            replace_once()
+        return result
+
+    def replacing_write(descriptor: int, data: bytes):
+        written = real_write(descriptor, data)
+        if replacement_stage == "after_write" and not replaced and is_checkpoint(descriptor):
+            replace_once()
+        return written
+
+    def replacing_fsync(descriptor: int):
+        result = real_fsync(descriptor)
+        if replacement_stage == "after_fsync" and not replaced and is_checkpoint(descriptor):
+            replace_once()
+        return result
+
+    monkeypatch.setattr(os, "fchmod", replacing_fchmod)
+    monkeypatch.setattr(os, "write", replacing_write)
+    monkeypatch.setattr(os, "fsync", replacing_fsync)
+    with pytest.raises(ValueError, match="identity|published|private|changed"):
+        append_audit_finding(tmp_path, finding(second, "missing"))
+
+    assert replaced is True
+    assert checkpoint.read_bytes() == before
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o640
+    assert detached.read_bytes() == before
+
+
+def test_checkpoint_load_rejects_published_leaf_replacement_after_read(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = write_manifest(tmp_path, candidate)
+    expected = finding(candidate)
+    append_audit_finding(tmp_path, expected)
+    checkpoint = tmp_path / "audit-findings.jsonl"
+    detached = tmp_path / "detached-checkpoint.jsonl"
+    before = checkpoint.read_bytes()
+    checkpoint_inode = checkpoint.stat().st_ino
+    real_load = report_module._load_findings_from_fd
+    replaced = False
+
+    def replacing_load(descriptor: int, loaded_manifest):
+        nonlocal replaced
+        findings = real_load(descriptor, loaded_manifest)
+        if not replaced and os.fstat(descriptor).st_ino == checkpoint_inode:
+            replace_published_leaf(checkpoint, detached, before)
+            replaced = True
+        return findings
+
+    monkeypatch.setattr(report_module, "_load_findings_from_fd", replacing_load)
+    with pytest.raises(ValueError, match="identity|published|private|changed"):
+        load_audit_findings(tmp_path, manifest)
+
+    assert replaced is True
+    assert checkpoint.read_bytes() == before
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("artifact", ["manifest", "report"])
+def test_artifact_read_rejects_published_leaf_replacement_after_read(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    monkeypatch,
+    artifact: str,
+):
+    manifest = write_manifest(tmp_path, candidate)
+    if artifact == "manifest":
+        path = tmp_path / "audit-manifest.json"
+        label = "audit manifest"
+        loader = lambda: load_audit_manifest(path)
+    else:
+        append_audit_finding(tmp_path, finding(candidate))
+        finalize_audit_report(tmp_path)
+        path = tmp_path / "audit-report.json"
+        label = "audit report"
+        loader = lambda: load_audit_report(path)
+    detached = tmp_path / f"detached-{artifact}.json"
+    before = path.read_bytes()
+    artifact_inode = path.stat().st_ino
+    real_read = report_module._read_fd_limited
+    replaced = False
+
+    def replacing_read(descriptor: int, read_label: str, limit: int):
+        nonlocal replaced
+        data = real_read(descriptor, read_label, limit)
+        if (
+            not replaced
+            and read_label == label
+            and os.fstat(descriptor).st_ino == artifact_inode
+        ):
+            replace_published_leaf(path, detached, before)
+            replaced = True
+        return data
+
+    monkeypatch.setattr(report_module, "_read_fd_limited", replacing_read)
+    with pytest.raises(ValueError, match="identity|published|private|changed"):
+        loader()
+
+    assert replaced is True
+    assert path.read_bytes() == before
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_new_manifest_install_rejects_replaced_published_leaf(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = make_manifest(tmp_path, candidate)
+    path = tmp_path / "audit-manifest.json"
+    detached = tmp_path / "detached-installed-manifest.json"
+    replacement = b"replacement-manifest-content"
+    real_fsync_directory = report_module._fsync_directory_fd
+    replaced = False
+
+    def replacing_directory_fsync(directory_fd: int):
+        nonlocal replaced
+        result = real_fsync_directory(directory_fd)
+        if not replaced and path.exists():
+            replace_published_leaf(path, detached, replacement)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(report_module, "_fsync_directory_fd", replacing_directory_fsync)
+    with pytest.raises(ValueError, match="identity|published|private|changed"):
+        write_audit_manifest(tmp_path, manifest)
+
+    assert replaced is True
+    assert path.read_bytes() == replacement
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("artifact", ["manifest", "report"])
+def test_idempotent_artifact_write_rejects_published_leaf_replacement(
+    tmp_path: Path,
+    candidate: AuditCandidateSnapshot,
+    monkeypatch,
+    artifact: str,
+):
+    manifest = write_manifest(tmp_path, candidate)
+    if artifact == "manifest":
+        path = tmp_path / "audit-manifest.json"
+        operation = lambda: write_audit_manifest(tmp_path, manifest)
+    else:
+        append_audit_finding(tmp_path, finding(candidate))
+        expected = finalize_audit_report(tmp_path)
+        path = tmp_path / "audit-report.json"
+        operation = lambda: finalize_audit_report(tmp_path)
+        assert load_audit_report(path) == expected
+    path.chmod(0o644)
+    detached = tmp_path / f"detached-idempotent-{artifact}.json"
+    replacement = path.read_bytes()
+    artifact_inode = path.stat().st_ino
+    real_fchmod = os.fchmod
+    replaced = False
+
+    def replacing_fchmod(descriptor: int, mode: int):
+        nonlocal replaced
+        result = real_fchmod(descriptor, mode)
+        if not replaced and os.fstat(descriptor).st_ino == artifact_inode:
+            replace_published_leaf(path, detached, replacement)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(os, "fchmod", replacing_fchmod)
+    with pytest.raises(ValueError, match="identity|published|private|changed"):
+        operation()
+
+    assert replaced is True
+    assert path.read_bytes() == replacement
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_report_uses_derived_budget_for_valid_base_limited_inputs(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    manifest = write_manifest(tmp_path, candidate)
+    append_audit_finding(tmp_path, large_valid_finding(candidate))
+    manifest_size = (tmp_path / "audit-manifest.json").stat().st_size
+    checkpoint_size = (tmp_path / "audit-findings.jsonl").stat().st_size
+    base_limit = max(manifest_size, checkpoint_size)
+    monkeypatch.setattr(report_module, "MAX_AUDIT_DOCUMENT_BYTES", base_limit)
+
+    report = finalize_audit_report(tmp_path)
+
+    report_path = tmp_path / "audit-report.json"
+    assert report_path.stat().st_size > base_limit
+    assert load_audit_report(report_path) == report
+
+
+def test_report_rejects_exact_bytes_one_over_report_specific_limit(
+    tmp_path: Path, candidate: AuditCandidateSnapshot, monkeypatch
+):
+    write_manifest(tmp_path, candidate)
+    append_audit_finding(tmp_path, finding(candidate))
+    report = finalize_audit_report(tmp_path)
+    report_path = tmp_path / "audit-report.json"
+    report_size = report_path.stat().st_size
+    report_path.unlink()
+    monkeypatch.setattr(
+        report_module,
+        "_max_audit_report_bytes",
+        lambda: report_size - 1,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="report|large|limit"):
+        finalize_audit_report(tmp_path)
+
+    assert report.complete is True
+    assert not report_path.exists()
+    assert not list(tmp_path.glob(".audit-report.json.*.tmp"))
