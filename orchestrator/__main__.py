@@ -199,6 +199,27 @@ def build_subtitle_audit_api_service(settings):
     )
 
 
+def build_requested_subtitle_importer(settings):
+    if (
+        not settings.cloudflare_account_id
+        or not settings.cloudflare_d1_api_token
+        or not settings.cloudflare_d1_database_id
+        or not settings.supabase_url
+        or not settings.supabase_service_role_key
+    ):
+        return None
+    from orchestrator.subtitle_request_importer import RequestedSubtitleImporter
+
+    return RequestedSubtitleImporter(
+        cloudflare_account_id=settings.cloudflare_account_id,
+        cloudflare_d1_api_token=settings.cloudflare_d1_api_token,
+        cloudflare_d1_database_id=settings.cloudflare_d1_database_id,
+        supabase_url=settings.supabase_url,
+        supabase_service_role_key=settings.supabase_service_role_key,
+        timeout_seconds=settings.requested_subtitle_import_timeout_seconds,
+    )
+
+
 def build_supabase_publisher(settings):
     if not settings.mac_translation_publish_enabled:
         return None
@@ -234,14 +255,32 @@ def build_supabase_publisher(settings):
     )
 
 
+def build_supabase_publication_verifier(settings):
+    if (
+        not settings.supabase_url
+        or not settings.supabase_service_role_key
+        or not settings.supabase_subtitle_bucket
+    ):
+        raise RuntimeError(
+            "Supabase URL, service key, and subtitle bucket are required"
+        )
+    from orchestrator.supabase_publisher import SupabaseSubtitlePublisher
+
+    return SupabaseSubtitlePublisher(
+        settings.supabase_url,
+        settings.supabase_service_role_key,
+        bucket=settings.supabase_subtitle_bucket,
+        verification_timeout_seconds=(
+            settings.supabase_publish_verify_timeout_seconds
+        ),
+    )
+
+
 def build_catalog_sync_client(settings):
     if not settings.mac_translation_publish_enabled:
         return None
     if not settings.javsubtitle_api_base or not settings.javsubtitle_admin_api_token:
-        raise RuntimeError(
-            "Supabase publication and catalog sync is enabled but website API base "
-            "or admin token is missing"
-        )
+        return None
     from orchestrator.catalog_sync import CatalogSyncClient
 
     return CatalogSyncClient(
@@ -265,6 +304,8 @@ def run_api() -> None:
         worker_lease_seconds=settings.worker_lease_seconds,
         max_worker_attempts=settings.max_worker_attempts,
         subtitle_audit_service=build_subtitle_audit_api_service(settings),
+        requested_subtitle_importer=build_requested_subtitle_importer(settings),
+        callback_clients=build_callback_clients(settings),
     )
     uvicorn.run(app, host=settings.host, port=settings.port)
 
@@ -276,6 +317,84 @@ def _release_worker_lock(lock, *, preserve_worker_error: bool) -> None:
         if not preserve_worker_error:
             raise
         LOGGER.exception("worker lock cleanup failed while preserving worker error")
+
+
+def build_callback_clients(settings):
+    from orchestrator.callbacks import CallbackClient
+
+    return {
+        key: CallbackClient(url=value.url, secret=value.secret)
+        for key, value in getattr(settings, "callback_clients", {}).items()
+    }
+
+
+def build_callback_notifier(store, settings):
+    if not getattr(settings, "callback_clients", {}):
+        return None
+    from orchestrator.callbacks import CallbackNotifier
+
+    return CallbackNotifier(
+        store,
+        build_callback_clients(settings),
+        timeout_seconds=getattr(settings, "callback_timeout_seconds", 10),
+    )
+
+
+def run_catalog_sync_reconciliation(
+    *,
+    movie_codes: list[str] | None,
+    limit: int,
+    execute: bool,
+    retry_catalog_sync: bool,
+    resend_ready_webhook: bool,
+) -> None:
+    from orchestrator.catalog_sync_reconciliation import CatalogSyncReconciler
+    from orchestrator.config import MacSettings
+    from orchestrator.store import JobStore
+
+    if not execute and (retry_catalog_sync or resend_ready_webhook):
+        raise ValueError("retry and resend options require --execute")
+    settings = MacSettings()
+    store = JobStore(
+        settings.db_path,
+        settings.jobs_root_mac,
+        settings.jobs_root_windows,
+    )
+    if execute:
+        store.initialize()
+    reconciler = CatalogSyncReconciler(
+        store,
+        build_supabase_publication_verifier(settings),
+        notifier=(
+            build_callback_notifier(store, settings)
+            if resend_ready_webhook
+            else None
+        ),
+    )
+    report = reconciler.run(
+        movie_codes=movie_codes,
+        limit=limit,
+        execute=execute,
+        retry_catalog_sync=retry_catalog_sync,
+        resend_ready_webhook=resend_ready_webhook,
+    )
+    print(
+        json.dumps(
+            {
+                "mode": report.mode,
+                "counts": report.counts,
+                "items": [
+                    {
+                        "job_id": item.job_id,
+                        "movie_code": item.movie_code,
+                        "outcome": item.outcome,
+                    }
+                    for item in report.items
+                ],
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def run_mac_worker() -> None:
@@ -431,6 +550,10 @@ def run_mac_translation_worker() -> None:
             catalog_sync_client=catalog_sync_client,
             max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
             catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
+            catalog_sync_max_retry_seconds=(
+                getattr(settings, "catalog_sync_max_retry_seconds", 900)
+            ),
+            callback_notifier=build_callback_notifier(store, settings),
         )
         run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
     except BaseException:
@@ -468,6 +591,12 @@ def run_mac_translation_worker_once(job_id: str) -> None:
         catalog_sync_client=catalog_sync_client,
         max_catalog_sync_attempts=settings.max_catalog_sync_attempts,
         catalog_sync_retry_seconds=settings.catalog_sync_retry_seconds,
+        catalog_sync_max_retry_seconds=getattr(
+            settings,
+            "catalog_sync_max_retry_seconds",
+            900,
+        ),
+        callback_notifier=build_callback_notifier(store, settings),
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)
@@ -978,6 +1107,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated movie codes to inspect",
     )
     catalog_repair_parser.add_argument("--limit", type=int, default=100)
+    reconciliation = subcommands.add_parser(
+        "reconcile-catalog-sync-failures",
+        help="verify Supabase artifacts and repair false catalog-sync failures",
+    )
+    reconciliation.add_argument(
+        "--movie",
+        action="append",
+        dest="movie_codes",
+        help="movie code to inspect; repeat for an explicit allowlist",
+    )
+    reconciliation.add_argument("--limit", type=int, default=100)
+    reconciliation.add_argument("--execute", action="store_true")
+    reconciliation.add_argument("--retry-catalog-sync", action="store_true")
+    reconciliation.add_argument("--resend-ready-webhook", action="store_true")
     audit_parser = subcommands.add_parser(
         "audit-english-ai-local",
         help="GET-only local audit of exact English_AI catalog subtitles",
@@ -1092,6 +1235,14 @@ def main() -> None:
         run_plan_catalog_repairs(
             allowlist=_parse_allowlist(args.allowlist),
             limit=args.limit,
+        )
+    elif args.command == "reconcile-catalog-sync-failures":
+        run_catalog_sync_reconciliation(
+            movie_codes=args.movie_codes,
+            limit=args.limit,
+            execute=args.execute,
+            retry_catalog_sync=args.retry_catalog_sync,
+            resend_ready_webhook=args.resend_ready_webhook,
         )
     elif args.command == "audit-english-ai-local":
         run_local_english_ai_audit(

@@ -165,6 +165,79 @@ class SupabaseSubtitlePublisher:
             metadata_source=catalog.metadata_source,
         )
 
+    def verify_existing_publication(
+        self,
+        *,
+        movie_code: str,
+        movie_uuid: str,
+        subtitle_id: str,
+        storage_path: str,
+        content_sha256: str,
+        file_size: int,
+    ) -> None:
+        """Verify a persisted publication receipt without modifying Supabase."""
+        canonical = canonical_movie_code(movie_code)
+        if storage_path != build_ai_subtitle_storage_path(canonical):
+            raise ValueError("published storage path does not match movie code")
+        if not isinstance(movie_uuid, str) or not movie_uuid:
+            raise ValueError("published movie UUID is required")
+        if not isinstance(subtitle_id, str) or not subtitle_id:
+            raise ValueError("published subtitle ID is required")
+        if (
+            not isinstance(content_sha256, str)
+            or len(content_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in content_sha256)
+        ):
+            raise ValueError("published content SHA-256 is invalid")
+        if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size <= 0:
+            raise ValueError("published file size is invalid")
+
+        rows = self._request_json(
+            "GET",
+            "/rest/v1/movie_languages",
+            params={
+                "select": "id,movie_id,language,file_path,file_size",
+                "id": f"eq.{subtitle_id}",
+                "movie_id": f"eq.{movie_uuid}",
+                "language": f"eq.{AI_ENGLISH_LANGUAGE}",
+                "file_path": f"eq.{storage_path}",
+                "limit": "1",
+            },
+        )
+        expected = {
+            "id": subtitle_id,
+            "movie_id": movie_uuid,
+            "language": AI_ENGLISH_LANGUAGE,
+            "file_path": storage_path,
+            "file_size": file_size,
+        }
+        if not isinstance(rows, list) or len(rows) != 1 or rows[0] != expected:
+            raise RuntimeError("catalog_mismatch")
+
+        response = self._request_raw(
+            "GET",
+            f"/storage/v1/object/{self.bucket}/{storage_path}",
+            headers={"Accept-Encoding": "identity"},
+            params={"cacheNonce": self.nonce_factory()},
+            stream=True,
+        )
+        actual_sha256 = hashlib.sha256()
+        actual_size = 0
+        try:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                actual_size += len(chunk)
+                if actual_size > file_size:
+                    break
+                actual_sha256.update(chunk)
+        finally:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()
+        if actual_size != file_size or actual_sha256.hexdigest() != content_sha256:
+            raise RuntimeError("storage_mismatch")
+
     def _request_raw(self, method: str, path: str, **kwargs: Any) -> Any:
         headers = {**self.headers, **kwargs.pop("headers", {})}
         response = self.session.request(

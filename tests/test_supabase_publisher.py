@@ -522,3 +522,133 @@ def test_default_catalog_ensurer_reuses_publisher_http_configuration():
     assert publisher.catalog_ensurer.service_key == "service-key"
     assert publisher.catalog_ensurer.timeout_seconds == 17
     assert publisher.catalog_ensurer.session is session
+
+
+class ExistingPublicationSession:
+    def __init__(self, *, row, content: bytes):
+        self.row = row
+        self.content = content
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        if method == "GET" and "/rest/v1/movie_languages" in url:
+            return FakeResponse([] if self.row is None else [self.row])
+        if method == "GET" and "/storage/v1/object/" in url:
+            return BinaryResponse(self.content)
+        raise AssertionError(f"unexpected call: {method} {url}")
+
+
+def _existing_publication_row(content: bytes) -> dict[str, object]:
+    return {
+        "id": "subtitle-uuid",
+        "movie_id": CATALOG_MOVIE_UUID,
+        "language": "English_AI",
+        "file_path": "ktb/ktb-104/ktb-104-English_AI.srt",
+        "file_size": len(content),
+    }
+
+
+def test_verify_existing_publication_reads_exact_catalog_row_and_storage_object():
+    content = b"1\n00:00:00,000 --> 00:00:01,000\nPublished\n"
+    session = ExistingPublicationSession(
+        row=_existing_publication_row(content),
+        content=content,
+    )
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=RecordingCatalogEnsurer(),
+        nonce_factory=lambda: "verification-nonce",
+    )
+
+    publisher.verify_existing_publication(
+        movie_code="ktb-104",
+        movie_uuid=CATALOG_MOVIE_UUID,
+        subtitle_id="subtitle-uuid",
+        storage_path="ktb/ktb-104/ktb-104-English_AI.srt",
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        file_size=len(content),
+    )
+
+    assert [call[0] for call in session.calls] == ["GET", "GET"]
+    catalog_call, storage_call = session.calls
+    assert catalog_call[2]["params"] == {
+        "select": "id,movie_id,language,file_path,file_size",
+        "id": "eq.subtitle-uuid",
+        "movie_id": f"eq.{CATALOG_MOVIE_UUID}",
+        "language": "eq.English_AI",
+        "file_path": "eq.ktb/ktb-104/ktb-104-English_AI.srt",
+        "limit": "1",
+    }
+    assert storage_call[2]["headers"]["Accept-Encoding"] == "identity"
+    assert storage_call[2]["params"] == {"cacheNonce": "verification-nonce"}
+    assert storage_call[2]["stream"] is True
+
+
+@pytest.mark.parametrize(
+    ("row_factory", "content_factory", "reason"),
+    [
+        (lambda expected, content: None, lambda content: content, "catalog_mismatch"),
+        (
+            lambda expected, content: {**expected, "file_size": len(content) + 1},
+            lambda content: content,
+            "catalog_mismatch",
+        ),
+        (
+            lambda expected, content: expected,
+            lambda content: content + b"tampered",
+            "storage_mismatch",
+        ),
+    ],
+)
+def test_verify_existing_publication_rejects_missing_or_changed_artifact(
+    row_factory,
+    content_factory,
+    reason,
+):
+    content = b"published subtitle"
+    expected = _existing_publication_row(content)
+    session = ExistingPublicationSession(
+        row=row_factory(expected, content),
+        content=content_factory(content),
+    )
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=RecordingCatalogEnsurer(),
+    )
+
+    with pytest.raises(RuntimeError, match=rf"^{reason}$"):
+        publisher.verify_existing_publication(
+            movie_code="ktb-104",
+            movie_uuid=CATALOG_MOVIE_UUID,
+            subtitle_id="subtitle-uuid",
+            storage_path="ktb/ktb-104/ktb-104-English_AI.srt",
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            file_size=len(content),
+        )
+
+
+def test_verify_existing_publication_rejects_receipt_for_another_movie_before_io():
+    session = ExistingPublicationSession(row=None, content=b"")
+    publisher = SupabaseSubtitlePublisher(
+        "https://example.supabase.co",
+        "service-key",
+        session=session,
+        catalog_ensurer=RecordingCatalogEnsurer(),
+    )
+
+    with pytest.raises(ValueError, match="storage path"):
+        publisher.verify_existing_publication(
+            movie_code="ktb-110",
+            movie_uuid=CATALOG_MOVIE_UUID,
+            subtitle_id="subtitle-uuid",
+            storage_path="ktb/ktb-104/ktb-104-English_AI.srt",
+            content_sha256="a" * 64,
+            file_size=10,
+        )
+
+    assert session.calls == []

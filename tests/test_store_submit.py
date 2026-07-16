@@ -181,9 +181,54 @@ def test_initialize_migrates_legacy_row_idempotently(
     assert migrated["catalog_sync_attempt_count"] == 0
     assert migrated["next_catalog_sync_attempt_at"] is None
     assert migrated["catalog_lease_token"] is None
+    assert migrated["artifact_status"] is None
+    assert migrated["catalog_sync_status"] is None
+    assert migrated["catalog_sync_warning_code"] is None
+    assert migrated["catalog_sync_warning_message"] is None
+    assert migrated["catalog_sync_last_http_status"] is None
+    assert migrated["catalog_sync_last_response_json"] is None
+    assert migrated["catalog_sync_last_attempt_at"] is None
+    assert migrated["callback_client_key"] is None
     assert any(row["type"] == "table" for row in first_schema)
     assert [tuple(row) for row in second_schema] == [tuple(row) for row in first_schema]
     assert foreign_key_violations == []
+
+
+def test_initialize_classifies_verified_legacy_ready_publication(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("KTB-104", priority=100, force=False).job
+    with store.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'english_srt_ready', artifact_status = NULL,
+                catalog_sync_status = NULL,
+                catalog_movie_uuid = ?, metadata_status = 'complete',
+                metadata_source = 'public', published_subtitle_id = ?,
+                published_storage_path = ?, published_content_sha256 = ?,
+                published_file_size = 123, error = NULL
+            WHERE id = ?
+            """,
+            (
+                "f1bd9932-5697-4f16-865a-c56edc73d491",
+                "f1bd9932-5697-4f16-865a-c56edc73d492",
+                "ktb/ktb-104/ktb-104-English_AI.srt",
+                "a" * 64,
+                job.id,
+            ),
+        )
+
+    store.initialize()
+
+    migrated = store.get_job(job.id)
+    assert migrated.status is JobStatus.ENGLISH_SRT_READY
+    assert migrated.artifact_status == "ready"
+    assert migrated.catalog_sync_status is None
+    assert migrated.error is None
 
 
 def test_initialize_backfills_immutable_source_english_hash_on_legacy_repairs(
@@ -582,6 +627,44 @@ def test_force_submit_returns_conflict_for_active_worker_statuses(
     assert result.job.id == created.job.id
     assert result.job.status == active_status
     assert result.job.claimed_by == "worker-1"
+
+
+def test_force_submit_cannot_reset_claimed_ready_catalog_work(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    created = store.submit_job("abc-034", priority=100, force=False)
+    set_job_fields(
+        sqlite_path,
+        created.job.id,
+        status=JobStatus.ENGLISH_SRT_READY.value,
+        artifact_status="ready",
+        catalog_sync_status="pending",
+        catalog_movie_uuid="f1bd9932-5697-4f16-865a-c56edc73d491",
+        metadata_status="complete",
+        metadata_source="public",
+        published_subtitle_id="f1bd9932-5697-4f16-865a-c56edc73d492",
+        published_storage_path="abc/abc-034/abc-034-English_AI.srt",
+        published_content_sha256="f" * 64,
+        published_file_size=321,
+    )
+    claimed = store.claim_catalog_sync_job(
+        "catalog-worker",
+        60,
+        job_id=created.job.id,
+    )
+
+    result = store.submit_job("ABC034", priority=10, force=True)
+
+    assert result.kind == "conflict"
+    current = store.get_job(created.job.id)
+    assert current.status is JobStatus.ENGLISH_SRT_READY
+    assert current.claimed_by == "catalog-worker"
+    assert current.catalog_lease_token == claimed.catalog_lease_token
+    assert current.published_subtitle_id == claimed.published_subtitle_id
+    assert current.published_storage_path == claimed.published_storage_path
 
 
 def test_submit_invalid_movie_number(sqlite_path, mac_jobs_root):

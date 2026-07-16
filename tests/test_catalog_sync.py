@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import fields
 
 import pytest
 import requests
 
-from orchestrator.catalog_sync import CatalogSyncClient, CatalogSyncError, CatalogSyncResult
+from orchestrator.catalog_sync import (
+    CatalogSyncClient,
+    CatalogSyncDiagnostic,
+    CatalogSyncError,
+    CatalogSyncResult,
+)
 
 
 CANONICAL_CODE = "roe-291"
@@ -15,6 +21,9 @@ TOKEN = "never-log-this-token"
 ADULT_TEXT = "sensitive-response-subtitle-text"
 CREDENTIAL_URL = f"https://user:{TOKEN}@javsubtitle.example/private"
 SECRET_NETLOC = "private-adult-host.example"
+IDEMPOTENCY_KEY = "jso-catalog-" + hashlib.sha256(
+    f"{CANONICAL_CODE}\0{SUBTITLE_ID}\0{CONTENT_SHA256}".encode()
+).hexdigest()
 
 
 def valid_body() -> dict[str, object]:
@@ -75,6 +84,32 @@ def valid_public_body() -> dict[str, object]:
                 "expiresIn": 3600,
             }
         ],
+    }
+
+
+def production_body() -> dict[str, object]:
+    keys = [
+        f"movie:full:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    ]
+    return {
+        "success": True,
+        "requested": 1,
+        "synced": 1,
+        "failed": [],
+        "results": [
+            {
+                "canonicalCode": CANONICAL_CODE.upper(),
+                "d1RowsUpdated": 1,
+                "kvKeysTouched": keys,
+                "kvKeysDeleted": keys,
+                "subtitleCount": 1,
+                "futureField": ADULT_TEXT,
+            }
+        ],
+        "fence": {"value": 42, "accepted": True},
+        "action": "sync",
+        "futureTopLevel": ADULT_TEXT,
     }
 
 
@@ -167,12 +202,16 @@ def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
             f"movie:full:{CANONICAL_CODE}",
             f"movie:light:{CANONICAL_CODE}",
         ),
+        diagnostic=result.diagnostic,
     )
+    assert isinstance(result.diagnostic, CatalogSyncDiagnostic)
+    assert result.diagnostic.http_status == 200
     assert [field.name for field in fields(CatalogSyncResult)] == [
         "canonical_code",
         "d1_rows_updated",
         "subtitle_count",
         "kv_keys_deleted",
+        "diagnostic",
     ]
     with pytest.raises(AttributeError):
         result.subtitle_count = 4  # type: ignore[misc]
@@ -183,6 +222,7 @@ def test_sync_uses_exact_bounded_request_and_returns_frozen_public_result():
                 "headers": {
                     "Authorization": f"Bearer {TOKEN}",
                     "Content-Type": "application/json",
+                    "Idempotency-Key": IDEMPOTENCY_KEY,
                 },
                 "json": {
                     "canonicalCodes": [CANONICAL_CODE],
@@ -215,7 +255,100 @@ def test_sync_accepts_current_catalog_response_schema():
             f"movie:full:{CANONICAL_CODE}-uncensored-leak",
             f"movie:light:{CANONICAL_CODE}-uncensored-leak",
         ),
+        diagnostic=result.diagnostic,
     )
+
+
+def test_sync_accepts_production_schema_semantically_and_redacts_unknown_values():
+    result = sync_with_response(200, body=production_body())
+
+    assert result.canonical_code == CANONICAL_CODE
+    assert result.d1_rows_updated == 1
+    assert result.subtitle_count == 1
+    assert result.diagnostic.http_status == 200
+    assert "futureField" in result.diagnostic.response_json
+    assert "futureTopLevel" in result.diagnostic.response_json
+    assert ADULT_TEXT not in result.diagnostic.response_json
+
+
+@pytest.mark.parametrize(
+    "deleted",
+    [
+        [
+            f"movie:full:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+        ],
+        [
+            f"movie:full:{CANONICAL_CODE}",
+            {"unsafe": "entry"},
+        ],
+    ],
+)
+def test_both_kv_receipts_must_be_independently_well_formed(deleted):
+    body = production_body()
+    body["results"][0]["kvKeysDeleted"] = deleted
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+
+
+def test_http_207_is_retryable_and_retains_only_safe_partial_failure_metadata():
+    body = {
+        "success": False,
+        "requested": 1,
+        "synced": 0,
+        "failed": [
+            {"canonicalCode": CANONICAL_CODE, "error": "movie_not_found"}
+        ],
+        "results": [],
+        "secret": ADULT_TEXT,
+    }
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(207, body=body)
+
+    assert raised.value.reason_code == "catalog_sync_failed"
+    assert raised.value.retryable is True
+    assert raised.value.http_status == 207
+    assert "movie_not_found" in raised.value.response_json
+    assert "secret" in raised.value.response_json
+    assert ADULT_TEXT not in raised.value.response_json
+
+
+def test_http_500_is_retryable_with_safe_status_diagnostic():
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(500, body={"error": ADULT_TEXT})
+
+    assert raised.value.retryable is True
+    assert raised.value.http_status == 500
+    assert ADULT_TEXT not in raised.value.response_json
+
+
+def test_non_json_diagnostic_contains_only_size_and_sha256():
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(
+            500,
+            json_error=ValueError("invalid"),
+        )
+
+    diagnostic = raised.value.response_json
+    assert "bodyBytes" in diagnostic
+    assert "bodySha256" in diagnostic
+    assert ADULT_TEXT not in diagnostic
+    assert TOKEN not in diagnostic
+
+
+def test_idempotency_key_is_stable_for_same_verified_receipt():
+    first_session = FakeSession()
+    second_session = FakeSession()
+    sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=first_session))
+    sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=second_session))
+
+    assert first_session.requests[0][1]["headers"]["Idempotency-Key"] == IDEMPOTENCY_KEY
+    assert second_session.requests[0][1]["headers"]["Idempotency-Key"] == IDEMPOTENCY_KEY
 
 
 def test_sync_accepts_versioned_full_cache_key_from_deployed_catalog():
@@ -250,6 +383,18 @@ def test_sync_accepts_versioned_alias_keys_from_multirow_catalog():
     assert result.kv_keys_deleted == tuple(body["results"][0]["kvKeysDeleted"])
 
 
+def test_sync_accepts_versioned_light_alias_keys_from_deployed_catalog():
+    body = valid_body()
+    body["results"][0]["kvKeysDeleted"] = [
+        f"movie:full:v4:{CANONICAL_CODE}-uncensored-leak",
+        f"movie:light:v2:{CANONICAL_CODE}-uncensored-leak",
+    ]
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == tuple(body["results"][0]["kvKeysDeleted"])
+
+
 @pytest.mark.parametrize(
     ("status", "reason"),
     [
@@ -258,7 +403,6 @@ def test_sync_accepts_versioned_alias_keys_from_multirow_catalog():
         (399, "catalog_redirect_rejected"),
         (401, "catalog_auth_failed"),
         (403, "catalog_auth_failed"),
-        (200 + 7, "catalog_sync_failed"),
         (400, "catalog_sync_failed"),
         (500, "catalog_sync_failed"),
     ],
@@ -331,10 +475,14 @@ def response_mutations() -> list[tuple[str, object]]:
         ("results wrong type", lambda body: body.update(results={})),
         ("results wrong count", lambda body: body.update(results=[])),
         ("result not object", lambda body: body.update(results=[ADULT_TEXT])),
-        ("extra top-level field", lambda body: body.update(extra=ADULT_TEXT)),
+        ("unexpected action", lambda body: body.update(action="claim-fence")),
         (
-            "extra result field",
-            lambda body: body["results"][0].update(extra=ADULT_TEXT),
+            "rejected fence",
+            lambda body: body.update(fence={"value": 42, "accepted": False}),
+        ),
+        (
+            "nonpositive fence",
+            lambda body: body.update(fence={"value": 0, "accepted": True}),
         ),
         (
             "canonical code mismatch",
@@ -510,6 +658,8 @@ def test_public_movie_verification_fails_closed_on_mismatch(body, reason):
         sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
 
     assert raised.value.reason_code == reason
+    assert raised.value.http_status == 200
+    assert '"success":true' in raised.value.response_json
     assert TOKEN not in repr(raised.value)
     assert ADULT_TEXT not in repr(raised.value)
 
