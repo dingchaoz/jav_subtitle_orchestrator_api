@@ -13,6 +13,7 @@ from orchestrator.job_logs import append_job_log
 from orchestrator.job_snapshot import write_job_snapshot
 from orchestrator.job_files_lock import exclusive_job_files_lock
 from orchestrator.models import JobStatus
+from orchestrator.missav_adapter import DownloadDeferredError
 from orchestrator.paths import build_job_paths
 from orchestrator.store import (
     HISTORICAL_TRANSLATION_ORIGIN,
@@ -87,6 +88,16 @@ class MacDownloadWorker:
         error: str | None = None
         try:
             self._process_job(job)
+        except DownloadDeferredError as exc:
+            error = str(exc)
+            updated = self.store.defer_download_job(job.id, error)
+            _write_job_snapshot_safely(updated)
+            _append_job_log_safely(
+                Path(job.job_dir_mac),
+                "mac-download.log",
+                f"download_deferred {job.normalized_movie_number}: {error}",
+            )
+            return False
         except Exception as exc:
             error = str(exc)
             self._record_failure(job, error)
@@ -197,6 +208,7 @@ class MacTranslationWorker:
         catalog_sync_retry_seconds: int = 30,
         catalog_sync_max_retry_seconds: int = 900,
         callback_notifier=None,
+        delete_audio_after_publish: bool = True,
     ) -> None:
         self.store = store
         self.translator = translator
@@ -221,6 +233,7 @@ class MacTranslationWorker:
         self.catalog_sync_retry_seconds = catalog_sync_retry_seconds
         self.catalog_sync_max_retry_seconds = catalog_sync_max_retry_seconds
         self.callback_notifier = callback_notifier
+        self.delete_audio_after_publish = delete_audio_after_publish
         self.consecutive_quality_failures = 0
         self.historical_quality_failures = (
             self.store.historical_lane_state().consecutive_quality_failures
@@ -236,6 +249,34 @@ class MacTranslationWorker:
             )
         except Exception:
             return
+
+    def _cleanup_published_audio(self, job: JobRecord) -> JobRecord:
+        from orchestrator.audio_cleanup import delete_published_job_audio
+
+        try:
+            with exclusive_job_files_lock(
+                self.store.jobs_root_mac,
+                job.normalized_movie_number,
+                blocking=True,
+            ):
+                cleaned, _outcome = self.store.cleanup_published_audio_atomically(
+                    job.id,
+                    cleanup=lambda current: delete_published_job_audio(
+                        current,
+                        self.store.jobs_root_mac,
+                    ).outcome,
+                )
+        except (RuntimeError, ValueError, OSError):
+            current = self.store.get_job(job.id)
+            return current if current is not None else job
+        _write_job_snapshot_safely(cleaned)
+        return cleaned
+
+    def _reconcile_published_audio(self) -> None:
+        if not self.delete_audio_after_publish:
+            return
+        for candidate in self.store.list_published_audio_cleanup_candidates(limit=25):
+            self._cleanup_published_audio(candidate)
 
     def _recover_historical_marker_before_generic_leases(self) -> bool:
         job = self.store.find_recoverable_historical_marker_job()
@@ -318,6 +359,7 @@ class MacTranslationWorker:
         return True
 
     def process_one(self) -> bool:
+        self._reconcile_published_audio()
         if self._recover_historical_marker_before_generic_leases():
             return True
         if self.consecutive_quality_failures >= self.quality_failure_limit:
@@ -1680,6 +1722,11 @@ class MacTranslationWorker:
             file_size=published.file_size,
             lease_token=job.stage_lease_token,
         )
+        if (
+            self.delete_audio_after_publish
+            and job.translation_origin == NORMAL_TRANSLATION_ORIGIN
+        ):
+            updated = self._cleanup_published_audio(updated)
         if job.translation_origin == NORMAL_TRANSLATION_ORIGIN:
             self.consecutive_quality_failures = 0
         else:

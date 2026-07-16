@@ -13,6 +13,7 @@ from orchestrator.mac_worker import (
     MacTranslationUnhealthyError,
     MacTranslationWorker,
 )
+from orchestrator.missav_adapter import DownloadDeferredError
 from orchestrator.models import JobStatus
 from orchestrator.paths import build_job_paths
 from orchestrator.store import HistoricalRepairState, JobStore
@@ -52,6 +53,15 @@ class AudioOSErrorAdapter:
 
     def download_audio(self, movie_number: str, output_path: Path) -> None:
         raise OSError("audio disk full")
+
+
+class LowDiskDeferredAdapter:
+    def download_metadata(self, movie_number: str, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("{}\n", encoding="utf-8")
+
+    def download_audio(self, movie_number: str, output_path: Path) -> None:
+        raise DownloadDeferredError("download deferred: low disk space")
 
 
 def test_mac_worker_processes_one_queued_job_to_audio_ready(sqlite_path, mac_jobs_root):
@@ -205,6 +215,26 @@ def test_mac_worker_preserves_audio_writer_oserror(
     refreshed = store.get_job(job.id)
     assert refreshed.status is JobStatus.QUEUED
     assert refreshed.error == "audio disk full"
+
+
+def test_mac_worker_defers_low_disk_without_consuming_attempt(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-115", priority=100, force=False).job
+    worker = MacDownloadWorker(store, LowDiskDeferredAdapter(), max_download_attempts=3)
+
+    assert worker.process_one() is False
+
+    refreshed = store.get_job(job.id)
+    assert refreshed.status is JobStatus.QUEUED
+    assert refreshed.attempt_count == 0
+    assert refreshed.error == "download deferred: low disk space"
+    log = (mac_jobs_root / "ktb-115" / "logs" / "mac-download.log").read_text(
+        encoding="utf-8"
+    )
+    assert "download_deferred" in log
 
 
 def test_mac_worker_returns_false_when_no_queued_jobs(sqlite_path, mac_jobs_root):
@@ -424,6 +454,162 @@ def prepare_transcription_done_job(store, mac_jobs_root, cue_count=20, movie="kt
         f"M:\\{stored_movie}\\{stored_movie}.Japanese.srt",
         lambda path: Path(path).exists(),
     )
+
+
+def test_verified_publication_deletes_normal_job_audio(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="new-201")
+    audio = mac_jobs_root / "new-201" / "audio.wav"
+    audio.write_bytes(b"source audio")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=True,
+    )
+
+    assert worker.process_one() is True
+    assert audio.exists()
+    assert worker.process_one() is True
+
+    assert store.get_job(job.id).status is JobStatus.ENGLISH_SRT_READY
+    assert not audio.exists()
+    assert "deleted" in (
+        audio.parent / "logs" / "audio-cleanup.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_disabled_post_publish_cleanup_retains_audio(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    prepare_transcription_done_job(store, mac_jobs_root, movie="new-202")
+    audio = mac_jobs_root / "new-202" / "audio.wav"
+    audio.write_bytes(b"source audio")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=False,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert audio.exists()
+
+
+def test_publication_failure_retains_audio(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    prepare_transcription_done_job(store, mac_jobs_root, movie="new-203")
+    audio = mac_jobs_root / "new-203" / "audio.wav"
+    audio.write_bytes(b"source audio")
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(errors=[RuntimeError("offline")]),
+        catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=True,
+    )
+
+    assert worker.process_one() is True
+    assert worker.process_one() is True
+
+    assert audio.exists()
+
+
+def test_worker_reconciles_audio_after_crash_gap_without_republishing(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="new-204")
+    audio = mac_jobs_root / "new-204" / "audio.wav"
+    audio.write_bytes(b"source audio")
+    publisher = RecordingPublisher()
+    publishing_worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=publisher,
+        catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=False,
+    )
+    assert publishing_worker.process_one() is True
+    assert publishing_worker.process_one() is True
+    assert audio.exists()
+
+    reconciling_worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-2",
+        lease_seconds=60,
+        publisher=None,
+        delete_audio_after_publish=True,
+    )
+
+    assert reconciling_worker.process_one() is False
+
+    refreshed = store.get_job(job.id)
+    assert not audio.exists()
+    assert refreshed.audio_path_mac is None
+    assert refreshed.audio_path_windows is None
+    assert len(publisher.events) == 1
+
+
+def test_cleanup_revalidates_stale_candidate_before_unlink(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = prepare_transcription_done_job(store, mac_jobs_root, movie="new-205")
+    audio = mac_jobs_root / "new-205" / "audio.wav"
+    audio.write_bytes(b"preserved audio")
+    setup = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-1",
+        lease_seconds=60,
+        publisher=RecordingPublisher(),
+        catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=False,
+    )
+    assert setup.process_one() is True
+    assert setup.process_one() is True
+    stale = store.get_job(job.id)
+    with store.connection() as conn:
+        conn.execute(
+            "UPDATE jobs SET translation_origin = 'historical' WHERE id = ?",
+            (job.id,),
+        )
+    worker = MacTranslationWorker(
+        store,
+        DiverseMacTranslator(),
+        max_translation_attempts=3,
+        worker_id="mac-translation-2",
+        lease_seconds=60,
+        delete_audio_after_publish=True,
+    )
+
+    worker._cleanup_published_audio(stale)
+
+    assert audio.read_bytes() == b"preserved audio"
 
 
 def enqueue_historical_worker_job(store, mac_jobs_root, movie):
@@ -2775,6 +2961,7 @@ def test_prepared_catalog_canary_publication_only_exact_job_preserves_other_job(
         lease_seconds=60,
         publisher=RecordingPublisher(publication_calls, verified=True),
         catalog_sync_client=RecordingCatalogSync(),
+        delete_audio_after_publish=False,
     )
 
     assert receipt.new_status is JobStatus.PUBLISH_PENDING

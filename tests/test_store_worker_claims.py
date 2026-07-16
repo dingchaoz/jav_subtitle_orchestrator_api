@@ -1217,6 +1217,66 @@ def test_claim_next_download_job_removes_claimed_job_from_queue(sqlite_path, mac
     assert second_claim is None
 
 
+def test_defer_download_job_preserves_attempt_count(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    submitted = store.submit_job("abc-901", priority=100, force=False).job
+    claimed = store.claim_next_download_job()
+    assert claimed.id == submitted.id
+    store.update_download_status(claimed.id, JobStatus.DOWNLOADING_AUDIO)
+
+    deferred = store.defer_download_job(
+        claimed.id,
+        "download deferred: low disk space",
+    )
+
+    assert deferred.status is JobStatus.QUEUED
+    assert deferred.attempt_count == 0
+    assert deferred.error == "download deferred: low disk space"
+
+
+def test_published_audio_cleanup_candidate_is_durable_and_cleared(
+    sqlite_path, mac_jobs_root
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("abc-902", priority=100, force=False).job
+    job = store.mark_audio_ready(job.id)
+    with store.connection() as conn:
+        conn.execute(
+            """
+            UPDATE jobs SET status = ?, translation_origin = 'normal',
+                artifact_status = 'ready', catalog_movie_uuid = ?,
+                metadata_status = 'complete', metadata_source = 'missav',
+                published_subtitle_id = ?, published_storage_path = ?,
+                published_content_sha256 = ?, published_file_size = ?
+            WHERE id = ?
+            """,
+            (
+                JobStatus.ENGLISH_SRT_READY.value,
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "abc/abc-902/abc-902-English_AI.srt",
+                "b" * 64,
+                123,
+                job.id,
+            ),
+        )
+
+    candidates = store.list_published_audio_cleanup_candidates(limit=10)
+    assert [candidate.id for candidate in candidates] == [job.id]
+
+    cleaned, outcome = store.cleanup_published_audio_atomically(
+        job.id,
+        cleanup=lambda current: "missing",
+    )
+
+    assert outcome == "missing"
+    assert cleaned.audio_path_mac is None
+    assert cleaned.audio_path_windows is None
+    assert store.list_published_audio_cleanup_candidates(limit=10) == []
+
+
 def test_claim_next_audio_ready_job_is_atomic_and_ordered(sqlite_path, mac_jobs_root):
     store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
     store.initialize()

@@ -500,6 +500,24 @@ def test_dashboard_contains_safe_read_only_historical_progress_card(
     assert "history-repair-counts\").innerHTML" not in html
     assert "history-repair-current\").innerHTML" not in html
     assert "history-repair-pause\").innerHTML" not in html
+
+
+def test_dashboard_shows_post_publish_audio_cleanup_status(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    client = TestClient(create_app(store, delete_audio_after_publish=False))
+
+    state = client.get("/dashboard/state")
+    html = client.get("/dashboard").text
+
+    assert state.status_code == 200
+    assert state.json()["audio_cleanup"] == {
+        "enabled": False,
+        "trigger": "verified_supabase_publication",
+    }
+    assert "Audio cleanup" in html
+    assert 'id="audio-cleanup-status"' in html
+    assert "state.audio_cleanup" in html
     for forbidden_control in (
         "history-repair-resume",
         "history-repair-requeue",

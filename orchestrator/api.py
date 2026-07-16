@@ -134,6 +134,7 @@ def create_app(
     subtitle_audit_service: SubtitleAuditServiceProtocol | None = None,
     requested_subtitle_importer: RequestedSubtitleImporterProtocol | None = None,
     callback_clients: dict[str, object] | None = None,
+    delete_audio_after_publish: bool = True,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
     audit_close = getattr(subtitle_audit_service, "close", None)
@@ -225,7 +226,10 @@ def create_app(
 
     @app.get("/dashboard/state", response_model=DashboardStateResponse)
     def dashboard_state() -> DashboardStateResponse:
-        return build_dashboard_state(store)
+        return build_dashboard_state(
+            store,
+            delete_audio_after_publish=delete_audio_after_publish,
+        )
 
     def require_subtitle_audit_service() -> SubtitleAuditServiceProtocol:
         if subtitle_audit_service is None:

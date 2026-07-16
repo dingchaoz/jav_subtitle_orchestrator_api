@@ -33,6 +33,7 @@ MAC_ENV_ALIASES = (
     "MAX_DOWNLOAD_ATTEMPTS",
     "MAX_WORKER_ATTEMPTS",
     "MAC_TRANSLATION_PUBLISH_ENABLED",
+    "DELETE_AUDIO_AFTER_PUBLISH",
     "MAX_PUBLISH_ATTEMPTS",
     "MAC_PUBLISH_RETRY_SECONDS",
     "SUPABASE_PUBLISH_VERIFY_TIMEOUT_SECONDS",
@@ -485,6 +486,15 @@ def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):
 
     assert settings.host == "0.0.0.0"
     assert settings.port == 8010
+
+
+def test_mac_audio_cleanup_defaults_enabled_and_honors_env(monkeypatch):
+    clear_env_aliases(monkeypatch, MAC_ENV_ALIASES)
+    assert MacSettings(_env_file=None).delete_audio_after_publish is True
+
+    monkeypatch.setenv("DELETE_AUDIO_AFTER_PUBLISH", "false")
+
+    assert MacSettings(_env_file=None).delete_audio_after_publish is False
 
 
 def test_normalize_movie_number_lowercases_and_keeps_dash():

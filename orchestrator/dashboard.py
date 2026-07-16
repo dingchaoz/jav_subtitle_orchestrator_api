@@ -6,6 +6,7 @@ from math import ceil
 from pathlib import Path
 
 from orchestrator.models import (
+    AudioCleanupStatus,
     DashboardJobSummary,
     DashboardStateResponse,
     HistoricalRepairDashboardCounts,
@@ -413,7 +414,12 @@ def _historical_activity_payload(
     }
 
 
-def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> DashboardStateResponse:
+def build_dashboard_state(
+    store: JobStore,
+    *,
+    latest_limit: int = 50,
+    delete_audio_after_publish: bool = True,
+) -> DashboardStateResponse:
     jobs = store.list_jobs()
     counts = Counter(job.status.value for job in jobs)
     latest = sorted(jobs, key=dashboard_recency_key, reverse=True)[:latest_limit]
@@ -472,6 +478,7 @@ def build_dashboard_state(store: JobStore, *, latest_limit: int = 50) -> Dashboa
             ),
         },
         counts=dict(counts),
+        audio_cleanup=AudioCleanupStatus(enabled=delete_audio_after_publish),
         historical_repairs=_historical_progress(historical_snapshot),
         workers=workers,
         latest_jobs=[job_summary(job) for job in latest],
@@ -550,6 +557,7 @@ def job_has_active_error(job: JobRecord) -> bool:
 
 
 ALLOWED_LOG_NAMES = (
+    "audio-cleanup.log",
     "mac-download.log",
     "mac-translation.log",
     "quality.log",
@@ -1177,6 +1185,11 @@ def dashboard_html() -> str:
           <div class="health-value" id="errors-status">Loading</div>
           <div class="health-meta" id="errors-meta">Fetching state</div>
         </article>
+        <article class="health-card">
+          <div class="health-title">Audio cleanup</div>
+          <div class="health-value" id="audio-cleanup-status">Loading</div>
+          <div class="health-meta" id="audio-cleanup-meta">Fetching configuration</div>
+        </article>
       </section>
 
       <section class="content-grid">
@@ -1475,6 +1488,16 @@ def dashboard_html() -> str:
         state.api.online ? "Online" : "Offline",
         `Server time ${formatDate(state.api.server_time)}`,
         state.api.online ? "status-ok" : "status-error"
+      );
+
+      const audioCleanup = state.audio_cleanup || {};
+      setHealth(
+        "audio-cleanup",
+        audioCleanup.enabled ? "Enabled" : "Disabled",
+        audioCleanup.enabled
+          ? "Deletes WAV after verified Supabase publication"
+          : "Published WAV files are being retained",
+        audioCleanup.enabled ? "status-ok" : "status-warn"
       );
 
       const mac = state.activity.mac_download || state.activity.mac || {};
