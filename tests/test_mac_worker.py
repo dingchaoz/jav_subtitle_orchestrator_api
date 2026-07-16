@@ -231,6 +231,7 @@ def test_mac_worker_defers_low_disk_without_consuming_attempt(
     assert refreshed.status is JobStatus.QUEUED
     assert refreshed.attempt_count == 0
     assert refreshed.error == "download deferred: low disk space"
+    assert refreshed.next_download_attempt_at is not None
     log = (mac_jobs_root / "ktb-115" / "logs" / "mac-download.log").read_text(
         encoding="utf-8"
     )
@@ -264,6 +265,7 @@ def test_mac_worker_requeues_failure_below_max_attempts(sqlite_path, mac_jobs_ro
     assert refreshed.status == JobStatus.QUEUED
     assert refreshed.attempt_count == 1
     assert refreshed.error == "metadata failed"
+    assert refreshed.next_download_attempt_at is not None
     assert (mac_jobs_root / "ktb-096" / "job.json").exists()
 
 

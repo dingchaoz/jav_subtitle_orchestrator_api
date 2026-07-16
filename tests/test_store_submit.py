@@ -545,6 +545,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
         status=JobStatus.FAILED.value,
         attempt_count=3,
         worker_attempt_count=2,
+        next_download_attempt_at="2026-07-12T11:00:00+00:00",
         translation_attempt_count=2,
         publish_attempt_count=2,
         next_publish_attempt_at="2026-07-12T12:00:00+00:00",
@@ -581,6 +582,7 @@ def test_force_submit_resets_existing_job_and_clears_outputs(sqlite_path, mac_jo
     assert result.job.error is None
     assert result.job.attempt_count == 0
     assert result.job.worker_attempt_count == 0
+    assert result.job.next_download_attempt_at is None
     assert result.job.translation_attempt_count == 0
     assert result.job.publish_attempt_count == 0
     assert result.job.next_publish_attempt_at is None

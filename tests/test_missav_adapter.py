@@ -193,3 +193,63 @@ def test_download_audio_classifies_low_disk_pause_as_deferred(monkeypatch, tmp_p
 
     with pytest.raises(DownloadDeferredError, match="low disk space"):
         MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+
+def test_download_audio_classifies_retryable_pipeline_failure_as_deferred(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+
+    def fake_run(command, **kwargs):
+        log_file = Path(command[command.index("--log-file") + 1])
+        log_file.write_text(
+            json.dumps(
+                {
+                    "failed": {
+                        "ktb-096": {
+                            "error": "page_http_403",
+                            "attempts": 1,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="failed\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DownloadDeferredError, match="page_http_403"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+
+def test_download_audio_preserves_nonretryable_pipeline_failure_detail(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+
+    def fake_run(command, **kwargs):
+        log_file = Path(command[command.index("--log-file") + 1])
+        log_file.write_text(
+            json.dumps(
+                {
+                    "failed": {
+                        "ktb-096": {
+                            "error": "stream URL unavailable",
+                            "attempts": 1,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="failed\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FileNotFoundError, match="stream URL unavailable"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)

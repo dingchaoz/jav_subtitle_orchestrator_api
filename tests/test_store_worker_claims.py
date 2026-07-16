@@ -1233,6 +1233,24 @@ def test_defer_download_job_preserves_attempt_count(sqlite_path, mac_jobs_root):
     assert deferred.status is JobStatus.QUEUED
     assert deferred.attempt_count == 0
     assert deferred.error == "download deferred: low disk space"
+    assert deferred.next_download_attempt_at is not None
+
+
+def test_claim_next_download_job_skips_job_waiting_for_retry(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    waiting = store.submit_job("abc-901", priority=1, force=False).job
+    available = store.submit_job("abc-902", priority=100, force=False).job
+    claimed = store.claim_next_download_job()
+    assert claimed.id == waiting.id
+    store.defer_download_job(claimed.id, "temporary upstream failure")
+
+    next_claim = store.claim_next_download_job()
+
+    assert next_claim.id == available.id
 
 
 def test_published_audio_cleanup_candidate_is_durable_and_cleared(

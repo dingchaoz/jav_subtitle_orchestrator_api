@@ -103,19 +103,54 @@ class MissAVAdapter:
                 capture_output=True,
                 check=False,
             )
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr or completed.stdout)
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr or completed.stdout)
 
-        try:
-            produced_path = self._find_produced_audio(movie_number, output_path)
-        except FileNotFoundError:
-            process_output = f"{completed.stdout}\n{completed.stderr}".lower()
-            if "pausing before next download" in process_output:
-                raise DownloadDeferredError(
-                    "download deferred: low disk space"
-                ) from None
-            raise
+            try:
+                produced_path = self._find_produced_audio(movie_number, output_path)
+            except FileNotFoundError as exc:
+                process_output = f"{completed.stdout}\n{completed.stderr}"
+                if "pausing before next download" in process_output.lower():
+                    raise DownloadDeferredError(
+                        "download deferred: low disk space"
+                    ) from None
+                detail = self._pipeline_failure_detail(log_path, movie_number)
+                if detail and self._is_retryable_stream_failure(detail):
+                    raise DownloadDeferredError(
+                        f"download deferred: upstream stream resolution: {detail}"
+                    ) from None
+                if detail:
+                    raise FileNotFoundError(f"{exc}: {detail}") from None
+                raise
         produced_path.replace(output_path)
+
+    def _pipeline_failure_detail(self, log_path: Path, movie_number: str) -> str | None:
+        try:
+            payload = json.loads(log_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        failed = payload.get("failed") if isinstance(payload, dict) else None
+        if not isinstance(failed, dict):
+            return None
+        record = failed.get(self._base_movie_id(movie_number)) or failed.get(movie_number)
+        if not isinstance(record, dict):
+            return None
+        detail = record.get("last_error") or record.get("error")
+        if not isinstance(detail, str) or not detail.strip():
+            return None
+        return detail.strip()[:1000]
+
+    def _is_retryable_stream_failure(self, detail: str) -> bool:
+        lowered = detail.lower()
+        return any(
+            token in lowered
+            for token in (
+                "page_http_400",
+                "page_http_403",
+                "page_cloudflare_challenge",
+                "page_request_failed",
+            )
+        )
 
     def _catalog_movies(self, catalog_path: Path) -> list[dict[str, Any]]:
         if not catalog_path.exists():

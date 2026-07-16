@@ -26,6 +26,9 @@ MAX_PUBLICATION_CANARY_SRT_BYTES = 32 * 1024 * 1024
 NORMAL_TRANSLATION_ORIGIN = "normal"
 HISTORICAL_TRANSLATION_ORIGIN = "historical"
 UNAVAILABLE_HISTORICAL_SHA256 = "0" * 64
+DOWNLOAD_FAILURE_RETRY_BASE_SECONDS = 60
+DOWNLOAD_FAILURE_RETRY_MAX_SECONDS = 15 * 60
+DOWNLOAD_DEFER_RETRY_SECONDS = 5 * 60
 _CATALOG_SYNC_FAILURE_REASON_CODES = frozenset(
     {
         "catalog_fetch_failed",
@@ -720,6 +723,7 @@ class JobRecord:
     priority: int
     attempt_count: int
     worker_attempt_count: int
+    next_download_attempt_at: str | None
     translation_attempt_count: int
     publish_attempt_count: int
     next_publish_attempt_at: str | None
@@ -858,6 +862,7 @@ class JobStore:
                   priority INTEGER NOT NULL DEFAULT 100,
                   attempt_count INTEGER NOT NULL DEFAULT 0,
                   worker_attempt_count INTEGER NOT NULL DEFAULT 0,
+                  next_download_attempt_at TEXT,
                   translation_attempt_count INTEGER NOT NULL DEFAULT 0,
                   publish_attempt_count INTEGER NOT NULL DEFAULT 0,
                   next_publish_attempt_at TEXT,
@@ -906,6 +911,10 @@ class JobStore:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN translation_attempt_count "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "next_download_attempt_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN next_download_attempt_at TEXT"
                 )
             publication_columns = {
                 "publish_attempt_count": "INTEGER NOT NULL DEFAULT 0",
@@ -1463,7 +1472,7 @@ class JobStore:
                 SET status = ?, updated_at = ?, metadata_path_mac = COALESCE(?, metadata_path_mac),
                     audio_path_mac = COALESCE(?, audio_path_mac),
                     audio_path_windows = COALESCE(?, audio_path_windows),
-                    error = ?
+                    next_download_attempt_at = NULL, error = ?
                 WHERE id = ?
                 """,
                 (
@@ -1556,7 +1565,8 @@ class JobStore:
                 UPDATE jobs
                 SET status = ?, updated_at = ?,
                     metadata_path_mac = COALESCE(?, metadata_path_mac),
-                    audio_path_mac = ?, audio_path_windows = ?, error = NULL
+                    audio_path_mac = ?, audio_path_windows = ?,
+                    next_download_attempt_at = NULL, error = NULL
                 WHERE id = ? AND status = ? AND claimed_by IS NULL
                   AND lease_expires_at IS NULL
                   AND normalized_movie_number = ?
@@ -1590,14 +1600,27 @@ class JobStore:
         error: str,
     ) -> JobRecord:
         now = utc_now_iso()
+        next_download_attempt_at = (
+            self._download_retry_at(attempt_count)
+            if status is JobStatus.QUEUED
+            else None
+        )
         with self.connection() as conn:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, attempt_count = ?, updated_at = ?, error = ?
+                SET status = ?, attempt_count = ?, updated_at = ?,
+                    next_download_attempt_at = ?, error = ?
                 WHERE id = ?
                 """,
-                (status.value, attempt_count, now, error, job_id),
+                (
+                    status.value,
+                    attempt_count,
+                    now,
+                    next_download_attempt_at,
+                    error,
+                    job_id,
+                ),
             )
             if cursor.rowcount == 0:
                 raise KeyError(job_id)
@@ -1605,18 +1628,27 @@ class JobStore:
             assert job is not None
             return job
 
-    def defer_download_job(self, job_id: str, reason: str) -> JobRecord:
+    def defer_download_job(
+        self,
+        job_id: str,
+        reason: str,
+        retry_delay_seconds: int = DOWNLOAD_DEFER_RETRY_SECONDS,
+    ) -> JobRecord:
         now = utc_now_iso()
+        next_attempt_at = (
+            datetime.now(UTC) + timedelta(seconds=max(1, retry_delay_seconds))
+        ).replace(microsecond=0).isoformat()
         with self.connection() as conn:
             cursor = conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, updated_at = ?, error = ?
+                SET status = ?, updated_at = ?, next_download_attempt_at = ?, error = ?
                 WHERE id = ? AND status IN (?, ?)
                 """,
                 (
                     JobStatus.QUEUED.value,
                     now,
+                    next_attempt_at,
                     reason,
                     job_id,
                     JobStatus.DOWNLOADING_METADATA.value,
@@ -1636,10 +1668,11 @@ class JobStore:
                 """
                 SELECT id FROM jobs
                 WHERE status = ?
+                  AND (next_download_attempt_at IS NULL OR next_download_attempt_at <= ?)
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 1
                 """,
-                (JobStatus.QUEUED.value,),
+                (JobStatus.QUEUED.value, now),
             ).fetchone()
             if row is None:
                 return None
@@ -1649,17 +1682,19 @@ class JobStore:
                 """
                 SELECT * FROM jobs
                 WHERE status = ?
+                  AND (next_download_attempt_at IS NULL OR next_download_attempt_at <= ?)
                 ORDER BY priority ASC, created_at ASC
                 LIMIT 1
                 """,
-                (JobStatus.QUEUED.value,),
+                (JobStatus.QUEUED.value, now),
             ).fetchone()
             if row is None:
                 return None
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, updated_at = ?, error = NULL
+                SET status = ?, updated_at = ?, next_download_attempt_at = NULL,
+                    error = NULL
                 WHERE id = ? AND status = ?
                 """,
                 (
@@ -1708,19 +1743,31 @@ class JobStore:
                 conn.execute(
                     """
                     UPDATE jobs
-                    SET status = ?, attempt_count = ?, updated_at = ?, error = ?
+                    SET status = ?, attempt_count = ?, updated_at = ?,
+                        next_download_attempt_at = ?, error = ?
                     WHERE id = ?
                     """,
                     (
                         next_status.value,
                         attempts,
                         now,
+                        None,
                         "download interrupted",
                         row["id"],
                     ),
                 )
                 recovered += 1
         return recovered
+
+    @staticmethod
+    def _download_retry_at(attempt_count: int) -> str:
+        delay_seconds = min(
+            DOWNLOAD_FAILURE_RETRY_MAX_SECONDS,
+            DOWNLOAD_FAILURE_RETRY_BASE_SECONDS * (2 ** max(0, attempt_count - 1)),
+        )
+        return (
+            datetime.now(UTC) + timedelta(seconds=delay_seconds)
+        ).replace(microsecond=0).isoformat()
 
     def claim_next_worker_job(self, worker_id: str, lease_seconds: int) -> JobRecord | None:
         now = utc_now_iso()
@@ -5910,6 +5957,7 @@ class JobStore:
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
                 stage_lease_token = NULL, error = NULL,
                 attempt_count = 0, worker_attempt_count = 0,
+                next_download_attempt_at = NULL,
                 translation_attempt_count = 0,
                 publish_attempt_count = 0, next_publish_attempt_at = NULL,
                 translation_origin = ?, published_subtitle_id = NULL,
@@ -5976,6 +6024,7 @@ class JobStore:
             priority=row["priority"],
             attempt_count=row["attempt_count"],
             worker_attempt_count=row["worker_attempt_count"],
+            next_download_attempt_at=row["next_download_attempt_at"],
             translation_attempt_count=row["translation_attempt_count"],
             publish_attempt_count=row["publish_attempt_count"],
             next_publish_attempt_at=row["next_publish_attempt_at"],
