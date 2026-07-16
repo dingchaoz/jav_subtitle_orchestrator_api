@@ -317,7 +317,12 @@ def test_launchd_plist_uses_bounded_production_runtime(
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] is True
     assert plist["ThrottleInterval"] == 10
-    assert "EnvironmentVariables" not in plist
+    if command == "mac-worker":
+        assert plist["EnvironmentVariables"]["PATH"].split(":")[0] == (
+            "/opt/homebrew/bin"
+        )
+    else:
+        assert "EnvironmentVariables" not in plist
 
 
 def test_mac_downloader_worker_id_is_stable_and_configurable(monkeypatch):
