@@ -5909,6 +5909,7 @@ class JobStore:
             UPDATE jobs
             SET status = ?, claimed_by = NULL, lease_expires_at = NULL, updated_at = ?,
                 stage_lease_token = NULL, error = NULL,
+                attempt_count = 0, worker_attempt_count = 0,
                 translation_attempt_count = 0,
                 publish_attempt_count = 0, next_publish_attempt_at = NULL,
                 translation_origin = ?, published_subtitle_id = NULL,
