@@ -4,7 +4,8 @@ from contextlib import closing
 from fastapi.testclient import TestClient
 
 from orchestrator.api import create_app
-from orchestrator.models import JobStatus
+from orchestrator.models import JobStatus, RequestedSubtitle
+from orchestrator.subtitle_request_importer import RequestedSubtitleImportSelection
 from orchestrator.store import JobStore
 
 
@@ -308,8 +309,94 @@ def test_dashboard_page_returns_operator_html_without_force_controls(
     assert "Mac Downloader" in html
     assert "Windows Transcription" in html
     assert "Mac Translation" in html
-    assert 'id="import-requested-form"' not in html
-    assert "/jobs/import-subtitle-requests" not in html
+    assert "Requested subtitles" in html
+    assert 'id="import-requested-form"' in html
+    assert 'id="import-requested-min-count"' in html
+    assert 'id="import-requested-limit"' in html
+    assert 'id="import-requested-priority"' in html
+    assert "importRequestedSubtitles" in html
+    assert "/jobs/import-subtitle-requests" in html
+
+
+class FakeRequestedSubtitleImporter:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def fetch_requested_subtitles(self, *, min_count: int, limit: int):
+        self.calls.append({"min_count": min_count, "limit": limit})
+        return RequestedSubtitleImportSelection(
+            requested=[
+                RequestedSubtitle(
+                    code="ktb-111",
+                    movie_id="movie-1",
+                    request_count=7,
+                    last_requested_at="2026-07-15T01:02:03Z",
+                ),
+                RequestedSubtitle(
+                    code="stars-506",
+                    movie_id="movie-2",
+                    request_count=3,
+                    last_requested_at="2026-07-14T01:02:03Z",
+                ),
+            ],
+            imported=[
+                RequestedSubtitle(
+                    code="ktb-111",
+                    movie_id="movie-1",
+                    request_count=7,
+                    last_requested_at="2026-07-15T01:02:03Z",
+                )
+            ],
+            skipped_available=[
+                RequestedSubtitle(
+                    code="stars-506",
+                    movie_id="movie-2",
+                    request_count=3,
+                    last_requested_at="2026-07-14T01:02:03Z",
+                )
+            ],
+        )
+
+
+def test_import_requested_subtitles_endpoint_creates_jobs_from_imported_items(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    importer = FakeRequestedSubtitleImporter()
+    client = TestClient(create_app(store, requested_subtitle_importer=importer))
+
+    response = client.post(
+        "/jobs/import-subtitle-requests",
+        json={"min_count": 3, "limit": 25, "priority": 12},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert importer.calls == [{"min_count": 3, "limit": 25}]
+    assert [item["code"] for item in body["requested"]] == ["ktb-111", "stars-506"]
+    assert [item["code"] for item in body["imported"]] == ["ktb-111"]
+    assert [item["code"] for item in body["skipped_available"]] == ["stars-506"]
+    assert [item["movie_number"] for item in body["created"]] == ["ktb-111"]
+    assert body["created"][0]["status"] == "queued"
+    assert body["created"][0]["ready"] is False
+    assert body["existing"] == []
+    assert body["invalid"] == []
+
+
+def test_import_requested_subtitles_endpoint_requires_configured_importer(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    client = TestClient(create_app(store))
+
+    response = client.post("/jobs/import-subtitle-requests", json={})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "requested subtitle importer is not configured"
 
 
 def test_dashboard_contains_safe_independent_subtitle_quality_section(

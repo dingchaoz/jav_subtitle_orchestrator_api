@@ -104,6 +104,24 @@ class MacSettings(BaseSettings):
         default=None,
         alias="SUPABASE_SERVICE_ROLE_KEY",
     )
+    cloudflare_account_id: str | None = Field(
+        default=None,
+        alias="CLOUDFLARE_ACCOUNT_ID",
+    )
+    cloudflare_d1_api_token: str | None = Field(
+        default=None,
+        alias="CLOUDFLARE_D1_API_TOKEN",
+    )
+    cloudflare_d1_database_id: str = Field(
+        default="401de37d-51fc-44b1-aacc-6ccff9d74f52",
+        alias="CLOUDFLARE_D1_DATABASE_ID",
+    )
+    requested_subtitle_import_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        alias="REQUESTED_SUBTITLE_IMPORT_TIMEOUT_SECONDS",
+    )
     javsubtitle_api_base: str | None = Field(
         default=None,
         alias="JAVSUBTITLE_API_BASE",

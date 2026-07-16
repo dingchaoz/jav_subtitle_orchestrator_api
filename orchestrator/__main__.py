@@ -199,6 +199,27 @@ def build_subtitle_audit_api_service(settings):
     )
 
 
+def build_requested_subtitle_importer(settings):
+    if (
+        not settings.cloudflare_account_id
+        or not settings.cloudflare_d1_api_token
+        or not settings.cloudflare_d1_database_id
+        or not settings.supabase_url
+        or not settings.supabase_service_role_key
+    ):
+        return None
+    from orchestrator.subtitle_request_importer import RequestedSubtitleImporter
+
+    return RequestedSubtitleImporter(
+        cloudflare_account_id=settings.cloudflare_account_id,
+        cloudflare_d1_api_token=settings.cloudflare_d1_api_token,
+        cloudflare_d1_database_id=settings.cloudflare_d1_database_id,
+        supabase_url=settings.supabase_url,
+        supabase_service_role_key=settings.supabase_service_role_key,
+        timeout_seconds=settings.requested_subtitle_import_timeout_seconds,
+    )
+
+
 def build_supabase_publisher(settings):
     if not settings.mac_translation_publish_enabled:
         return None
@@ -283,6 +304,7 @@ def run_api() -> None:
         worker_lease_seconds=settings.worker_lease_seconds,
         max_worker_attempts=settings.max_worker_attempts,
         subtitle_audit_service=build_subtitle_audit_api_service(settings),
+        requested_subtitle_importer=build_requested_subtitle_importer(settings),
         callback_clients=build_callback_clients(settings),
     )
     uvicorn.run(app, host=settings.host, port=settings.port)

@@ -19,6 +19,7 @@ from orchestrator.models import (
     BatchJobResponse,
     AuditStatus,
     DashboardStateResponse,
+    ImportRequestedSubtitlesRequest,
     JobBrowserResponse,
     JobDetailResponse,
     JobLogTailResponse,
@@ -27,6 +28,7 @@ from orchestrator.models import (
     MAX_AUDIT_OFFSET,
     JobResponse,
     JobStatus,
+    RequestedSubtitleImportResponse,
     SubmitBatchRequest,
     SubmitJobRequest,
     SubtitleAuditItem,
@@ -39,6 +41,7 @@ from orchestrator.models import (
     WorkerNextJobResponse,
     WorkerTranscriptionCompleteRequest,
 )
+from orchestrator.subtitle_request_importer import RequestedSubtitleImportSelection
 from orchestrator.store import JobRecord, JobStore
 
 
@@ -55,6 +58,15 @@ class SubtitleAuditServiceProtocol(Protocol):
     ) -> SubtitleAuditPageResponse: ...
 
     def get_finding(self, subtitle_id: str) -> SubtitleAuditItem | None: ...
+
+
+class RequestedSubtitleImporterProtocol(Protocol):
+    def fetch_requested_subtitles(
+        self,
+        *,
+        min_count: int,
+        limit: int,
+    ) -> RequestedSubtitleImportSelection: ...
 
 
 def job_warnings(job: JobRecord) -> list[JobWarning]:
@@ -120,6 +132,7 @@ def create_app(
     max_worker_attempts: int = 3,
     final_file_exists: Callable[[str], bool] | None = None,
     subtitle_audit_service: SubtitleAuditServiceProtocol | None = None,
+    requested_subtitle_importer: RequestedSubtitleImporterProtocol | None = None,
     callback_clients: dict[str, object] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="JAV Subtitle Orchestrator")
@@ -166,6 +179,41 @@ def create_app(
             callback_client_key=callback_client_key(http_request),
         )
         return BatchJobResponse(
+            created=[job_response(item.job) for item in result.created],
+            existing=[job_response(item.job) for item in result.existing if item.job is not None],
+            invalid=[item.movie_number for item in result.invalid],
+        )
+
+    @app.post(
+        "/jobs/import-subtitle-requests",
+        response_model=RequestedSubtitleImportResponse,
+    )
+    def import_subtitle_requests(
+        request: ImportRequestedSubtitlesRequest,
+        http_request: Request,
+    ) -> RequestedSubtitleImportResponse:
+        if requested_subtitle_importer is None:
+            raise HTTPException(
+                status_code=503,
+                detail="requested subtitle importer is not configured",
+            )
+        try:
+            selection = requested_subtitle_importer.fetch_requested_subtitles(
+                min_count=request.min_count,
+                limit=request.limit,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        result = store.submit_batch(
+            [item.code for item in selection.imported],
+            priority=request.priority,
+            force=request.force,
+            callback_client_key=callback_client_key(http_request),
+        )
+        return RequestedSubtitleImportResponse(
+            requested=selection.requested,
+            imported=selection.imported,
+            skipped_available=selection.skipped_available,
             created=[job_response(item.job) for item in result.created],
             existing=[job_response(item.job) for item in result.existing if item.job is not None],
             invalid=[item.movie_number for item in result.invalid],

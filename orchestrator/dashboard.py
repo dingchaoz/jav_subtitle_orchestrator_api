@@ -1221,6 +1221,30 @@ def dashboard_html() -> str:
           </div>
         </section>
 
+        <section class="panel" aria-labelledby="import-requested-title">
+          <div class="panel-header">
+            <h2 id="import-requested-title">Requested subtitles</h2>
+          </div>
+          <div class="panel-body">
+            <form id="import-requested-form">
+              <label>
+                Minimum requests
+                <input id="import-requested-min-count" name="min_count" type="number" value="1" min="1" max="9999" required>
+              </label>
+              <label>
+                Limit
+                <input id="import-requested-limit" name="limit" type="number" value="500" min="1" max="500" required>
+              </label>
+              <label>
+                Priority
+                <input id="import-requested-priority" name="priority" type="number" value="100" min="0" max="9999" required>
+              </label>
+              <button type="submit">Import requested subtitles</button>
+              <div class="message" id="import-requested-message" role="status"></div>
+            </form>
+          </div>
+        </section>
+
       </div>
 
       <div class="main-stack">
@@ -1854,6 +1878,38 @@ def dashboard_html() -> str:
       }
     }
 
+    function importRequestRange(requested) {
+      const counts = (requested || []).map((item) => Number(item.request_count || 0));
+      if (!counts.length) return "no request counts";
+      const min = Math.min(...counts);
+      const max = Math.max(...counts);
+      return min === max ? `request count ${min}` : `request counts ${min}-${max}`;
+    }
+
+    async function importRequestedSubtitles(event) {
+      event.preventDefault();
+      const message = document.getElementById("import-requested-message");
+      const minCount = Number(document.getElementById("import-requested-min-count").value || "1");
+      const limit = Number(document.getElementById("import-requested-limit").value || "500");
+      const priority = Number(document.getElementById("import-requested-priority").value || "100");
+      message.textContent = "Importing requested subtitles...";
+      try {
+        const result = await fetchJson("/jobs/import-subtitle-requests", {
+          method: "POST",
+          body: JSON.stringify({
+            min_count: minCount,
+            limit,
+            priority,
+            force: false
+          })
+        });
+        message.textContent = `Requested ${result.requested.length} (${importRequestRange(result.requested)}), imported ${result.imported.length}, skipped available ${result.skipped_available.length}, created ${result.created.length}, existing ${result.existing.length}, invalid ${result.invalid.length}`;
+        await refreshState();
+      } catch (error) {
+        message.textContent = error.message;
+      }
+    }
+
     function selectBrowserView(view) {
       browserState.view = view;
       browserState.page = 1;
@@ -1887,6 +1943,7 @@ def dashboard_html() -> str:
     });
     document.getElementById("single-movie-form").addEventListener("submit", submitSingle);
     document.getElementById("batch-movie-form").addEventListener("submit", submitBatch);
+    document.getElementById("import-requested-form").addEventListener("submit", importRequestedSubtitles);
     for (const tab of document.querySelectorAll(".dashboard-tab")) {
       tab.addEventListener("click", () => selectDashboardTab(tab.dataset.dashboardTab));
     }

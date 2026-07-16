@@ -99,6 +99,13 @@ class SubmitBatchRequest(BaseModel):
     force: bool = False
 
 
+class ImportRequestedSubtitlesRequest(BaseModel):
+    min_count: int = Field(default=1, ge=1)
+    limit: int = Field(default=500, ge=1, le=500)
+    priority: int = 100
+    force: bool = False
+
+
 class WorkerHeartbeatRequest(BaseModel):
     worker_id: str
     stage: JobStatus
@@ -136,6 +143,22 @@ class JobResponse(BaseModel):
 
 
 class BatchJobResponse(BaseModel):
+    created: list[JobResponse]
+    existing: list[JobResponse]
+    invalid: list[str]
+
+
+class RequestedSubtitle(BaseModel):
+    code: str
+    movie_id: str | None = None
+    request_count: int
+    last_requested_at: str | None = None
+
+
+class RequestedSubtitleImportResponse(BaseModel):
+    requested: list[RequestedSubtitle]
+    imported: list[RequestedSubtitle]
+    skipped_available: list[RequestedSubtitle]
     created: list[JobResponse]
     existing: list[JobResponse]
     invalid: list[str]
