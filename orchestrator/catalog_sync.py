@@ -208,10 +208,23 @@ def _matches_light_cache_key(
     allow_aliases: bool = False,
 ) -> bool:
     prefix = "movie:light:"
-    return key.startswith(prefix) and _matches_cache_code(
-        key[len(prefix) :],
-        canonical,
-        allow_aliases=allow_aliases,
+    if not key.startswith(prefix):
+        return False
+    payload = key[len(prefix) :]
+    if _matches_cache_code(payload, canonical, allow_aliases=allow_aliases):
+        return True
+    parts = payload.split(":")
+    if len(parts) != 2:
+        return False
+    version, code = parts
+    return (
+        _matches_cache_code(code, canonical, allow_aliases=allow_aliases)
+        and bool(version)
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "._-")
+            for character in version
+        )
     )
 
 
@@ -455,13 +468,11 @@ class CatalogSyncClient:
             )
         )
         kv_keys_deleted = touched if isinstance(touched, list) else deleted
-        expected_light_key = f"movie:light:{canonical}"
         kv_keys_valid = (
             touched_valid
             and deleted_valid
             and keys_agree
             and self._valid_cache_keys(kv_keys_deleted, canonical)
-            and expected_light_key in kv_keys_deleted
         )
         try:
             response_canonical = canonical_movie_code(row.get("canonicalCode"))
@@ -509,8 +520,8 @@ class CatalogSyncClient:
             and len(value) >= 2
             and all(isinstance(key, str) for key in value)
             and len(set(value)) == len(value)
-            and f"movie:light:{canonical}" in value
-            and any(_matches_full_cache_key(key, canonical) for key in value)
+            and any(_matches_light_cache_key(key, canonical, allow_aliases=True) for key in value)
+            and any(_matches_full_cache_key(key, canonical, allow_aliases=True) for key in value)
             and all(
                 _matches_full_cache_key(key, canonical, allow_aliases=True)
                 or _matches_light_cache_key(key, canonical, allow_aliases=True)

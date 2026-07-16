@@ -93,19 +93,57 @@ def _matches_catalog_full_cache_key(key: str, canonical: str) -> bool:
     if not key.startswith(prefix):
         return False
     payload = key[len(prefix) :]
-    if payload == canonical:
+    if _matches_catalog_cache_code(payload, canonical):
         return True
     parts = payload.split(":")
     if len(parts) != 2:
         return False
     version, code = parts
     return (
-        code == canonical
+        _matches_catalog_cache_code(code, canonical)
         and bool(version)
         and all(
             character.isascii()
             and (character.isalnum() or character in "._-")
             for character in version
+        )
+    )
+
+
+def _matches_catalog_light_cache_key(key: str, canonical: str) -> bool:
+    prefix = "movie:light:"
+    if not key.startswith(prefix):
+        return False
+    payload = key[len(prefix) :]
+    if _matches_catalog_cache_code(payload, canonical):
+        return True
+    parts = payload.split(":")
+    if len(parts) != 2:
+        return False
+    version, code = parts
+    return (
+        _matches_catalog_cache_code(code, canonical)
+        and bool(version)
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "._-")
+            for character in version
+        )
+    )
+
+
+def _matches_catalog_cache_code(code: str, canonical: str) -> bool:
+    if code == canonical:
+        return True
+    return any(
+        code == f"{canonical}{suffix}"
+        for suffix in (
+            "-uncensored-leak",
+            "-uncensored",
+            "-english-subtitle",
+            "-chinese-subtitle",
+            "-subtitle",
+            "-leak",
         )
     )
 
@@ -4725,10 +4763,13 @@ class JobStore:
             for value in (d1_rows_updated, subtitle_count)
         ):
             raise ValueError("catalog result counts must be positive integers")
-        expected_light_key = f"movie:light:{canonical}"
         if (
             not isinstance(kv_keys_deleted, tuple)
-            or expected_light_key not in set(kv_keys_deleted)
+            or not any(
+                isinstance(key, str)
+                and _matches_catalog_light_cache_key(key, canonical)
+                for key in kv_keys_deleted
+            )
             or not any(
                 isinstance(key, str)
                 and _matches_catalog_full_cache_key(key, canonical)

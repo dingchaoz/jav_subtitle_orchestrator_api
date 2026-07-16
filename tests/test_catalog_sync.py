@@ -383,6 +383,18 @@ def test_sync_accepts_versioned_alias_keys_from_multirow_catalog():
     assert result.kv_keys_deleted == tuple(body["results"][0]["kvKeysDeleted"])
 
 
+def test_sync_accepts_versioned_light_alias_keys_from_deployed_catalog():
+    body = valid_body()
+    body["results"][0]["kvKeysDeleted"] = [
+        f"movie:full:v4:{CANONICAL_CODE}-uncensored-leak",
+        f"movie:light:v2:{CANONICAL_CODE}-uncensored-leak",
+    ]
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == tuple(body["results"][0]["kvKeysDeleted"])
+
+
 @pytest.mark.parametrize(
     ("status", "reason"),
     [
