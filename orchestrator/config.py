@@ -93,6 +93,10 @@ class MacSettings(BaseSettings):
         default=False,
         alias="MAC_TRANSLATION_PUBLISH_ENABLED",
     )
+    delete_audio_after_publish: bool = Field(
+        default=True,
+        alias="DELETE_AUDIO_AFTER_PUBLISH",
+    )
     supabase_publish_verify_timeout_seconds: int = Field(
         default=90,
         ge=60,

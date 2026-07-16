@@ -235,10 +235,16 @@ class HistoricalRepairDashboardProgress(BaseModel):
     updated_at: str | None = None
 
 
+class AudioCleanupStatus(BaseModel):
+    enabled: bool
+    trigger: str = "verified_supabase_publication"
+
+
 class DashboardStateResponse(BaseModel):
     api: dict[str, str | bool]
     activity: dict[str, dict[str, str | None]]
     counts: dict[str, int]
+    audio_cleanup: AudioCleanupStatus
     historical_repairs: HistoricalRepairDashboardProgress = Field(
         default_factory=HistoricalRepairDashboardProgress
     )

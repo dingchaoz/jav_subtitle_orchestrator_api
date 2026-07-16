@@ -124,6 +124,8 @@ def test_build_dashboard_state_counts_latest_jobs_and_active_errors(
     assert state.api["online"] is True
     assert state.api["jobs_root_mac"] == str(mac_jobs_root)
     assert state.api["jobs_root_windows"] == "M:\\"
+    assert state.audio_cleanup.enabled is True
+    assert state.audio_cleanup.trigger == "verified_supabase_publication"
     assert state.counts["queued"] == 1
     assert state.counts["audio_ready"] == 1
     assert state.counts["failed"] == 1
@@ -137,6 +139,15 @@ def test_build_dashboard_state_counts_latest_jobs_and_active_errors(
         state.active_errors[0].error
         == "metadata failed: Movie not found in MissAV catalog"
     )
+
+
+def test_dashboard_state_reports_disabled_audio_cleanup(sqlite_path, mac_jobs_root):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+
+    state = build_dashboard_state(store, delete_audio_after_publish=False)
+
+    assert state.audio_cleanup.enabled is False
 
 
 def test_build_dashboard_state_derives_worker_activity(sqlite_path, mac_jobs_root):

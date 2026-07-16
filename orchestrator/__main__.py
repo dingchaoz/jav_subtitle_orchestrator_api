@@ -359,6 +359,7 @@ def run_api() -> None:
         subtitle_audit_service=build_subtitle_audit_api_service(settings),
         requested_subtitle_importer=build_requested_subtitle_importer(settings),
         callback_clients=build_callback_clients(settings),
+        delete_audio_after_publish=settings.delete_audio_after_publish,
     )
     uvicorn.run(app, host=settings.host, port=settings.port)
 
@@ -607,6 +608,11 @@ def run_mac_translation_worker() -> None:
                 getattr(settings, "catalog_sync_max_retry_seconds", 900)
             ),
             callback_notifier=build_callback_notifier(store, settings),
+            delete_audio_after_publish=getattr(
+                settings,
+                "delete_audio_after_publish",
+                True,
+            ),
         )
         run_translation_forever(worker, settings.mac_translation_poll_interval_seconds)
     except BaseException:
@@ -650,6 +656,11 @@ def run_mac_translation_worker_once(job_id: str) -> None:
             900,
         ),
         callback_notifier=build_callback_notifier(store, settings),
+        delete_audio_after_publish=getattr(
+            settings,
+            "delete_audio_after_publish",
+            True,
+        ),
     )
     worker.process_job_id(job_id)
     completed = store.get_job(job_id)

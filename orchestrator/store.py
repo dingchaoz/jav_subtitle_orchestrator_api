@@ -1260,6 +1260,88 @@ class JobStore:
             ]
         return candidates if limit is None else candidates[:limit]
 
+    def list_published_audio_cleanup_candidates(
+        self,
+        *,
+        limit: int = 25,
+    ) -> list[JobRecord]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE status = ? AND artifact_status = ?
+                  AND translation_origin = ? AND audio_path_mac IS NOT NULL
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    "ready",
+                    NORMAL_TRANSLATION_ORIGIN,
+                ),
+            ).fetchall()
+        candidates: list[JobRecord] = []
+        for row in rows:
+            job = self._row_to_job(row)
+            try:
+                _validate_ready_published_artifact(job)
+            except ValueError:
+                continue
+            candidates.append(job)
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    def cleanup_published_audio_atomically(
+        self,
+        job_id: str,
+        *,
+        cleanup: Callable[[JobRecord], str],
+    ) -> tuple[JobRecord, str]:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self.get_job(job_id, conn=conn)
+            if job is None:
+                raise KeyError(job_id)
+            paths = build_job_paths(
+                job.normalized_movie_number,
+                self.jobs_root_mac,
+                self.jobs_root_windows,
+            )
+            expected_audio_path = str(paths.audio_path_mac)
+            if job.translation_origin != NORMAL_TRANSLATION_ORIGIN:
+                raise RuntimeError("audio cleanup state changed")
+            _validate_ready_published_artifact(job)
+            if job.audio_path_mac != expected_audio_path:
+                raise RuntimeError("audio cleanup state changed")
+            outcome = cleanup(job)
+            if outcome not in {"deleted", "missing"}:
+                return job, outcome
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET audio_path_mac = NULL, audio_path_windows = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = ? AND artifact_status = ?
+                  AND translation_origin = ? AND audio_path_mac = ?
+                """,
+                (
+                    now,
+                    job_id,
+                    JobStatus.ENGLISH_SRT_READY.value,
+                    "ready",
+                    NORMAL_TRANSLATION_ORIGIN,
+                    expected_audio_path,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("audio cleanup state changed")
+            cleaned = self.get_job(job_id, conn=conn)
+            assert cleaned is not None
+            return cleaned, outcome
+
     def record_worker_idle(
         self,
         worker_id: str,
@@ -1519,6 +1601,30 @@ class JobStore:
             )
             if cursor.rowcount == 0:
                 raise KeyError(job_id)
+            job = self.get_job(job_id, conn=conn)
+            assert job is not None
+            return job
+
+    def defer_download_job(self, job_id: str, reason: str) -> JobRecord:
+        now = utc_now_iso()
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, updated_at = ?, error = ?
+                WHERE id = ? AND status IN (?, ?)
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    now,
+                    reason,
+                    job_id,
+                    JobStatus.DOWNLOADING_METADATA.value,
+                    JobStatus.DOWNLOADING_AUDIO.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("download deferral state changed")
             job = self.get_job(job_id, conn=conn)
             assert job is not None
             return job

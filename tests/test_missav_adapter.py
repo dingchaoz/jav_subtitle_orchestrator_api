@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.missav_adapter import MissAVAdapter
+from orchestrator.missav_adapter import DownloadDeferredError, MissAVAdapter
 
 
 def _fake_pipeline_root(tmp_path: Path) -> Path:
@@ -175,3 +175,21 @@ def test_download_audio_queues_requested_movie_and_moves_produced_audio(
 
     assert output_path.read_bytes() == b"RIFFrequestedWAVE"
     assert not (output_path.parent / "audio" / "ktb-096.wav").exists()
+
+
+def test_download_audio_classifies_low_disk_pause_as_deferred(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="Free space below threshold. Pausing before next download...\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DownloadDeferredError, match="low disk space"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)

@@ -19,6 +19,10 @@ VARIANT_SUFFIXES = (
 QUEUE_MOVIE_FIELDS = ("number", "title", "link", "cover", "preview", "duration", "release_date")
 
 
+class DownloadDeferredError(RuntimeError):
+    pass
+
+
 class MissAVAdapter:
     def __init__(
         self,
@@ -102,7 +106,15 @@ class MissAVAdapter:
         if completed.returncode != 0:
             raise RuntimeError(completed.stderr or completed.stdout)
 
-        produced_path = self._find_produced_audio(movie_number, output_path)
+        try:
+            produced_path = self._find_produced_audio(movie_number, output_path)
+        except FileNotFoundError:
+            process_output = f"{completed.stdout}\n{completed.stderr}".lower()
+            if "pausing before next download" in process_output:
+                raise DownloadDeferredError(
+                    "download deferred: low disk space"
+                ) from None
+            raise
         produced_path.replace(output_path)
 
     def _catalog_movies(self, catalog_path: Path) -> list[dict[str, Any]]:
