@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import fields
 
 import pytest
@@ -68,6 +69,47 @@ def valid_current_body() -> dict[str, object]:
             }
         ],
     }
+
+
+def valid_v4_body() -> dict[str, object]:
+    active_keys = v4_active_keys([CANONICAL_CODE])
+    return {
+        "success": True,
+        "requested": 1,
+        "synced": 1,
+        "failed": [],
+        "cacheSchemaVersion": "v4",
+        "results": [
+            {
+                "canonicalCode": CANONICAL_CODE,
+                "d1RowsUpdated": 1,
+                "d1Verified": True,
+                "subtitleCount": 1,
+                "kvAction": "written",
+                "kvKeysTouched": active_keys.copy(),
+                "kvKeysDeleted": active_keys.copy(),
+            }
+        ],
+    }
+
+
+def v4_active_keys(codes: list[str]) -> list[str]:
+    return [
+        key
+        for code in codes
+        for key in (
+            f"movie:full:v4:{code}",
+            f"movie:light:{code}",
+        )
+    ]
+
+
+def valid_v4_body_for_codes(codes: list[str]) -> dict[str, object]:
+    body = valid_v4_body()
+    active_keys = v4_active_keys(codes)
+    body["results"][0]["kvKeysTouched"] = active_keys.copy()
+    body["results"][0]["kvKeysDeleted"] = active_keys.copy()
+    return body
 
 
 def valid_public_body() -> dict[str, object]:
@@ -139,8 +181,8 @@ class FakeSession:
         response: FakeResponse | None = None,
         *,
         public_response: FakeResponse | None = None,
-        error: requests.RequestException | None = None,
-        public_error: requests.RequestException | None = None,
+        error: Exception | None = None,
+        public_error: Exception | None = None,
     ) -> None:
         self.response = response or FakeResponse()
         self.public_response = public_response or FakeResponse(body=valid_public_body())
@@ -295,6 +337,37 @@ def test_both_kv_receipts_must_be_independently_well_formed(deleted):
     assert raised.value.reason_code == "catalog_response_mismatch"
 
 
+def test_sync_accepts_strengthened_v4_catalog_response_schema():
+    result = sync_with_response(200, body=valid_v4_body())
+
+    assert result == CatalogSyncResult(
+        canonical_code=CANONICAL_CODE,
+        d1_rows_updated=1,
+        subtitle_count=1,
+        kv_keys_deleted=(
+            f"movie:full:v4:{CANONICAL_CODE}",
+            f"movie:light:{CANONICAL_CODE}",
+        ),
+        diagnostic=result.diagnostic,
+    )
+
+
+def test_sync_rejects_non_v4_strengthened_cache_schema_version():
+    body = valid_v4_body()
+    active_keys = [
+        f"movie:full:v12:{CANONICAL_CODE}",
+        f"movie:light:{CANONICAL_CODE}",
+    ]
+    body["cacheSchemaVersion"] = "v12"
+    body["results"][0]["kvKeysTouched"] = active_keys.copy()
+    body["results"][0]["kvKeysDeleted"] = active_keys.copy()
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+
+
 def test_http_207_is_retryable_and_retains_only_safe_partial_failure_metadata():
     body = {
         "success": False,
@@ -349,6 +422,251 @@ def test_idempotency_key_is_stable_for_same_verified_receipt():
 
     assert first_session.requests[0][1]["headers"]["Idempotency-Key"] == IDEMPOTENCY_KEY
     assert second_session.requests[0][1]["headers"]["Idempotency-Key"] == IDEMPOTENCY_KEY
+
+
+def test_sync_accepts_strengthened_v4_catalog_response_with_multi_variant_pairs():
+    codes = [CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"]
+    body = valid_v4_body_for_codes(codes)
+
+    result = sync_with_response(200, body=body)
+
+    assert result.kv_keys_deleted == tuple(v4_active_keys(codes))
+
+
+def v4_variant_response_mutations() -> list[tuple[str, object]]:
+    variant_codes = [CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"]
+    return [
+        (
+            "legacy full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "old version full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "unsafe normalized suffix",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}-bad/variant",
+                    f"movie:light:{CANONICAL_CODE}-bad/variant",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}-bad/variant",
+                    f"movie:light:{CANONICAL_CODE}-bad/variant",
+                ],
+            ),
+        ),
+        (
+            "variant outside canonical family",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys([CANONICAL_CODE, "other-291"]),
+                kvKeysDeleted=v4_active_keys([CANONICAL_CODE, "other-291"]),
+            ),
+        ),
+        (
+            "reversed full-light pair",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:light:{CANONICAL_CODE}",
+                    f"movie:full:v4:{CANONICAL_CODE}",
+                    f"movie:full:v4:{variant_codes[1]}",
+                    f"movie:light:{variant_codes[1]}",
+                ],
+            ),
+        ),
+        (
+            "duplicate variant pair",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys(variant_codes + [variant_codes[1]]),
+                kvKeysDeleted=v4_active_keys(variant_codes + [variant_codes[1]]),
+            ),
+        ),
+        (
+            "odd number of keys",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=body["results"][0]["kvKeysTouched"]
+                + [f"movie:full:v4:{variant_codes[1]}"],
+                kvKeysDeleted=body["results"][0]["kvKeysDeleted"]
+                + [f"movie:full:v4:{variant_codes[1]}"],
+            ),
+        ),
+        (
+            "too many variant pairs",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=v4_active_keys(
+                    [CANONICAL_CODE] + [f"{CANONICAL_CODE}-variant-{index}" for index in range(64)]
+                ),
+                kvKeysDeleted=v4_active_keys(
+                    [CANONICAL_CODE] + [f"{CANONICAL_CODE}-variant-{index}" for index in range(64)]
+                ),
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "_name,mutate", v4_variant_response_mutations(), ids=lambda value: str(value)
+)
+def test_malformed_strengthened_v4_multi_variant_response_is_rejected(_name, mutate):
+    body = valid_v4_body_for_codes([CANONICAL_CODE, f"{CANONICAL_CODE}-uncensored-leak"])
+    mutate(body)
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+
+
+def v4_response_mutations() -> list[tuple[str, object]]:
+    return [
+        ("zero schema version", lambda body: body.update(cacheSchemaVersion="v0")),
+        ("padded schema version", lambda body: body.update(cacheSchemaVersion="v01")),
+        ("arbitrary schema version", lambda body: body.update(cacheSchemaVersion="latest")),
+        (
+            "non-string schema version",
+            lambda body: (
+                body.update(cacheSchemaVersion=4),
+                body["results"][0].update(
+                    kvKeysTouched=[
+                        f"movie:full:4:{CANONICAL_CODE}",
+                        f"movie:light:{CANONICAL_CODE}",
+                    ],
+                    kvKeysDeleted=[
+                        f"movie:full:4:{CANONICAL_CODE}",
+                        f"movie:light:{CANONICAL_CODE}",
+                    ],
+                ),
+            ),
+        ),
+        (
+            "D1 verification false",
+            lambda body: body["results"][0].update(d1Verified=False),
+        ),
+        (
+            "D1 verification non-bool",
+            lambda body: body["results"][0].update(d1Verified=1),
+        ),
+        (
+            "bad KV action",
+            lambda body: body["results"][0].update(kvAction="replaced"),
+        ),
+        (
+            "array KV action",
+            lambda body: body["results"][0].update(kvAction=[]),
+        ),
+        (
+            "object KV action",
+            lambda body: body["results"][0].update(kvAction={}),
+        ),
+        (
+            "numeric KV action",
+            lambda body: body["results"][0].update(kvAction=1),
+        ),
+        (
+            "null KV action",
+            lambda body: body["results"][0].update(kvAction=None),
+        ),
+        (
+            "unequal KV arrays",
+            lambda body: body["results"][0].update(
+                kvKeysDeleted=[f"movie:light:{CANONICAL_CODE}"]
+            ),
+        ),
+        (
+            "missing result key",
+            lambda body: body["results"][0].pop("d1Verified"),
+        ),
+        (
+            "extra result key",
+            lambda body: body["results"][0].update(extra=ADULT_TEXT),
+        ),
+        ("missing top-level key", lambda body: body.pop("cacheSchemaVersion")),
+        ("extra top-level key", lambda body: body.update(extra=ADULT_TEXT)),
+        (
+            "unversioned full key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+            ),
+        ),
+        (
+            "wrong full-key version",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+                kvKeysDeleted=[
+                    f"movie:full:v3:{CANONICAL_CODE}",
+                    f"movie:light:{CANONICAL_CODE}",
+                ],
+            ),
+        ),
+        (
+            "extra active key",
+            lambda body: body["results"][0].update(
+                kvKeysTouched=body["results"][0]["kvKeysTouched"]
+                + [f"movie:light:{CANONICAL_CODE}-subtitle"],
+                kvKeysDeleted=body["results"][0]["kvKeysDeleted"]
+                + [f"movie:light:{CANONICAL_CODE}-subtitle"],
+            ),
+        ),
+    ]
+
+
+@pytest.mark.parametrize("_name,mutate", v4_response_mutations(), ids=lambda value: str(value))
+def test_malformed_strengthened_v4_response_is_rejected(_name, mutate):
+    body = valid_v4_body()
+    mutate(body)
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync_with_response(200, body=body)
+
+    assert raised.value.reason_code == "catalog_response_mismatch"
+    assert ADULT_TEXT not in repr(raised.value)
 
 
 def test_sync_accepts_versioned_full_cache_key_from_deployed_catalog():
@@ -586,12 +904,63 @@ def test_admin_token_must_be_nonempty_string(token):
         CatalogSyncClient("https://javsubtitle.example", token, session=FakeSession())
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True])
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        0,
+        -1,
+        True,
+        math.nan,
+        math.inf,
+        -math.inf,
+    ],
+)
 def test_timeout_must_be_positive_number(timeout):
     with pytest.raises(ValueError, match="timeout_seconds must be positive"):
         CatalogSyncClient(
             "https://javsubtitle.example", TOKEN, timeout_seconds=timeout, session=FakeSession()
         )
+
+
+@pytest.mark.parametrize("timeout", [1, 0.25, 300, 301, 3600, 1e20, 10**400])
+def test_sync_accepts_positive_finite_timeout(timeout):
+    client = CatalogSyncClient(
+        "https://javsubtitle.example",
+        TOKEN,
+        timeout_seconds=timeout,
+        session=FakeSession(),
+    )
+
+    assert client.timeout_seconds == timeout
+
+
+def test_admin_post_overflow_is_safe_catalog_fetch_failure():
+    session = FakeSession(error=OverflowError(f"overflow {TOKEN} {ADULT_TEXT}"))
+
+    with pytest.raises(CatalogSyncError) as raised:
+        sync(CatalogSyncClient("https://javsubtitle.example", TOKEN, session=session))
+
+    assert raised.value.reason_code == "catalog_fetch_failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    for sensitive in (TOKEN, ADULT_TEXT):
+        assert sensitive not in str(raised.value)
+        assert sensitive not in repr(raised.value)
+
+
+def test_sync_endpoint_uses_requests_aligned_idn_origin_for_bearer_request():
+    session = FakeSession()
+    client = CatalogSyncClient("https://faß.de", TOKEN, session=session)
+
+    result = sync(client)
+
+    assert result.canonical_code == CANONICAL_CODE
+    assert client.base_url == "https://xn--fa-hia.de"
+    assert client.endpoint == (
+        "https://xn--fa-hia.de/api/admin/catalog/sync-subtitles"
+    )
+    assert session.requests[0][0] == client.endpoint
+    assert session.requests[0][1]["headers"]["Authorization"] == f"Bearer {TOKEN}"
 
 
 def test_invalid_movie_code_is_rejected_before_request_without_echoing_input():
@@ -629,7 +998,10 @@ def test_public_movie_verification_accepts_real_public_subtitle_shape():
 @pytest.mark.parametrize(
     ("body", "reason"),
     [
-        ({"canonicalCode": "abc-123", "subtitles": []}, "public_visibility_mismatch"),
+        (
+            {"canonicalCode": "abc-123", "subtitles": []},
+            "public_visibility_response_invalid",
+        ),
         ({"canonicalCode": CANONICAL_CODE, "subtitles": []}, "public_visibility_mismatch"),
         (
             {
@@ -646,6 +1018,10 @@ def test_public_movie_verification_accepts_real_public_subtitle_shape():
                 "canonicalCode": CANONICAL_CODE,
                 "subtitles": "not-an-array",
             },
+            "public_visibility_response_invalid",
+        ),
+        (
+            {"canonicalCode": CANONICAL_CODE, "subtitles": [{"id": 123}]},
             "public_visibility_response_invalid",
         ),
         ([], "public_visibility_response_invalid"),

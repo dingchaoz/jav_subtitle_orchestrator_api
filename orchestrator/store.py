@@ -230,6 +230,10 @@ def _bounded_catalog_diagnostic(
     return safe_status, safe_response
 
 
+def validate_verified_supabase_receipt(**kwargs: object) -> None:
+    _validate_verified_supabase_receipt(**kwargs)
+
+
 def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
     return (
         before.st_dev,
@@ -1219,6 +1223,42 @@ class JobStore:
                     (status.value,),
                 ).fetchall()
             return [self._row_to_job(row) for row in rows]
+
+    def list_catalog_visibility_candidates(
+        self,
+        *,
+        allowlist: set[str] | None = None,
+        limit: int | None = None,
+    ) -> list[JobRecord]:
+        if (
+            limit is not None
+            and (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit <= 0
+            )
+        ):
+            raise ValueError("limit must be a positive integer")
+        canonical_allowlist = (
+            {canonical_movie_code(movie_code) for movie_code in allowlist}
+            if allowlist is not None
+            else None
+        )
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status = ? "
+                "ORDER BY updated_at ASC, id ASC",
+                (JobStatus.ENGLISH_SRT_READY.value,),
+            ).fetchall()
+        candidates = [self._row_to_job(row) for row in rows]
+        if canonical_allowlist is not None:
+            candidates = [
+                job
+                for job in candidates
+                if canonical_movie_code(job.normalized_movie_number)
+                in canonical_allowlist
+            ]
+        return candidates if limit is None else candidates[:limit]
 
     def record_worker_idle(
         self,
