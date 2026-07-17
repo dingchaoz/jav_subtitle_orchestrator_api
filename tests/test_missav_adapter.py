@@ -199,6 +199,35 @@ def test_download_audio_classifies_low_disk_pause_as_deferred(monkeypatch, tmp_p
         MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
 
 
+def test_download_audio_cleans_stale_tmp_and_prioritizes_low_disk_pause(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"canonical audio")
+    staging_path = output_path.with_suffix(".wav.tmp")
+    staging_path.write_bytes(b"stale partial audio")
+
+    def fake_run(command, **kwargs):
+        assert not staging_path.exists()
+        staging_path.write_bytes(b"fresh partial audio")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="Free space below threshold. Pausing before next download...\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DownloadDeferredError, match="low disk space"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+    assert output_path.read_bytes() == b"canonical audio"
+
+
 def test_download_audio_classifies_retryable_pipeline_failure_as_deferred(
     monkeypatch,
     tmp_path,
@@ -257,6 +286,108 @@ def test_download_audio_preserves_nonretryable_pipeline_failure_detail(
 
     with pytest.raises(FileNotFoundError, match="stream URL unavailable"):
         MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+
+def test_download_audio_cleans_stale_candidate_and_prioritizes_no_audio_log(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(json.dumps({"movies": []}) + "\n", encoding="utf-8")
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    staging_path = output_path.parent / "audio" / "mfyd-123.wav"
+    staging_path.parent.mkdir(parents=True)
+    staging_path.write_bytes(b"stale candidate audio")
+
+    def fake_run(command, **kwargs):
+        assert not staging_path.exists()
+        staging_path.write_bytes(b"fresh partial audio")
+        log_file = Path(command[command.index("--log-file") + 1])
+        log_file.write_text(
+            json.dumps(
+                {"failed": {"mfyd-123": {"error": "source_no_audio: mfyd-123"}}}
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(SourceNoAudioError, match="source_no_audio"):
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    assert not output_path.exists()
+
+
+def test_download_audio_cleans_stale_fallback_candidate_before_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps({"movies": [{"number": "mfyd-123-uncensored-leak"}]}) + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    fallback_staging_path = (
+        output_path.parent / "audio" / "mfyd-123-uncensored-leak.wav"
+    )
+    fallback_staging_path.parent.mkdir(parents=True)
+    fallback_staging_path.write_bytes(b"stale fallback audio")
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        if queued_number == "mfyd-123-uncensored-leak":
+            assert not fallback_staging_path.exists()
+            fallback_staging_path.write_bytes(b"fresh fallback partial")
+        log_file.write_text(
+            json.dumps(
+                {
+                    "failed": {
+                        "mfyd-123": {
+                            "error": f"source_no_audio: {queued_number}",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(SourceNoAudioError, match="source_no_audio"):
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    assert attempted == ["mfyd-123", "mfyd-123-uncensored-leak"]
+    assert not output_path.exists()
+
+
+def test_download_audio_rejects_empty_produced_audio(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+
+    def fake_run(command, **kwargs):
+        output_dir = Path(command[command.index("--output-dir") + 1])
+        produced = output_dir / "audio" / "ktb-096.wav"
+        produced.parent.mkdir(parents=True)
+        produced.write_bytes(b"")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FileNotFoundError, match="Downloaded audio for ktb-096 not found"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+    assert not output_path.exists()
 
 
 def test_download_audio_falls_back_to_catalog_variant_when_primary_has_no_audio(

@@ -124,6 +124,9 @@ class MissAVAdapter:
         output_path: Path,
     ) -> Path:
         movie_number = str(queue_movie["number"])
+        for staging_path in self._audio_staging_candidates(movie_number, output_path):
+            staging_path.unlink(missing_ok=True)
+
         with tempfile.TemporaryDirectory(prefix="missav-adapter-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
             catalog_path = temp_dir / "single_movie_catalog.json"
@@ -163,31 +166,27 @@ class MissAVAdapter:
                 capture_output=True,
                 check=False,
             )
+            detail = self._pipeline_failure_detail(log_path, movie_number)
             if completed.returncode != 0:
-                detail = self._pipeline_failure_detail(log_path, movie_number)
                 if detail and self._is_source_no_audio_failure(detail):
                     raise SourceNoAudioError(f"source_no_audio: {movie_number}") from None
                 raise RuntimeError(completed.stderr or completed.stdout)
 
-            try:
-                produced_path = self._find_produced_audio(movie_number, output_path)
-            except FileNotFoundError as exc:
-                process_output = f"{completed.stdout}\n{completed.stderr}"
-                if "pausing before next download" in process_output.lower():
-                    raise DownloadDeferredError(
-                        "download deferred: low disk space"
-                    ) from None
-                detail = self._pipeline_failure_detail(log_path, movie_number)
-                if detail and self._is_retryable_stream_failure(detail):
-                    raise DownloadDeferredError(
-                        f"download deferred: upstream stream resolution: {detail}"
-                    ) from None
-                if detail and self._is_source_no_audio_failure(detail):
-                    raise SourceNoAudioError(f"source_no_audio: {movie_number}") from None
-                if detail:
-                    raise FileNotFoundError(f"{exc}: {detail}") from None
-                raise
-            return produced_path
+            process_output = f"{completed.stdout}\n{completed.stderr}"
+            if "pausing before next download" in process_output.lower():
+                raise DownloadDeferredError("download deferred: low disk space") from None
+            if detail and self._is_retryable_stream_failure(detail):
+                raise DownloadDeferredError(
+                    f"download deferred: upstream stream resolution: {detail}"
+                ) from None
+            if detail and self._is_source_no_audio_failure(detail):
+                raise SourceNoAudioError(f"source_no_audio: {movie_number}") from None
+            if detail:
+                raise FileNotFoundError(
+                    f"Downloaded audio for {movie_number} not found under "
+                    f"{output_path.parent}: {detail}"
+                ) from None
+            return self._find_produced_audio(movie_number, output_path)
 
     def _audio_fallback_candidates(self, movie_number: str) -> list[dict[str, Any]]:
         catalog_path = self.missav_pipeline_root / "new-release" / "release_movies_complete.json"
@@ -296,6 +295,12 @@ class MissAVAdapter:
         return queued
 
     def _find_produced_audio(self, movie_number: str, output_path: Path) -> Path:
+        for candidate in self._audio_staging_candidates(movie_number, output_path):
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+        raise FileNotFoundError(f"Downloaded audio for {movie_number} not found under {output_path.parent}")
+
+    def _audio_staging_candidates(self, movie_number: str, output_path: Path) -> list[Path]:
         audio_dir = output_path.parent / "audio"
         safe_number = re.sub(r"[^\w\-_.]", "_", movie_number)
         base_number = self._base_movie_id(movie_number)
@@ -307,10 +312,16 @@ class MissAVAdapter:
             audio_dir / f"{safe_base}.wav",
             audio_dir / f"{base_number}.wav",
         ]
+        unique_candidates = []
         for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        raise FileNotFoundError(f"Downloaded audio for {movie_number} not found under {output_path.parent}")
+            if candidate == output_path or (
+                candidate != output_path.with_suffix(output_path.suffix + ".tmp")
+                and candidate.parent != audio_dir
+            ):
+                continue
+            if candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        return unique_candidates
 
     def _base_movie_id(self, movie_number: str) -> str:
         base = movie_number.strip().lower()
