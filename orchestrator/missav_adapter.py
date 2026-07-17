@@ -1,5 +1,7 @@
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -124,8 +126,7 @@ class MissAVAdapter:
         output_path: Path,
     ) -> Path:
         movie_number = str(queue_movie["number"])
-        for staging_path in self._audio_staging_candidates(movie_number, output_path):
-            staging_path.unlink(missing_ok=True)
+        self._clean_audio_staging_candidates(movie_number, output_path)
 
         with tempfile.TemporaryDirectory(prefix="missav-adapter-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
@@ -295,10 +296,152 @@ class MissAVAdapter:
         return queued
 
     def _find_produced_audio(self, movie_number: str, output_path: Path) -> Path:
-        for candidate in self._audio_staging_candidates(movie_number, output_path):
-            if candidate.is_file() and candidate.stat().st_size > 0:
-                return candidate
-        raise FileNotFoundError(f"Downloaded audio for {movie_number} not found under {output_path.parent}")
+        job_dir = output_path.parent
+        job_fd = self._open_staging_directory(job_dir, "job")
+        audio_fd: int | None = None
+        try:
+            audio_fd = self._open_audio_staging_directory(job_fd, job_dir / "audio")
+            for candidate in self._audio_staging_candidates(movie_number, output_path):
+                parent_fd = job_fd if candidate.parent == job_dir else audio_fd
+                if parent_fd is None:
+                    continue
+                if self._is_nonempty_regular_staging_file(parent_fd, candidate.name):
+                    return candidate
+        finally:
+            if audio_fd is not None:
+                os.close(audio_fd)
+            os.close(job_fd)
+        raise FileNotFoundError(
+            f"Downloaded audio for {movie_number} not found under {output_path.parent}"
+        )
+
+    def _clean_audio_staging_candidates(
+        self,
+        movie_number: str,
+        output_path: Path,
+    ) -> None:
+        job_dir = output_path.parent
+        job_fd = self._open_staging_directory(job_dir, "job")
+        audio_fd: int | None = None
+        try:
+            audio_fd = self._open_audio_staging_directory(job_fd, job_dir / "audio")
+            for candidate in self._audio_staging_candidates(movie_number, output_path):
+                parent_fd = job_fd if candidate.parent == job_dir else audio_fd
+                if parent_fd is None:
+                    continue
+                try:
+                    os.unlink(candidate.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    continue
+        finally:
+            if audio_fd is not None:
+                os.close(audio_fd)
+            os.close(job_fd)
+
+    def _open_staging_directory(self, directory: Path, label: str) -> int:
+        descriptor: int | None = None
+        try:
+            path_snapshot = directory.lstat()
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            opened_snapshot = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(path_snapshot.st_mode)
+                or not stat.S_ISDIR(opened_snapshot.st_mode)
+                or (path_snapshot.st_dev, path_snapshot.st_ino)
+                != (opened_snapshot.st_dev, opened_snapshot.st_ino)
+            ):
+                raise OSError("directory identity changed")
+            return descriptor
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RuntimeError(f"unsafe {label} staging directory: {directory}") from None
+
+    def _open_audio_staging_directory(
+        self,
+        job_fd: int,
+        audio_dir: Path,
+    ) -> int | None:
+        descriptor: int | None = None
+        try:
+            try:
+                path_snapshot = os.stat(
+                    "audio",
+                    dir_fd=job_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            descriptor = os.open(
+                "audio",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=job_fd,
+            )
+            opened_snapshot = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(path_snapshot.st_mode)
+                or not stat.S_ISDIR(opened_snapshot.st_mode)
+                or (path_snapshot.st_dev, path_snapshot.st_ino)
+                != (opened_snapshot.st_dev, opened_snapshot.st_ino)
+            ):
+                raise OSError("directory identity changed")
+            return descriptor
+        except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise RuntimeError(f"unsafe audio staging directory: {audio_dir}") from None
+
+    def _is_nonempty_regular_staging_file(self, directory_fd: int, name: str) -> bool:
+        descriptor: int | None = None
+        try:
+            path_snapshot = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISREG(path_snapshot.st_mode) or path_snapshot.st_size <= 0:
+                return False
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            opened_snapshot = os.fstat(descriptor)
+            current_snapshot = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            return (
+                stat.S_ISREG(opened_snapshot.st_mode)
+                and opened_snapshot.st_size > 0
+                and (
+                    path_snapshot.st_dev,
+                    path_snapshot.st_ino,
+                    path_snapshot.st_mode,
+                    path_snapshot.st_size,
+                )
+                == (
+                    opened_snapshot.st_dev,
+                    opened_snapshot.st_ino,
+                    opened_snapshot.st_mode,
+                    opened_snapshot.st_size,
+                )
+                == (
+                    current_snapshot.st_dev,
+                    current_snapshot.st_ino,
+                    current_snapshot.st_mode,
+                    current_snapshot.st_size,
+                )
+            )
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def _audio_staging_candidates(self, movie_number: str, output_path: Path) -> list[Path]:
         audio_dir = output_path.parent / "audio"

@@ -228,6 +228,62 @@ def test_download_audio_cleans_stale_tmp_and_prioritizes_low_disk_pause(
     assert output_path.read_bytes() == b"canonical audio"
 
 
+def test_download_audio_rejects_symlinked_audio_staging_directory(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_bytes(b"canonical audio")
+    external_dir = tmp_path / "external-audio"
+    external_dir.mkdir()
+    external_target = external_dir / "ktb-096.wav"
+    external_target.write_bytes(b"external audio")
+    (output_path.parent / "audio").symlink_to(external_dir, target_is_directory=True)
+
+    def fake_run(command, **kwargs):
+        raise AssertionError("unsafe staging directory must fail before subprocess")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="unsafe audio staging directory"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+    assert external_target.read_bytes() == b"external audio"
+    assert output_path.read_bytes() == b"canonical audio"
+
+
+@pytest.mark.parametrize("staging_location", ["audio_dir", "job_tmp"])
+def test_download_audio_rejects_symlink_produced_output(
+    monkeypatch,
+    tmp_path,
+    staging_location,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "audio.wav"
+    external_target = tmp_path / "external.wav"
+    external_target.write_bytes(b"external audio")
+
+    def fake_run(command, **kwargs):
+        output_dir = Path(command[command.index("--output-dir") + 1])
+        if staging_location == "audio_dir":
+            produced = output_dir / "audio" / "ktb-096.wav"
+            produced.parent.mkdir(parents=True)
+        else:
+            produced = output_path.with_suffix(".wav.tmp")
+        produced.symlink_to(external_target)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(FileNotFoundError, match="Downloaded audio for ktb-096 not found"):
+        MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+    assert external_target.read_bytes() == b"external audio"
+    assert not output_path.exists()
+
+
 def test_download_audio_classifies_retryable_pipeline_failure_as_deferred(
     monkeypatch,
     tmp_path,
