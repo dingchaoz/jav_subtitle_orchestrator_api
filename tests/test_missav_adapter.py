@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.missav_adapter import DownloadDeferredError, MissAVAdapter
+from orchestrator.missav_adapter import (
+    DownloadDeferredError,
+    MissAVAdapter,
+    SourceNoAudioError,
+)
 
 
 def _fake_pipeline_root(tmp_path: Path) -> Path:
@@ -253,3 +257,250 @@ def test_download_audio_preserves_nonretryable_pipeline_failure_detail(
 
     with pytest.raises(FileNotFoundError, match="stream URL unavailable"):
         MissAVAdapter(pipeline_root).download_audio("ktb-096", output_path)
+
+
+def test_download_audio_falls_back_to_catalog_variant_when_primary_has_no_audio(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "movies": [
+                    {
+                        "number": "mfyd-123-uncensored-leak",
+                        "title": "Alternate with audio",
+                        "link": "https://missav.example/mfyd-123-uncensored-leak",
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        output_dir = Path(command[command.index("--output-dir") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        if queued_number == "mfyd-123":
+            log_file.write_text(
+                json.dumps(
+                    {
+                        "failed": {
+                            "mfyd-123": {
+                                "error": "source_no_audio: mfyd-123",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            produced = output_dir / "audio" / "mfyd-123-uncensored-leak.wav"
+            produced.parent.mkdir(parents=True, exist_ok=True)
+            produced.write_bytes(b"alternate audio bytes")
+        return subprocess.CompletedProcess(command, 0, stdout="pipeline output", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    assert attempted == ["mfyd-123", "mfyd-123-uncensored-leak"]
+    assert output_path.read_bytes() == b"alternate audio bytes"
+    assert not (output_path.parent / "audio" / "mfyd-123-uncensored-leak.wav").exists()
+    job_log = (output_path.parent / "logs" / "mac-download.log").read_text(
+        encoding="utf-8"
+    )
+    assert "source_no_audio mfyd-123" in job_log
+    assert "source_fallback mfyd-123 -> mfyd-123-uncensored-leak" in job_log
+    assert "source_fallback_success mfyd-123 -> mfyd-123-uncensored-leak" in job_log
+    assert "pipeline output" not in job_log
+    assert "https://" not in job_log
+
+
+def test_download_audio_never_uses_unrelated_catalog_variant(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "movies": [
+                    {
+                        "number": "other-999-uncensored-leak",
+                        "title": "Unrelated movie",
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        log_file.write_text(
+            json.dumps(
+                {
+                    "failed": {
+                        "mfyd-123": {
+                            "error": "source_no_audio: mfyd-123",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(SourceNoAudioError) as exc_info:
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    assert attempted == ["mfyd-123"]
+    assert "source_no_audio" in str(exc_info.value)
+    assert "mfyd-123" in str(exc_info.value)
+    assert "other-999-uncensored-leak" not in str(exc_info.value)
+
+
+def test_download_audio_tries_same_base_variants_in_suffix_order(monkeypatch, tmp_path):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "movies": [
+                    {"number": "mfyd-123-english-subtitle"},
+                    {"number": "mfyd-123-uncensored"},
+                    {"number": "mfyd-123-uncensored-leak"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        log_file.write_text(
+            json.dumps(
+                {
+                    "failed": {
+                        "mfyd-123": {
+                            "error": f"source_no_audio: {queued_number}",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(SourceNoAudioError) as exc_info:
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    expected_attempts = [
+        "mfyd-123",
+        "mfyd-123-uncensored-leak",
+        "mfyd-123-uncensored",
+        "mfyd-123-english-subtitle",
+    ]
+    assert attempted == expected_attempts
+    for movie_number in expected_attempts:
+        assert movie_number in str(exc_info.value)
+
+
+def test_download_audio_preserves_non_no_audio_error_from_fallback(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps({"movies": [{"number": "mfyd-123-uncensored-leak"}]}) + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        detail = (
+            "source_no_audio: mfyd-123"
+            if queued_number == "mfyd-123"
+            else "page_http_403"
+        )
+        log_file.write_text(
+            json.dumps({"failed": {"mfyd-123": {"error": detail}}}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(DownloadDeferredError, match="page_http_403"):
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)
+
+    assert attempted == ["mfyd-123", "mfyd-123-uncensored-leak"]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Output file does not contain any stream",
+        "Stream map '0:a' matches no streams",
+        "Input does not contain any audio stream",
+    ],
+)
+def test_download_audio_classifies_ffmpeg_no_audio_details(
+    monkeypatch,
+    tmp_path,
+    detail,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(json.dumps({"movies": []}) + "\n", encoding="utf-8")
+    output_path = tmp_path / "jobs" / "mfyd-123" / "audio.wav"
+
+    def fake_run(command, **kwargs):
+        log_file = Path(command[command.index("--log-file") + 1])
+        log_file.write_text(
+            json.dumps({"failed": {"mfyd-123": {"error": detail}}}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(SourceNoAudioError, match="source_no_audio"):
+        MissAVAdapter(pipeline_root).download_audio("mfyd-123", output_path)

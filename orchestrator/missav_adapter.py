@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from orchestrator.job_logs import append_job_log
+
 
 VARIANT_SUFFIXES = (
     "-uncensored-leak",
@@ -21,6 +23,17 @@ QUEUE_MOVIE_FIELDS = ("number", "title", "link", "cover", "preview", "duration",
 
 class DownloadDeferredError(RuntimeError):
     pass
+
+
+class SourceNoAudioError(RuntimeError):
+    pass
+
+
+def _append_job_log_safely(job_dir: Path, message: str) -> None:
+    try:
+        append_job_log(job_dir, "mac-download.log", message)
+    except Exception:
+        return
 
 
 class MissAVAdapter:
@@ -64,6 +77,53 @@ class MissAVAdapter:
         movie = self._load_audio_movie(movie_number, output_path.parent / "metadata.json")
         queue_movie = self._queue_movie(movie, movie_number)
 
+        try:
+            produced_path = self._download_audio_candidate(queue_movie, output_path)
+        except SourceNoAudioError:
+            original_code = self._safe_log_movie_code(movie_number)
+            _append_job_log_safely(output_path.parent, f"source_no_audio {original_code}")
+        else:
+            produced_path.replace(output_path)
+            return
+
+        attempted = [str(queue_movie["number"])]
+        for fallback_movie in self._audio_fallback_candidates(movie_number):
+            candidate_number = str(fallback_movie["number"])
+            attempted.append(candidate_number)
+            candidate_code = self._safe_log_movie_code(candidate_number)
+            _append_job_log_safely(
+                output_path.parent,
+                f"source_fallback {original_code} -> {candidate_code}",
+            )
+            try:
+                produced_path = self._download_audio_candidate(fallback_movie, output_path)
+            except SourceNoAudioError:
+                continue
+            produced_path.replace(output_path)
+            _append_job_log_safely(
+                output_path.parent,
+                f"source_fallback_success {original_code} -> {candidate_code}",
+            )
+            return
+
+        attempted_codes = ", ".join(attempted)
+        safe_attempted_codes = ", ".join(
+            self._safe_log_movie_code(number) for number in attempted
+        )
+        _append_job_log_safely(
+            output_path.parent,
+            f"source_fallback_exhausted {original_code} attempted {safe_attempted_codes}",
+        )
+        raise SourceNoAudioError(
+            f"source_no_audio: {movie_number}; attempted: {attempted_codes}"
+        )
+
+    def _download_audio_candidate(
+        self,
+        queue_movie: dict[str, Any],
+        output_path: Path,
+    ) -> Path:
+        movie_number = str(queue_movie["number"])
         with tempfile.TemporaryDirectory(prefix="missav-adapter-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
             catalog_path = temp_dir / "single_movie_catalog.json"
@@ -104,6 +164,9 @@ class MissAVAdapter:
                 check=False,
             )
             if completed.returncode != 0:
+                detail = self._pipeline_failure_detail(log_path, movie_number)
+                if detail and self._is_source_no_audio_failure(detail):
+                    raise SourceNoAudioError(f"source_no_audio: {movie_number}") from None
                 raise RuntimeError(completed.stderr or completed.stdout)
 
             try:
@@ -119,10 +182,34 @@ class MissAVAdapter:
                     raise DownloadDeferredError(
                         f"download deferred: upstream stream resolution: {detail}"
                     ) from None
+                if detail and self._is_source_no_audio_failure(detail):
+                    raise SourceNoAudioError(f"source_no_audio: {movie_number}") from None
                 if detail:
                     raise FileNotFoundError(f"{exc}: {detail}") from None
                 raise
-        produced_path.replace(output_path)
+            return produced_path
+
+    def _audio_fallback_candidates(self, movie_number: str) -> list[dict[str, Any]]:
+        catalog_path = self.missav_pipeline_root / "new-release" / "release_movies_complete.json"
+        requested = movie_number.strip().lower()
+        requested_base = self._base_movie_id(requested)
+        matching_movies: dict[str, dict[str, Any]] = {}
+        for movie in self._catalog_movies(catalog_path):
+            normalized_number = str(movie.get("number", "")).strip().lower()
+            if (
+                normalized_number == requested
+                or self._base_movie_id(normalized_number) != requested_base
+            ):
+                continue
+            matching_movies.setdefault(normalized_number, movie)
+
+        candidates = []
+        for suffix in VARIANT_SUFFIXES:
+            candidate_number = f"{requested_base}{suffix}"
+            movie = matching_movies.get(candidate_number)
+            if movie is not None:
+                candidates.append(self._queue_movie(movie, candidate_number))
+        return candidates[: len(VARIANT_SUFFIXES)]
 
     def _pipeline_failure_detail(self, log_path: Path, movie_number: str) -> str | None:
         try:
@@ -151,6 +238,23 @@ class MissAVAdapter:
                 "page_request_failed",
             )
         )
+
+    def _is_source_no_audio_failure(self, detail: str) -> bool:
+        lowered = detail.lower()
+        return any(
+            token in lowered
+            for token in (
+                "source_no_audio",
+                "output file does not contain any stream",
+                "matches no streams",
+                "does not contain any audio stream",
+            )
+        )
+
+    def _safe_log_movie_code(self, movie_number: str) -> str:
+        normalized = movie_number.strip().lower()
+        safe_code = re.sub(r"[^a-z0-9._-]", "_", normalized)
+        return safe_code[:200] or "unknown"
 
     def _catalog_movies(self, catalog_path: Path) -> list[dict[str, Any]]:
         if not catalog_path.exists():
