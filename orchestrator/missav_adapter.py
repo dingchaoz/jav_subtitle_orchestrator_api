@@ -209,6 +209,9 @@ class MissAVAdapter:
             movie = matching_movies.get(candidate_number)
             if movie is not None:
                 candidates.append(self._queue_movie(movie, candidate_number))
+        base_movie = matching_movies.get(requested_base)
+        if base_movie is not None:
+            candidates.append(self._queue_movie(base_movie, requested_base))
         return candidates[: len(VARIANT_SUFFIXES)]
 
     def _pipeline_failure_detail(self, log_path: Path, movie_number: str) -> str | None:

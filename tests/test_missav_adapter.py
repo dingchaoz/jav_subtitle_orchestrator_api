@@ -435,6 +435,68 @@ def test_download_audio_tries_same_base_variants_in_suffix_order(monkeypatch, tm
         assert movie_number in str(exc_info.value)
 
 
+def test_download_audio_tries_unsuffixed_same_base_catalog_entry_last(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "movies": [
+                    {"number": "mfyd-123"},
+                    {"number": "mfyd-123-english-subtitle"},
+                    {"number": "mfyd-123-uncensored-leak"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "jobs" / "mfyd-123-uncensored" / "audio.wav"
+    attempted = []
+
+    def fake_run(command, **kwargs):
+        queue_file = Path(command[command.index("--queue-file") + 1])
+        log_file = Path(command[command.index("--log-file") + 1])
+        output_dir = Path(command[command.index("--output-dir") + 1])
+        queued_number = json.loads(queue_file.read_text(encoding="utf-8"))["pending"][0][
+            "number"
+        ]
+        attempted.append(queued_number)
+        if queued_number == "mfyd-123":
+            produced = output_dir / "audio" / "mfyd-123.wav"
+            produced.parent.mkdir(parents=True, exist_ok=True)
+            produced.write_bytes(b"unsuffixed alternate")
+        else:
+            log_file.write_text(
+                json.dumps(
+                    {
+                        "failed": {
+                            "mfyd-123": {
+                                "error": f"source_no_audio: {queued_number}",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    MissAVAdapter(pipeline_root).download_audio("mfyd-123-uncensored", output_path)
+
+    assert attempted == [
+        "mfyd-123-uncensored",
+        "mfyd-123-uncensored-leak",
+        "mfyd-123-english-subtitle",
+        "mfyd-123",
+    ]
+    assert output_path.read_bytes() == b"unsuffixed alternate"
+
+
 def test_download_audio_preserves_non_no_audio_error_from_fallback(
     monkeypatch,
     tmp_path,
