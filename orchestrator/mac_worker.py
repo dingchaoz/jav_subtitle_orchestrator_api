@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
 
 from orchestrator.audio_lock import exclusive_audio_job_lock
 from orchestrator.catalog_sync import CatalogSyncError
@@ -53,11 +54,13 @@ class MacDownloadWorker:
         adapter,
         max_download_attempts: int,
         worker_id: str = "mac-downloader-1",
+        heartbeat_interval_seconds: float = 60,
     ) -> None:
         self.store = store
         self.adapter = adapter
         self.max_download_attempts = max_download_attempts
         self.worker_id = worker_id
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
 
     def _record_idle(self, *, error: str | None = None) -> None:
         try:
@@ -70,21 +73,24 @@ class MacDownloadWorker:
         except Exception:
             return
 
+    def _record_processing(self, job: JobRecord, stage: str) -> None:
+        try:
+            self.store.record_worker_processing(
+                self.worker_id,
+                role="mac_downloader",
+                job=job,
+                stage=stage,
+            )
+        except Exception:
+            return
+
     def process_one(self) -> bool:
         self.store.recover_interrupted_downloads(self.max_download_attempts)
         job = self.store.claim_next_download_job()
         if job is None:
             self._record_idle()
             return False
-        try:
-            self.store.record_worker_processing(
-                self.worker_id,
-                role="mac_downloader",
-                job=job,
-                stage=job.status.value,
-            )
-        except Exception:
-            pass
+        self._record_processing(job, job.status.value)
         error: str | None = None
         try:
             self._process_job(job)
@@ -126,6 +132,7 @@ class MacDownloadWorker:
             metadata_path_mac=str(paths.metadata_path_mac),
         )
         _write_job_snapshot_safely(updated)
+        self._record_processing(updated, JobStatus.DOWNLOADING_AUDIO.value)
 
         _append_job_log_safely(
             paths.job_dir_mac,
@@ -137,7 +144,10 @@ class MacDownloadWorker:
             job.normalized_movie_number,
             blocking=True,
         ):
-            self.adapter.download_audio(
+            self._run_with_periodic_worker_status(
+                updated,
+                JobStatus.DOWNLOADING_AUDIO.value,
+                self.adapter.download_audio,
                 job.normalized_movie_number,
                 paths.audio_path_mac,
             )
@@ -154,6 +164,35 @@ class MacDownloadWorker:
             "mac-download.log",
             f"audio_ready {job.normalized_movie_number}",
         )
+
+    def _run_with_periodic_worker_status(
+        self,
+        job: JobRecord,
+        stage: str,
+        operation,
+        *args,
+    ) -> None:
+        stop = Event()
+        thread = Thread(
+            target=self._record_processing_until_stopped,
+            args=(job, stage, stop),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            operation(*args)
+        finally:
+            stop.set()
+            thread.join()
+
+    def _record_processing_until_stopped(
+        self,
+        job: JobRecord,
+        stage: str,
+        stop: Event,
+    ) -> None:
+        while not stop.wait(self.heartbeat_interval_seconds):
+            self._record_processing(job, stage)
 
     def _record_failure(self, job: JobRecord, error: str) -> None:
         next_attempts = job.attempt_count + 1

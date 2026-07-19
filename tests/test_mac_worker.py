@@ -1,6 +1,7 @@
 import hashlib
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +73,27 @@ class WorkerStageInspectingAudioAdapter:
         output_path.with_suffix(".wav.tmp").replace(output_path)
 
 
+class BlockingAudioAdapter:
+    def __init__(self, seen_stages: list[str]) -> None:
+        self.seen_stages = seen_stages
+
+    def download_metadata(self, movie_number: str, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("{}\n", encoding="utf-8")
+
+    def download_audio(self, movie_number: str, output_path: Path) -> None:
+        deadline = time.monotonic() + 1
+        while (
+            self.seen_stages.count(JobStatus.DOWNLOADING_AUDIO.value) < 2
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        assert self.seen_stages.count(JobStatus.DOWNLOADING_AUDIO.value) >= 2
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.with_suffix(".wav.tmp").write_bytes(b"RIFFfakeWAVE")
+        output_path.with_suffix(".wav.tmp").replace(output_path)
+
+
 class LowDiskDeferredAdapter:
     def download_metadata(self, movie_number: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,6 +138,33 @@ def test_mac_worker_updates_worker_stage_before_audio_download(
     )
 
     assert worker.process_one() is True
+
+
+def test_mac_worker_heartbeats_during_long_audio_download(
+    sqlite_path,
+    mac_jobs_root,
+    monkeypatch,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    store.submit_job("ktb-096", priority=100, force=False)
+    seen_stages: list[str] = []
+    original_record_worker_processing = store.record_worker_processing
+
+    def record_worker_processing(*args, **kwargs):
+        seen_stages.append(kwargs["stage"])
+        return original_record_worker_processing(*args, **kwargs)
+
+    monkeypatch.setattr(store, "record_worker_processing", record_worker_processing)
+    worker = MacDownloadWorker(
+        store,
+        BlockingAudioAdapter(seen_stages),
+        max_download_attempts=3,
+        heartbeat_interval_seconds=0.001,
+    )
+
+    assert worker.process_one() is True
+    assert seen_stages.count(JobStatus.DOWNLOADING_AUDIO.value) >= 2
 
 
 def test_mac_worker_writes_download_log(sqlite_path, mac_jobs_root):
