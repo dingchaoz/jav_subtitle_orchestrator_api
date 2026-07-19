@@ -48,7 +48,10 @@ def test_download_metadata_writes_matching_movie_record(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    MissAVAdapter(pipeline_root).download_metadata("ktb-096", output_path)
+    MissAVAdapter(pipeline_root, allow_metadata_refresh=True).download_metadata(
+        "ktb-096",
+        output_path,
+    )
 
     assert json.loads(output_path.read_text(encoding="utf-8")) == {
         "number": "KTB-096",
@@ -74,10 +77,11 @@ def test_adapter_uses_explicit_python_executable(monkeypatch, tmp_path):
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    MissAVAdapter(pipeline_root, python_executable=explicit_python).download_metadata(
-        "ktb-096",
-        output_path,
-    )
+    MissAVAdapter(
+        pipeline_root,
+        python_executable=explicit_python,
+        allow_metadata_refresh=True,
+    ).download_metadata("ktb-096", output_path)
 
     assert json.loads(output_path.read_text(encoding="utf-8"))["number"] == "ktb-096"
 
@@ -104,6 +108,32 @@ def test_download_metadata_uses_existing_catalog_without_refresh(monkeypatch, tm
     }
 
 
+def test_download_metadata_creates_direct_page_metadata_without_refresh(
+    monkeypatch,
+    tmp_path,
+):
+    pipeline_root = _fake_pipeline_root(tmp_path)
+    output_path = tmp_path / "jobs" / "ktb-096" / "metadata.json"
+
+    def fail_if_run(command, **kwargs):
+        raise AssertionError("cache miss should not refresh MissAV catalog by default")
+
+    monkeypatch.setattr(subprocess, "run", fail_if_run)
+
+    MissAVAdapter(pipeline_root).download_metadata("ktb-096", output_path)
+
+    assert json.loads(output_path.read_text(encoding="utf-8")) == {
+        "number": "ktb-096",
+        "title": "ktb-096",
+        "link": "https://missav.live/en/ktb-096",
+        "cover": "",
+        "preview": "",
+        "duration": "",
+        "release_date": "",
+        "metadata_source": "direct_page_fallback",
+    }
+
+
 def test_download_metadata_raises_when_requested_movie_missing(monkeypatch, tmp_path):
     pipeline_root = _fake_pipeline_root(tmp_path)
     catalog_path = pipeline_root / "new-release" / "release_movies_complete.json"
@@ -120,7 +150,10 @@ def test_download_metadata_raises_when_requested_movie_missing(monkeypatch, tmp_
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     with pytest.raises(FileNotFoundError, match="ktb-096"):
-        MissAVAdapter(pipeline_root).download_metadata("ktb-096", output_path)
+        MissAVAdapter(pipeline_root, allow_metadata_refresh=True).download_metadata(
+            "ktb-096",
+            output_path,
+        )
 
     assert not output_path.exists()
 

@@ -43,9 +43,11 @@ class MissAVAdapter:
         self,
         missav_pipeline_root: Path,
         python_executable: Path | str | None = None,
+        allow_metadata_refresh: bool = False,
     ) -> None:
         self.missav_pipeline_root = missav_pipeline_root
         self.python_executable = self._default_python_executable(python_executable)
+        self.allow_metadata_refresh = allow_metadata_refresh
 
     def download_metadata(self, movie_number: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,6 +58,9 @@ class MissAVAdapter:
             movie = None
         if movie is not None:
             self._write_json(movie, output_path)
+            return
+        if not self.allow_metadata_refresh:
+            self._write_json(self._direct_page_metadata(movie_number), output_path)
             return
 
         command = [
@@ -294,6 +299,19 @@ class MissAVAdapter:
         queued = {field: movie.get(field, "") for field in QUEUE_MOVIE_FIELDS}
         queued["number"] = movie_number
         return queued
+
+    def _direct_page_metadata(self, movie_number: str) -> dict[str, str]:
+        base_number = self._base_movie_id(movie_number)
+        return {
+            "number": movie_number,
+            "title": movie_number,
+            "link": f"https://missav.live/en/{base_number}",
+            "cover": "",
+            "preview": "",
+            "duration": "",
+            "release_date": "",
+            "metadata_source": "direct_page_fallback",
+        }
 
     def _find_produced_audio(self, movie_number: str, output_path: Path) -> Path:
         job_dir = output_path.parent

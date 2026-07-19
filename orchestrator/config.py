@@ -44,6 +44,10 @@ class MacSettings(BaseSettings):
         default=Path("/Users/ytt/Documents/startup/MissAV-Pipeline"),
         alias="MISSAV_PIPELINE_ROOT",
     )
+    missav_metadata_refresh_enabled: bool = Field(
+        default=False,
+        alias="MISSAV_METADATA_REFRESH_ENABLED",
+    )
     jobs_root_mac: Path = Field(default=Path("/Users/ytt/MissAVJobs"), alias="JOBS_ROOT_MAC")
     jobs_root_windows: str = Field(default="M:\\", alias="JOBS_ROOT_WINDOWS")
     mac_download_concurrency: int = Field(default=1, alias="MAC_DOWNLOAD_CONCURRENCY")

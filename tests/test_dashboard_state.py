@@ -178,6 +178,29 @@ def test_build_dashboard_state_derives_worker_activity(sqlite_path, mac_jobs_roo
     assert state.activity["windows"]["worker_id"] == "windows-gpu-1"
 
 
+def test_mac_download_activity_prefers_current_job_status_over_claim_stage(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    job = store.submit_job("ktb-096", priority=100, force=False).job
+    claimed = store.claim_next_download_job()
+    store.record_worker_processing(
+        "mac-downloader-1",
+        role="mac_downloader",
+        job=claimed,
+        stage=claimed.status.value,
+    )
+    store.update_download_status(job.id, JobStatus.DOWNLOADING_AUDIO)
+
+    state = build_dashboard_state(store)
+
+    assert state.activity["mac_download"]["status"] == "downloading_audio"
+    assert state.activity["mac_download"]["movie_number"] == "ktb-096"
+    assert state.activity["mac_download"]["worker_id"] == "mac-downloader-1"
+
+
 def test_build_dashboard_state_includes_idle_windows_worker_health(
     sqlite_path,
     mac_jobs_root,

@@ -313,6 +313,14 @@ def _role_activity_payload(
     ]
     if processing:
         worker = processing[0]
+        if fallback_job is not None and fallback_job.id == worker.current_job_id:
+            return {
+                "status": fallback_job.status.value,
+                "movie_number": fallback_job.normalized_movie_number,
+                "job_id": fallback_job.id,
+                "worker_id": worker.worker_id,
+                "updated_at": fallback_job.updated_at,
+            }
         return {
             "status": worker.stage or worker.state,
             "movie_number": worker.current_movie_number,

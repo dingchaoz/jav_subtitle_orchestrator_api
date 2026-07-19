@@ -55,6 +55,23 @@ class AudioOSErrorAdapter:
         raise OSError("audio disk full")
 
 
+class WorkerStageInspectingAudioAdapter:
+    def __init__(self, store: JobStore) -> None:
+        self.store = store
+
+    def download_metadata(self, movie_number: str, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("{}\n", encoding="utf-8")
+
+    def download_audio(self, movie_number: str, output_path: Path) -> None:
+        status = self.store.get_worker_status("mac-downloader-1")
+        assert status is not None
+        assert status.stage == JobStatus.DOWNLOADING_AUDIO.value
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.with_suffix(".wav.tmp").write_bytes(b"RIFFfakeWAVE")
+        output_path.with_suffix(".wav.tmp").replace(output_path)
+
+
 class LowDiskDeferredAdapter:
     def download_metadata(self, movie_number: str, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +100,22 @@ def test_mac_worker_processes_one_queued_job_to_audio_ready(sqlite_path, mac_job
     assert worker_status is not None
     assert worker_status.role == "mac_downloader"
     assert worker_status.state == "idle"
+
+
+def test_mac_worker_updates_worker_stage_before_audio_download(
+    sqlite_path,
+    mac_jobs_root,
+):
+    store = JobStore(sqlite_path, mac_jobs_root, "M:\\")
+    store.initialize()
+    store.submit_job("ktb-096", priority=100, force=False)
+    worker = MacDownloadWorker(
+        store,
+        WorkerStageInspectingAudioAdapter(store),
+        max_download_attempts=3,
+    )
+
+    assert worker.process_one() is True
 
 
 def test_mac_worker_writes_download_log(sqlite_path, mac_jobs_root):

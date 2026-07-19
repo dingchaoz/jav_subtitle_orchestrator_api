@@ -397,6 +397,7 @@ def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
             self.jobs_root_mac = tmp_path / "jobs"
             self.jobs_root_windows = "M:\\"
             self.missav_pipeline_root = tmp_path / "missav"
+            self.missav_metadata_refresh_enabled = False
             self.max_download_attempts = 3
             self.mac_download_worker_id = "configured-downloader"
 
@@ -408,8 +409,8 @@ def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
             events.append("store_initialize")
 
     class FakeAdapter:
-        def __init__(self, _root):
-            events.append("adapter")
+        def __init__(self, _root, *, allow_metadata_refresh):
+            events.append(("adapter_refresh", allow_metadata_refresh))
 
     class FakeWorker:
         def __init__(self, _store, _adapter, _attempts, *, worker_id):
@@ -448,6 +449,7 @@ def test_downloader_runtime_holds_its_lock_and_uses_configured_worker_id(
 
     assert events[0] == ("lock_path", tmp_path / "data" / "mac-worker.lock")
     assert events.index("lock_acquire") < events.index("settings")
+    assert ("adapter_refresh", False) in events
     assert ("worker_id", "configured-downloader") in events
     assert events[-2:] == ["run_forever", "lock_release"]
 

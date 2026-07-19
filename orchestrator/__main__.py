@@ -467,7 +467,10 @@ def run_mac_worker() -> None:
         store.initialize()
         worker = MacDownloadWorker(
             store,
-            MissAVAdapter(settings.missav_pipeline_root),
+            MissAVAdapter(
+                settings.missav_pipeline_root,
+                allow_metadata_refresh=settings.missav_metadata_refresh_enabled,
+            ),
             settings.max_download_attempts,
             worker_id=settings.mac_download_worker_id,
         )
