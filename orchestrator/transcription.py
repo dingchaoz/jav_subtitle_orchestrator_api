@@ -1,7 +1,10 @@
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
+from math import floor
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -11,6 +14,232 @@ class Segment:
     start: float
     end: float
     text: str
+
+
+@dataclass(frozen=True)
+class TimeWindow:
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class TranscriptionReport:
+    audio_duration_seconds: float | None
+    primary_segment_count: int
+    repair_window_count: int
+    repair_grid_a_segment_count: int
+    repair_grid_b_segment_count: int
+    confirmed_segment_count: int
+    final_segment_count: int
+    final_max_gap_seconds: float | None
+
+    def as_dict(self) -> dict[str, int | float | None]:
+        return asdict(self)
+
+
+PHANTOM_TRANSCRIPT_TEXTS = {
+    "ご視聴ありがとうございました",
+    "ありがとうございました",
+    "おはようございます",
+    "おやすみなさい",
+    "さようなら",
+    "おわり",
+}
+
+
+def normalize_transcript_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).lower()
+    return "".join(
+        character
+        for character in normalized
+        if (
+            "\u3040" <= character <= "\u30ff"
+            or "\u3400" <= character <= "\u9fff"
+            or character.isalnum()
+        )
+    )
+
+
+def transcript_text_similarity(left: str, right: str) -> float:
+    left_normalized = normalize_transcript_text(left)
+    right_normalized = normalize_transcript_text(right)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    if left_normalized == right_normalized:
+        return 1.0
+    if min(len(left_normalized), len(right_normalized)) >= 3 and (
+        left_normalized in right_normalized
+        or right_normalized in left_normalized
+    ):
+        return 1.0
+    return SequenceMatcher(None, left_normalized, right_normalized).ratio()
+
+
+def is_definite_hallucination(segment: Segment) -> bool:
+    normalized = normalize_transcript_text(segment.text)
+    if not normalized:
+        return True
+    duration = segment.end - segment.start
+    if duration >= 10 and normalized in PHANTOM_TRANSCRIPT_TEXTS:
+        return True
+    return len(normalized) >= 12 and len(set(normalized)) / len(normalized) <= 0.25
+
+
+def is_repair_trigger(segment: Segment) -> bool:
+    if is_definite_hallucination(segment):
+        return True
+    normalized = normalize_transcript_text(segment.text)
+    duration = segment.end - segment.start
+    return duration >= 20 and len(normalized) / duration < 0.5
+
+
+def find_repair_windows(
+    segments: list[Segment],
+    *,
+    duration: float,
+    gap_seconds: float,
+    padding_seconds: float,
+) -> list[TimeWindow]:
+    trusted = sorted(
+        (segment for segment in segments if not is_repair_trigger(segment)),
+        key=lambda segment: (segment.start, segment.end),
+    )
+    raw_windows: list[TimeWindow] = []
+    cursor = 0.0
+    for segment in trusted:
+        start = max(0.0, min(duration, segment.start))
+        end = max(start, min(duration, segment.end))
+        if start - cursor >= gap_seconds:
+            raw_windows.append(
+                TimeWindow(
+                    start=max(0.0, cursor - padding_seconds),
+                    end=min(duration, start + padding_seconds),
+                )
+            )
+        cursor = max(cursor, end)
+    if duration - cursor >= gap_seconds:
+        raw_windows.append(
+            TimeWindow(
+                start=max(0.0, cursor - padding_seconds),
+                end=duration,
+            )
+        )
+
+    merged: list[TimeWindow] = []
+    for window in raw_windows:
+        if not merged or window.start > merged[-1].end:
+            merged.append(window)
+        else:
+            previous = merged[-1]
+            merged[-1] = TimeWindow(previous.start, max(previous.end, window.end))
+    return merged
+
+
+def repair_grid_chunk_starts(
+    *,
+    window_start: float,
+    window_end: float,
+    duration: float,
+    chunk_seconds: float,
+    grid_offset_seconds: float,
+) -> list[float]:
+    if window_end <= window_start or duration <= 0 or chunk_seconds <= 0:
+        return []
+    first_index = floor((window_start - grid_offset_seconds) / chunk_seconds)
+    start = grid_offset_seconds + first_index * chunk_seconds
+    while start + chunk_seconds <= 0:
+        start += chunk_seconds
+
+    starts: list[float] = []
+    while start < window_end and start < duration:
+        if start >= 0 and start + chunk_seconds > window_start:
+            starts.append(start)
+        start += chunk_seconds
+    return starts
+
+
+def _nearby_text_sequences(
+    segment: Segment,
+    others: list[Segment],
+    *,
+    margin_seconds: float,
+    max_sequence_segments: int = 4,
+) -> list[str]:
+    nearby = [
+        other
+        for other in others
+        if other.end >= segment.start - margin_seconds
+        and other.start <= segment.end + margin_seconds
+        and not is_repair_trigger(other)
+    ]
+    sequences: list[str] = []
+    for start_index in range(len(nearby)):
+        parts: list[str] = []
+        for end_index in range(
+            start_index,
+            min(len(nearby), start_index + max_sequence_segments),
+        ):
+            parts.append(nearby[end_index].text)
+            sequences.append("".join(parts))
+    return sequences
+
+
+def confirm_repair_segments(
+    grid_a: list[Segment],
+    grid_b: list[Segment],
+    *,
+    margin_seconds: float = 5.0,
+    minimum_similarity: float = 0.72,
+) -> list[Segment]:
+    confirmed: list[Segment] = []
+    for segment in grid_a:
+        if is_repair_trigger(segment):
+            continue
+        sequences = _nearby_text_sequences(
+            segment,
+            grid_b,
+            margin_seconds=margin_seconds,
+        )
+        similarity = max(
+            (
+                transcript_text_similarity(segment.text, candidate)
+                for candidate in sequences
+            ),
+            default=0.0,
+        )
+        if similarity >= minimum_similarity:
+            confirmed.append(segment)
+    return confirmed
+
+
+def merge_transcript_segments(
+    primary: list[Segment],
+    confirmed: list[Segment],
+) -> list[Segment]:
+    merged = [
+        segment for segment in primary if not is_definite_hallucination(segment)
+    ]
+    for candidate in confirmed:
+        duplicate = any(
+            existing.end >= candidate.start - 2
+            and existing.start <= candidate.end + 2
+            and transcript_text_similarity(existing.text, candidate.text) >= 0.72
+            for existing in merged
+        )
+        if not duplicate:
+            merged.append(candidate)
+    return sorted(merged, key=lambda segment: (segment.start, segment.end, segment.text))
+
+
+def _maximum_gap_seconds(segments: list[Segment], duration: float) -> float:
+    cursor = 0.0
+    maximum_gap = 0.0
+    for segment in sorted(segments, key=lambda item: (item.start, item.end)):
+        start = max(0.0, min(duration, segment.start))
+        end = max(start, min(duration, segment.end))
+        maximum_gap = max(maximum_gap, start - cursor)
+        cursor = max(cursor, end)
+    return max(maximum_gap, duration - cursor)
 
 
 def srt_timestamp(seconds: float) -> str:
@@ -38,12 +267,39 @@ class FasterWhisperTranscriber:
         model_name: str,
         device: str,
         compute_type: str,
-        chunk_seconds: int = 900,
+        chunk_seconds: int = 90,
+        gap_repair_enabled: bool = True,
+        repair_gap_seconds: float = 60,
+        repair_chunk_seconds: float = 30,
+        repair_offset_seconds: float = 15,
+        repair_padding_seconds: float = 15,
+        repair_minimum_similarity: float = 0.72,
     ) -> None:
+        if chunk_seconds <= 0:
+            raise ValueError("chunk_seconds must be positive")
+        if repair_gap_seconds <= 0:
+            raise ValueError("repair_gap_seconds must be positive")
+        if repair_chunk_seconds <= 0:
+            raise ValueError("repair_chunk_seconds must be positive")
+        if not 0 <= repair_offset_seconds < repair_chunk_seconds:
+            raise ValueError(
+                "repair_offset_seconds must be at least zero and less than "
+                "repair_chunk_seconds"
+            )
+        if repair_padding_seconds < 0:
+            raise ValueError("repair_padding_seconds must be at least zero")
+        if not 0 <= repair_minimum_similarity <= 1:
+            raise ValueError("repair_minimum_similarity must be between zero and one")
         self.model_name = model_name
         self.device = device
         self.compute_type = compute_type
         self.chunk_seconds = chunk_seconds
+        self.gap_repair_enabled = gap_repair_enabled
+        self.repair_gap_seconds = repair_gap_seconds
+        self.repair_chunk_seconds = repair_chunk_seconds
+        self.repair_offset_seconds = repair_offset_seconds
+        self.repair_padding_seconds = repair_padding_seconds
+        self.repair_minimum_similarity = repair_minimum_similarity
         self._model = None
 
     def _load_model(self):
@@ -57,29 +313,149 @@ class FasterWhisperTranscriber:
             )
         return self._model
 
-    def transcribe_to_srt(self, audio_path: Path, output_path: Path) -> None:
+    def transcribe_to_srt(
+        self,
+        audio_path: Path,
+        output_path: Path,
+    ) -> TranscriptionReport:
         model = self._load_model()
         duration = _probe_audio_duration(audio_path)
-        if duration is not None and duration > self.chunk_seconds:
-            segments = self._transcribe_in_chunks(model, audio_path, duration)
-        else:
-            segments = self._transcribe_one(model, audio_path, offset_seconds=0.0)
-        write_srt(segments, output_path)
+        if duration is None:
+            primary = self._transcribe_one(model, audio_path, offset_seconds=0.0)
+            final = merge_transcript_segments(primary, [])
+            write_srt(final, output_path)
+            return TranscriptionReport(
+                audio_duration_seconds=None,
+                primary_segment_count=len(primary),
+                repair_window_count=0,
+                repair_grid_a_segment_count=0,
+                repair_grid_b_segment_count=0,
+                confirmed_segment_count=0,
+                final_segment_count=len(final),
+                final_max_gap_seconds=None,
+            )
 
-    def _transcribe_in_chunks(self, model, audio_path: Path, duration: float) -> list[Segment]:
+        if duration > self.chunk_seconds:
+            primary = self._transcribe_in_chunks(
+                model,
+                audio_path,
+                duration,
+                chunk_seconds=self.chunk_seconds,
+            )
+        else:
+            primary = self._transcribe_one(model, audio_path, offset_seconds=0.0)
+
+        repair_windows = (
+            find_repair_windows(
+                primary,
+                duration=duration,
+                gap_seconds=self.repair_gap_seconds,
+                padding_seconds=self.repair_padding_seconds,
+            )
+            if self.gap_repair_enabled
+            else []
+        )
+        grid_a: list[Segment] = []
+        grid_b: list[Segment] = []
+        confirmed: list[Segment] = []
+        if repair_windows:
+            grid_a = self._transcribe_repair_grid(
+                model,
+                audio_path,
+                duration,
+                repair_windows,
+                grid_offset_seconds=0,
+            )
+            grid_b = self._transcribe_repair_grid(
+                model,
+                audio_path,
+                duration,
+                repair_windows,
+                grid_offset_seconds=self.repair_offset_seconds,
+            )
+            confirmed = confirm_repair_segments(
+                grid_a,
+                grid_b,
+                minimum_similarity=self.repair_minimum_similarity,
+            )
+
+        final = merge_transcript_segments(primary, confirmed)
+        write_srt(final, output_path)
+        return TranscriptionReport(
+            audio_duration_seconds=duration,
+            primary_segment_count=len(primary),
+            repair_window_count=len(repair_windows),
+            repair_grid_a_segment_count=len(grid_a),
+            repair_grid_b_segment_count=len(grid_b),
+            confirmed_segment_count=len(confirmed),
+            final_segment_count=len(final),
+            final_max_gap_seconds=_maximum_gap_seconds(final, duration),
+        )
+
+    def _transcribe_in_chunks(
+        self,
+        model,
+        audio_path: Path,
+        duration: float,
+        *,
+        chunk_seconds: float,
+    ) -> list[Segment]:
         segments: list[Segment] = []
         with TemporaryDirectory(prefix="chunked-transcribe-") as temp_dir:
             temp_path = Path(temp_dir)
             start = 0.0
             chunk_index = 1
             while start < duration:
-                chunk_duration = min(float(self.chunk_seconds), duration - start)
+                chunk_duration = min(chunk_seconds, duration - start)
                 chunk_path = temp_path / f"chunk-{chunk_index:04d}.wav"
                 _extract_audio_chunk(audio_path, chunk_path, start, chunk_duration)
                 segments.extend(self._transcribe_one(model, chunk_path, offset_seconds=start))
                 start += chunk_duration
                 chunk_index += 1
         return segments
+
+    def _transcribe_repair_grid(
+        self,
+        model,
+        audio_path: Path,
+        duration: float,
+        windows: list[TimeWindow],
+        *,
+        grid_offset_seconds: float,
+    ) -> list[Segment]:
+        chunk_starts = sorted(
+            {
+                start
+                for window in windows
+                for start in repair_grid_chunk_starts(
+                    window_start=window.start,
+                    window_end=window.end,
+                    duration=duration,
+                    chunk_seconds=self.repair_chunk_seconds,
+                    grid_offset_seconds=grid_offset_seconds,
+                )
+            }
+        )
+        segments: list[Segment] = []
+        with TemporaryDirectory(prefix="repair-transcribe-") as temp_dir:
+            temp_path = Path(temp_dir)
+            for chunk_index, start in enumerate(chunk_starts, start=1):
+                chunk_duration = min(self.repair_chunk_seconds, duration - start)
+                chunk_path = temp_path / f"repair-{chunk_index:04d}.wav"
+                _extract_audio_chunk(
+                    audio_path,
+                    chunk_path,
+                    start,
+                    chunk_duration,
+                )
+                segments.extend(
+                    self._transcribe_one(
+                        model,
+                        chunk_path,
+                        offset_seconds=start,
+                    )
+                )
+        return sorted(segments, key=lambda segment: (segment.start, segment.end))
 
     @staticmethod
     def _transcribe_one(model, audio_path: Path, offset_seconds: float) -> list[Segment]:

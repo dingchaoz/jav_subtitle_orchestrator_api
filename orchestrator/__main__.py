@@ -461,6 +461,13 @@ def _build_windows_transcriber(settings):
         settings.whisper_model,
         settings.whisper_device,
         settings.whisper_compute_type,
+        chunk_seconds=settings.whisper_chunk_seconds,
+        gap_repair_enabled=settings.whisper_gap_repair_enabled,
+        repair_gap_seconds=settings.whisper_repair_gap_seconds,
+        repair_chunk_seconds=settings.whisper_repair_chunk_seconds,
+        repair_offset_seconds=settings.whisper_repair_offset_seconds,
+        repair_padding_seconds=settings.whisper_repair_padding_seconds,
+        repair_minimum_similarity=settings.whisper_repair_min_similarity,
     )
 
 

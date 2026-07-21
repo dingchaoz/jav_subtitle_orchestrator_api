@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from orchestrator.__main__ import (
     build_catalog_sync_client,
@@ -52,6 +53,13 @@ WINDOWS_ENV_ALIASES = (
     "WHISPER_MODEL",
     "WHISPER_DEVICE",
     "WHISPER_COMPUTE_TYPE",
+    "WHISPER_CHUNK_SECONDS",
+    "WHISPER_GAP_REPAIR_ENABLED",
+    "WHISPER_REPAIR_GAP_SECONDS",
+    "WHISPER_REPAIR_CHUNK_SECONDS",
+    "WHISPER_REPAIR_OFFSET_SECONDS",
+    "WHISPER_REPAIR_PADDING_SECONDS",
+    "WHISPER_REPAIR_MIN_SIMILARITY",
     "TRANSCRIBE_SCRIPT_PATH",
     "TRANSCRIBE_PYTHON_EXECUTABLE",
     "OPENAI_API_KEY",
@@ -394,6 +402,13 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
     assert settings.whisper_model == "large-v3-turbo"
     assert settings.whisper_device == "cuda"
     assert settings.whisper_compute_type == "float16"
+    assert settings.whisper_chunk_seconds == 90
+    assert settings.whisper_gap_repair_enabled is True
+    assert settings.whisper_repair_gap_seconds == 60
+    assert settings.whisper_repair_chunk_seconds == 30
+    assert settings.whisper_repair_offset_seconds == 15
+    assert settings.whisper_repair_padding_seconds == 15
+    assert settings.whisper_repair_min_similarity == 0.72
     assert settings.transcribe_script_path is None
     assert settings.transcribe_python_executable is None
     assert settings.openai_api_key is None
@@ -410,6 +425,16 @@ def test_windows_settings_defaults_match_design_spec(monkeypatch):
     assert settings.codex_translation_anthropic_recheck_minutes is None
     assert settings.poll_interval_seconds == 10
     assert settings.heartbeat_interval_seconds == 60
+
+
+def test_windows_settings_reject_invalid_repair_grid_offset(monkeypatch):
+    clear_env_aliases(monkeypatch, WINDOWS_ENV_ALIASES)
+    monkeypatch.setenv("MAC_API_BASE_URL", "http://192.168.1.25:8000")
+    monkeypatch.setenv("WHISPER_REPAIR_CHUNK_SECONDS", "30")
+    monkeypatch.setenv("WHISPER_REPAIR_OFFSET_SECONDS", "30")
+
+    with pytest.raises(ValidationError, match="WHISPER_REPAIR_OFFSET_SECONDS"):
+        WindowsSettings(_env_file=None)
 
 
 def test_build_windows_transcriber_prefers_external_script_when_configured():
@@ -435,11 +460,25 @@ def test_build_windows_transcriber_falls_back_to_internal_whisper():
         whisper_model="large-v3-turbo",
         whisper_device="cuda",
         whisper_compute_type="float16",
+        whisper_chunk_seconds=75,
+        whisper_gap_repair_enabled=True,
+        whisper_repair_gap_seconds=55,
+        whisper_repair_chunk_seconds=25,
+        whisper_repair_offset_seconds=12.5,
+        whisper_repair_padding_seconds=10,
+        whisper_repair_min_similarity=0.8,
     )
 
     transcriber = _build_windows_transcriber(settings)
 
     assert isinstance(transcriber, FasterWhisperTranscriber)
+    assert transcriber.chunk_seconds == 75
+    assert transcriber.gap_repair_enabled is True
+    assert transcriber.repair_gap_seconds == 55
+    assert transcriber.repair_chunk_seconds == 25
+    assert transcriber.repair_offset_seconds == 12.5
+    assert transcriber.repair_padding_seconds == 10
+    assert transcriber.repair_minimum_similarity == 0.8
 
 
 def test_mac_settings_do_not_load_env_from_ambient_cwd(monkeypatch, tmp_path):

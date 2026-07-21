@@ -4,6 +4,7 @@ from threading import Event
 import pytest
 import requests
 
+from orchestrator.transcription import TranscriptionReport
 from orchestrator.windows_worker import WindowsWorker, run_forever
 
 
@@ -45,6 +46,21 @@ class FakeTranscriber:
         output_path.write_text(
             "1\n00:00:00,000 --> 00:00:01,000\nこんにちは\n\n",
             encoding="utf-8",
+        )
+
+
+class ReportingTranscriber(FakeTranscriber):
+    def transcribe_to_srt(self, audio_path: Path, output_path: Path):
+        super().transcribe_to_srt(audio_path, output_path)
+        return TranscriptionReport(
+            audio_duration_seconds=4432.6,
+            primary_segment_count=202,
+            repair_window_count=3,
+            repair_grid_a_segment_count=20,
+            repair_grid_b_segment_count=18,
+            confirmed_segment_count=7,
+            final_segment_count=209,
+            final_max_gap_seconds=255.95,
         )
 
 
@@ -216,6 +232,22 @@ def test_windows_worker_hands_off_after_transcription_without_translation(tmp_pa
     assert not Path(job["english_srt_path_windows"]).exists()
 
 
+def test_windows_worker_logs_adaptive_transcription_report(tmp_path):
+    job = make_job(tmp_path)
+    client = FakeClient(job)
+    worker = WindowsWorker(client, ReportingTranscriber())
+
+    assert worker.process_one() is True
+
+    log_text = (
+        Path(job["audio_path_windows"]).parent / "logs" / "whisper.log"
+    ).read_text(encoding="utf-8")
+    assert '"primary_segment_count": 202' in log_text
+    assert '"repair_window_count": 3' in log_text
+    assert '"confirmed_segment_count": 7' in log_text
+    assert '"final_segment_count": 209' in log_text
+
+
 def test_windows_worker_skips_transcription_when_japanese_srt_exists(tmp_path):
     job = make_job(tmp_path)
     japanese_srt = Path(job["japanese_srt_path_windows"])
@@ -251,7 +283,6 @@ def test_windows_worker_writes_worker_and_whisper_logs(tmp_path):
 
     job_dir = Path(job["audio_path_windows"]).parent
     audio_path = Path(job["audio_path_windows"])
-    japanese_srt = Path(job["japanese_srt_path_windows"])
 
     assert (job_dir / "logs" / "windows-worker.log").read_text(encoding="utf-8") == (
         "claimed job_1\n"

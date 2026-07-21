@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -204,6 +204,41 @@ class WindowsSettings(BaseSettings):
     whisper_model: str = Field(default="large-v3-turbo", alias="WHISPER_MODEL")
     whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(default="float16", alias="WHISPER_COMPUTE_TYPE")
+    whisper_chunk_seconds: int = Field(
+        default=90,
+        gt=0,
+        alias="WHISPER_CHUNK_SECONDS",
+    )
+    whisper_gap_repair_enabled: bool = Field(
+        default=True,
+        alias="WHISPER_GAP_REPAIR_ENABLED",
+    )
+    whisper_repair_gap_seconds: float = Field(
+        default=60,
+        gt=0,
+        alias="WHISPER_REPAIR_GAP_SECONDS",
+    )
+    whisper_repair_chunk_seconds: float = Field(
+        default=30,
+        gt=0,
+        alias="WHISPER_REPAIR_CHUNK_SECONDS",
+    )
+    whisper_repair_offset_seconds: float = Field(
+        default=15,
+        ge=0,
+        alias="WHISPER_REPAIR_OFFSET_SECONDS",
+    )
+    whisper_repair_padding_seconds: float = Field(
+        default=15,
+        ge=0,
+        alias="WHISPER_REPAIR_PADDING_SECONDS",
+    )
+    whisper_repair_min_similarity: float = Field(
+        default=0.72,
+        ge=0,
+        le=1,
+        alias="WHISPER_REPAIR_MIN_SIMILARITY",
+    )
     transcribe_script_path: str | None = Field(default=None, alias="TRANSCRIBE_SCRIPT_PATH")
     transcribe_python_executable: str | None = Field(
         default=None,
@@ -248,3 +283,12 @@ class WindowsSettings(BaseSettings):
     )
     poll_interval_seconds: int = Field(default=10, alias="POLL_INTERVAL_SECONDS")
     heartbeat_interval_seconds: int = Field(default=60, alias="HEARTBEAT_INTERVAL_SECONDS")
+
+    @model_validator(mode="after")
+    def validate_whisper_repair_grid(self):
+        if self.whisper_repair_offset_seconds >= self.whisper_repair_chunk_seconds:
+            raise ValueError(
+                "WHISPER_REPAIR_OFFSET_SECONDS must be less than "
+                "WHISPER_REPAIR_CHUNK_SECONDS"
+            )
+        return self

@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from pathlib import Path
@@ -104,13 +105,24 @@ class WindowsWorker:
             else:
                 self.client.heartbeat(job_id, stage)
                 _append_job_log_safely(job_dir, "whisper.log", f"transcribing {audio_path}")
-                self._run_with_periodic_heartbeat(
+                transcription_report = self._run_with_periodic_heartbeat(
                     job_id,
                     stage,
                     self.transcriber.transcribe_to_srt,
                     audio_path,
                     japanese_srt,
                 )
+                if hasattr(transcription_report, "as_dict"):
+                    _append_job_log_safely(
+                        job_dir,
+                        "whisper.log",
+                        "transcription_stats "
+                        + json.dumps(
+                            transcription_report.as_dict(),
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    )
 
             stage = "transcription_done"
             self.client.heartbeat(job_id, stage)
@@ -131,7 +143,7 @@ class WindowsWorker:
             self.client.failed(job_id, stage, str(exc), permanent=False)
             return True
 
-    def _run_with_periodic_heartbeat(self, job_id: str, stage: str, operation, *args) -> None:
+    def _run_with_periodic_heartbeat(self, job_id: str, stage: str, operation, *args):
         stop = Event()
         thread = Thread(
             target=self._heartbeat_until_stopped,
@@ -140,7 +152,7 @@ class WindowsWorker:
         )
         thread.start()
         try:
-            operation(*args)
+            return operation(*args)
         finally:
             stop.set()
             thread.join()
